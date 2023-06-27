@@ -1,0 +1,10 @@
+*~*
+*\#*
+*.py[cod]
+__pycache__/
+venv/
+.idea/
+.env
+
+# automatically downloaded datasets
+data/
