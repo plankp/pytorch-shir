@@ -471,9 +471,14 @@ class LowerMM:
 @register_operator(aten.convolution.default)
 class LowerConvolution:
   def supports(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> bool:
-    if transposed or bias is not None:
+    if transposed:
       return False
     if any((p != 0 for p in output_padding)):
+      return False
+
+    # allow bias if it's also the same type.
+    # (aten.convolution seems to do weird coercion business otherwise)
+    if bias and shir_type.get_element_type(bias) != shir_type.get_element_type(input):
       return False
 
     # some cases that are technically allowed, but we weren't able to
@@ -489,9 +494,10 @@ class LowerConvolution:
     elt_ty = shir_type.get_element_type(input)
     ishape = input.meta.get("val").shape
     wshape = weight.meta.get("val").shape
+    bias = bias.name if bias else None
 
     obj = cls(elt_ty, stride, padding, dilation)
-    return obj.emit_many(input.name, ishape, weight, wshape, groups)
+    return obj.emit_many(input.name, ishape, weight, wshape, bias, groups)
 
   def __init__(self, elt_ty, stride, padding, dilation):
     self.elt_ty = elt_ty
@@ -544,7 +550,7 @@ class LowerConvolution:
             f" algo.AlgoLambda(Seq(_0), {w1}) }},"
             f" core.ParamUse(_0))) }}, {input})")
 
-  def emit_single(self, input, idim, kernel, kdim):
+  def emit_single(self, input, idim, kernel, kdim, bias):
     # idim[0]: number of inputs
     # idim[1]: InChan
     # kdim[0]: OutChan
@@ -613,8 +619,19 @@ class LowerConvolution:
       case shir_type.UI(bits):
         signed = False
 
-    acc = lambda t: (f"_idotp(algo.JoinAll({t}),"
-                     f" algo.JoinAll(core.ParamUse(_1)), {bits})")
+    if bias is None:
+      acc = lambda t: (f"_idotp(algo.JoinAll({t}),"
+                       f" algo.JoinAll(core.ParamUse(_1)), {bits})")
+    else:
+      # we needed to add the bias (and necessary casts),
+      # but also insert algo.Select now that the values come from tuples
+      acc = lambda t: (f"algo.TruncInteger(algo.Add2("
+                       f"algo.TruncInteger(algo.Select(core.ParamUse(_1), 1),"
+                       f" {bits}),"
+                       f" _idotp(algo.JoinAll({t}),"
+                       f" algo.JoinAll(algo.Select(core.ParamUse(_1), 0)),"
+                       f" {bits})), {bits})")
+
     if signed:
       t1 = acc  # prevent self-recursive acc!
       acc = lambda t: f"algo.Sub(algo.Tuple({t1(t)}, algo.ConstantInteger(0)))"
@@ -630,16 +647,23 @@ class LowerConvolution:
                        f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
     frag_inner_map = acc(frag_transpose)
 
+    if bias is None:
+      annot = "_2"
+    else:
+      # the type of the output-channel (2nd dimension) map is a tuple
+      annot = f"algo.TupleType(_2, {self.elt_ty.name()})"
+      kernel = f"algo.Zip(algo.Tuple({kernel}, {bias}))"
+
     input = self._zero_pad(input, idim)
     return (f"algo.Map({{ val _0 = core.ParamDef();"
             f" algo.AlgoLambda(Seq(_0), algo.Map({{"
-            f" val _2 = {inkern_ty}; val _1 = core.ParamDef(_2);"
+            f" val _2 = {inkern_ty}; val _1 = core.ParamDef({annot});"
             f" algo.AlgoLambda(Seq(_1), {frag_inner_map}) }},"
             f" {kernel})) }}, {input})")
 
-  def emit_many(self, input, idim, kernel, kdim, groups):
+  def emit_many(self, input, idim, kernel, kdim, bias, groups):
     if groups == 1:
-      return self.emit_single(input, idim, kernel, kdim)
+      return self.emit_single(input, idim, kernel, kdim, bias)
 
     # we rewrite the grouped convolution into many smaller parallelizable
     # convolutions and then concatenate the result.
@@ -659,7 +683,8 @@ class LowerConvolution:
     conv = self.emit_single(f"algo.Transpose(algo.Drop(inputT, ihd, itl))",
                             inner_idim,
                             f"algo.Drop(kernel, khd, ktl)",
-                            inner_kdim)
+                            inner_kdim,
+                            bias)
 
     def emit_inner_conv(i):
       ihd = i * iwindow

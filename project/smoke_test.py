@@ -3,7 +3,18 @@ import shir_backend
 
 @torch.compile(backend=shir_backend.compiler)
 def fn(x, y):
-  return torch.relu(x) + 2
-  # return torch.maximum(x, torch.ones([], dtype=torch.int32))
+  return torch.ops.aten.convolution.default(
+    x, y,
+    torch.zeros(4, dtype=torch.int),
+    [1, 1],
+    [0, 0],
+    [1, 1],
+    False,
+    [0, 0],
+    1
+)
 
-print(fn((torch.randn(2, 3) * 10).int(), (torch.randn(2, 3) * 10).int()))
+print(fn(
+    torch.ones(9, 2, 5, 5, dtype=torch.int),
+    torch.ones(4, 2, 3, 3, dtype=torch.int)
+).shape)

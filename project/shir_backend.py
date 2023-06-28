@@ -129,11 +129,12 @@ class SHIROperatorSupport(OperatorSupport):
     if n.op not in CALLABLE_NODE_OPS:
       return False
 
-    # clearly if shir can't represent this type, then we can't process it.
-    if not shir_type.has_shir_type(n):
-      return False
-
     try:
+      # clearly if shir can't represent this type, then we can't process it.
+      # e.g. max_pool2d returns a tuple?
+      if not shir_type.has_shir_type(n):
+        return False
+
       obj = shir_lowering.fetch_lowering(n.target)
       return obj.supports(*n.args, **n.kwargs)
     except:
@@ -151,10 +152,10 @@ def apply_shir_ops(gm: torch.fx.GraphModule):
 
 @fake_tensor_unsupported
 def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
-  # raw ops -> core aten -> rewrite -> prims -> partition -> shir-ify
+  # # raw ops -> core aten -> rewrite -> prims -> partition -> shir-ify
 
   def phase_partition(gm, example_inputs):
-    gm.print_readable()
+    # gm.print_readable()
     supported_ops = SHIROperatorSupport()
     partitioner = CapabilityBasedPartitioner(gm, supported_ops,
                                              allows_single_node_partition=True)
@@ -162,14 +163,15 @@ def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     fused_graph = partitioner.fuse_partitions(partitions)
     apply_shir_ops(fused_graph)
 
-    return fused_graph.forward
+    return make_boxed_func(fused_graph.forward)
 
   def phase_rewrite(gm, example_inputs):
     # gm.print_readable()
     rewrite_pattern.rewrite(gm)
-    return aot_module_simplified(gm, example_inputs,
-                                 decompositions=_decomps,
-                                 fw_compiler=phase_partition)
+    f = aot_module_simplified(gm, example_inputs,
+                              decompositions=_decomps,
+                              fw_compiler=phase_partition)
+    return make_boxed_func(f)
 
   f = aot_module_simplified(gm, example_inputs,
                             decompositions=core_aten_decompositions(),
