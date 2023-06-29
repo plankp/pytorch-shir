@@ -666,7 +666,7 @@ class LowerConvolution:
       return self.emit_single(input, idim, kernel, kdim, bias)
 
     # we rewrite the grouped convolution into many smaller parallelizable
-    # convolutions and then concatenate the result.
+    # convolutions and then concatenate (using algo.Join) the result.
     #
     # the partition is done on the channel dimension
 
@@ -678,39 +678,45 @@ class LowerConvolution:
     inner_idim[1] = iwindow
     inner_kdim[0] = kwindow
 
-    # since all the sub-convolutions are identical (shape-wise), share it
-    # using a local function to avoid excessive duplicate (scala) code
-    conv = self.emit_single("algo.Transpose(algo.Drop(inputT, ihd, itl))",
-                            inner_idim,
-                            "algo.Drop(kernel, khd, ktl)",
-                            inner_kdim,
-                            None if bias is None else "algo.Drop(bias, khd, ktl)")
+    # compute the types for the partitioned convolution because some operators
+    # need them...
 
-    def emit_inner_conv(i):
-      ihd = i * iwindow
-      khd = i * kwindow
-      itl = idim[1] - (i + 1) * iwindow
-      ktl = kdim[0] - (i + 1) * kwindow
+    # the input will be transposed, so 0th and 1st dimensions are swapped!
+    input = f"algo.Split(algo.Transpose({input}), {iwindow})"
+    input_ty = self.elt_ty.name()
+    for d in reversed(inner_idim[2:]):
+      input_ty = f"algo.SeqType({input_ty}, {d})"
+    input_ty = (f"algo.SeqType(algo.SeqType({input_ty},"
+                f" {inner_idim[0]}), {inner_idim[1]})")
 
-      if bias is None:
-        return f"_conv(_0, {ihd}, {itl}, {kernel}, {khd}, {ktl})"
-      return f"_conv(_0, {ihd}, {itl}, {kernel}, {khd}, {ktl}, {bias})"
+    kernel = f"algo.Split({kernel}, {kwindow})"
+    kernel_ty = self.elt_ty.name()
+    for d in reversed(inner_kdim):
+      kernel_ty = f"algo.SeqType({kernel_ty}, {d})"
 
-    acc = reduce(lambda x, y: f"algo.Concat({x}, {y})",
-                 (emit_inner_conv(i) for i in range(groups)))
+    if bias is not None:
+      bias = f"algo.Split({bias}, {kwindow})"
+      bias_ty = f"algo.SeqType({self.elt_ty.name()}, {kwindow})"
 
     if bias is None:
-      return (f"{{ def _conv("
-              f"inputT: core.Expr, ihd: core.ArithTypeT, itl: core.ArithTypeT, "
-              f"kernel: core.Expr, khd: core.ArithTypeT, ktl: core.ArithTypeT)"
-              f": core.Expr = algo.Transpose({conv});"
-              f" val _0 = algo.Transpose({input});"
-              f" algo.Transpose({acc}) }}")
+      conv = self.emit_single(
+          "algo.Transpose(algo.Select(core.ParamUse(_4), 0))", inner_idim,
+          "algo.Select(core.ParamUse(_4), 1)", inner_kdim,
+          None)
+      conv = (f"algo.Map({{ val _4 = core.ParamDef("
+              f"algo.TupleType({input_ty}, {kernel_ty}));"
+              f" algo.AlgoLambda(Seq(_4), {conv}) }},"
+              f" algo.Zip(algo.Tuple({input}, {kernel})))")
+    else:
+      conv = self.emit_single(
+          "algo.Transpose(algo.Select3(core.ParamUse(_4), 0))", inner_idim,
+          "algo.Select3(core.ParamUse(_4), 1)", inner_kdim,
+          "algo.Select3(core.ParamUse(_4), 2)")
+      conv = (f"algo.Map({{ val _4 = core.ParamDef("
+              f"algo.TupleType({input_ty}, {kernel_ty}, {bias_ty}));"
+              f" algo.AlgoLambda(Seq(_4), {conv}) }},"
+              f" algo.Zip3(algo.Tuple3({input}, {kernel}, {bias})))")
 
-    return (f"{{ def _conv("
-            f"inputT: core.Expr, ihd: core.ArithTypeT, itl: core.ArithTypeT, "
-            f"kernel: core.Expr, khd: core.ArithTypeT, ktl: core.ArithTypeT, "
-            f"bias: core.Expr)"
-            f": core.Expr = algo.Transpose({conv});"
-            f" val _0 = algo.Transpose({input});"
-            f" algo.Transpose({acc}) }}")
+    # at this point, we have T[Groups, N, OutChan, S1, S2, ...].
+    # merge the 0th (Groups) dimension into the 2nd (OutChan) dimension.
+    return f"algo.Map(algo.Join.asFunction(), algo.Transpose({conv}))"
