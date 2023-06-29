@@ -680,11 +680,11 @@ class LowerConvolution:
 
     # since all the sub-convolutions are identical (shape-wise), share it
     # using a local function to avoid excessive duplicate (scala) code
-    conv = self.emit_single(f"algo.Transpose(algo.Drop(inputT, ihd, itl))",
+    conv = self.emit_single("algo.Transpose(algo.Drop(inputT, ihd, itl))",
                             inner_idim,
-                            f"algo.Drop(kernel, khd, ktl)",
+                            "algo.Drop(kernel, khd, ktl)",
                             inner_kdim,
-                            bias)
+                            None if bias is None else "algo.Drop(bias, khd, ktl)")
 
     def emit_inner_conv(i):
       ihd = i * iwindow
@@ -692,13 +692,25 @@ class LowerConvolution:
       itl = idim[1] - (i + 1) * iwindow
       ktl = kdim[0] - (i + 1) * kwindow
 
-      return f"_conv(_0, {ihd}, {itl}, {kernel}, {khd}, {ktl})"
+      if bias is None:
+        return f"_conv(_0, {ihd}, {itl}, {kernel}, {khd}, {ktl})"
+      return f"_conv(_0, {ihd}, {itl}, {kernel}, {khd}, {ktl}, {bias})"
+
     acc = reduce(lambda x, y: f"algo.Concat({x}, {y})",
                  (emit_inner_conv(i) for i in range(groups)))
 
+    if bias is None:
+      return (f"{{ def _conv("
+              f"inputT: core.Expr, ihd: core.ArithTypeT, itl: core.ArithTypeT, "
+              f"kernel: core.Expr, khd: core.ArithTypeT, ktl: core.ArithTypeT)"
+              f": core.Expr = algo.Transpose({conv});"
+              f" val _0 = algo.Transpose({input});"
+              f" algo.Transpose({acc}) }}")
+
     return (f"{{ def _conv("
             f"inputT: core.Expr, ihd: core.ArithTypeT, itl: core.ArithTypeT, "
-            f"kernel: core.Expr, khd: core.ArithTypeT, ktl: core.ArithTypeT)"
+            f"kernel: core.Expr, khd: core.ArithTypeT, ktl: core.ArithTypeT, "
+            f"bias: core.Expr)"
             f": core.Expr = algo.Transpose({conv});"
             f" val _0 = algo.Transpose({input});"
             f" algo.Transpose({acc}) }}")
