@@ -1,6 +1,7 @@
 from torch.fx.graph_module import GraphModule
 from torch.fx import subgraph_rewriter
 import torch
+import operator
 
 # don't match or emit prims ops at this level!
 aten = torch.ops.aten
@@ -13,6 +14,59 @@ _rewrite_patterns = []
 def rewrite(gm: GraphModule):
   for (pat, repl) in _rewrite_patterns:
     subgraph_rewriter.replace_pattern(gm, pat, repl)
+  gm.graph.lint()
+
+# tries to recover from decomposed forms back into a simpler non-core-ATen
+# form.
+#
+# sometimes AOT autograd decomposes a bit too aggressively, rewriting the
+# operator into a very painful-to-handle form. An extreme form of this is
+# aten.max_pool1d where it turns into a aten.squeeze followed by a
+# aten.max_pool2d_with_indices and a tuple select.
+#
+# for the record, we're probably not going to be able to recover max_pool1d,
+# but we do want to at least recover it back into max_pool2d.
+def late_rewrite(gm: GraphModule):
+  max_pool_repl_map = {
+    # max_pool1d would have been decomposed into max_pool2d, so there's no
+    # need to have it in this map (but the rewrite is valid)
+    aten.max_pool2d_with_indices.default: aten.max_pool2d.default,
+    aten.max_pool3d_with_indices.default: aten.max_pool3d.default,
+  }
+
+  for n in gm.graph.nodes:
+    if n.op != "call_function":
+      continue
+
+    # turn:
+    #   x = call_function | aten.max_pool?d_with_indices | (w, ...)
+    #   y = call_function | getitem | (x, 0)  <-- all uses of x look like this
+    # into:
+    #   x = call_function | aten.max_pool?d | (w, ...)
+    #   y = x
+    repl = max_pool_repl_map.get(n.target)
+    if repl is not None:
+      def is_get_maxpool(node):
+        if node.op != "call_function" or node.target != operator.getitem:
+          return False
+        if node.kwargs != {}:
+          return False
+        match node.args:
+          case [v, 0] if v is n:
+            return True
+          case _:
+            return False
+
+      if n.users and all((is_get_maxpool(user) for user in n.users)):
+        n.target = repl
+        info = n.meta.get("val")
+        if info:
+          n.meta["val"] = info[0]
+
+        for user in [*n.users]:
+          user.replace_all_uses_with(n)
+          gm.graph.erase_node(user)
+
   gm.graph.lint()
 
 """

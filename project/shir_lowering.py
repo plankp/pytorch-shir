@@ -20,6 +20,7 @@ def register_operator(key):
   def _magic(lowering):
     assert key not in _ops, f"Operation {key} is repeatedly registered"
     _ops[key] = lowering
+    return lowering   # allows stacking this decorator
   return _magic
 
 def fetch_lowering(target):
@@ -720,3 +721,147 @@ class LowerConvolution:
     # at this point, we have T[Groups, N, OutChan, S1, S2, ...].
     # merge the 0th (Groups) dimension into the 2nd (OutChan) dimension.
     return f"algo.Map(algo.Join.asFunction(), algo.Transpose({conv}))"
+
+class LowerMaxPoolND:
+  def supports(input, kernel_size, stride=[], padding=0, dilation=1,
+               ceil_mode=False) -> bool:
+    # padding is a bit annoying because it pads the smallest value
+    if padding != 0 or any(padding):
+      return False
+
+    if ceil_mode:
+      return False
+
+    return True
+
+  def __init__(self, N, elt_ty, kernel_size, stride, dilation):
+    self.N = N
+    self.elt_ty = elt_ty
+    self._kernel_size = kernel_size
+    self._stride = stride
+    self._dilation = dilation
+
+  # For some reason, max_pool?d loves to keep things as scalar and rely on
+  # implicit broadcasting, hence all these helpers to fetch the widths.
+  #
+  # we also assume we never do illegal accesses
+
+  def _broadcast_get(u, axis: int) -> int:
+    match u:
+      case int(w) | [w]:
+        return w
+      case w:
+        return w[axis]
+
+  def kshape(self, axis: int) -> int:
+    return _broadcast_get(self._kernel_size, axis)
+
+  def stride(axis: int) -> int:
+    return _broadcast_get(self._stride, axis)
+
+  def padding(axis: int) -> int:
+    return _broadcast_get(self._padding, axis)
+
+  def dilation(axis: int) -> int:
+    return _broadcast_get(self._dilation, axis)
+
+  def emit(self, input, idim):
+    # JoinAll needs the type of the kernel
+    inkern_ty = self.elt_ty.name()
+    for dim in reversed(range(self.N)):
+      inkern_ty = f"algo.SeqType({inkern_ty}, {self.kshape(dim)})"
+
+    acc = lambda t: t
+    for (dim, iwidth) in zip(reversed(range(self.N)), reversed(idim)):
+      kwidth = self.kshape(dim)
+      stride = self.stride(dim)
+      pad = self.padding(dim)
+      dilation = self.dilation(dim)
+
+      # compute the widths due to input padding and kernel dilation
+      i = iwidth + 2 * pad
+      k = dilation * (kwidth - 1) + 1
+      out_width = i - k + 1   # new dimension after sliding
+
+      w1 = acc("core.ParamUse(_0)")
+      w2 = k
+      w3 = f"algo.Slide({w1}, {w2})"
+      w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
+
+      if dilation > 1:
+        # now that the slided input (w3) has type T[Out', K', ...], we drop the
+        # the dilated indices from the 2nd dimension (K') of the slided input.
+        indices = range(k // dilation + 1)
+        indices = (f"algo.Drop(core.ParamUse(_3), {dilation * i}, {k - 1 - dilation * i})" for i in indices)
+        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
+        w3 = (f"algo.Map({{"
+              f" val _3 = core.ParamDef(algo.SeqType(algo.AlgoDataTypeVar(), {k}));"
+              f" algo.AlgoLambda(Seq(_3), {w4}) }}, {w3})")
+
+      if stride > 1:
+        # strides work on the 1st dimension (Out') of the slided input, which is
+        # affected by the dilated kernel width.
+        indices = range(1 if stride > out_width else out_width // stride)
+        indices = (f"algo.Drop(_2, {stride * i}, {out_width - 1 - stride * i})" for i in indices)
+        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
+        w3 = f"{{ val _2 = {w3}; {w4} }}"
+
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
+                       f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
+
+    frag_sliding = acc("core.ParamUse(_0)")
+
+    # we now have T[Out1, K1, Out2, K2, ..., OutN, KN]
+    # we transpose it to T[Out1, Out2, ..., K1, ..., KN]
+    # that gives permutation indices of [0, 2, ..., 1, 3, ...]
+    #
+    # (it happens to be identical to SHIR indices)
+    transpose_axes = chain(range(0, 2 * self.N, 2), range(1, 2 * self.N + 1, 2))
+    frag_transpose = f"algo.TransposeND({frag_sliding}, Seq({(*transpose_axes,)}))"
+
+    # obviously, unlike convolution, max pooling performs a maximum reduction
+    # instead of a dot product.
+    acc = lambda t: f"algo.Fold(algo.Max2.asFunction(), algo.JoinAll({t}))"
+
+    # recall that JoinAll needs type annotation.
+    w1 = acc("core.ParamUse(_0)")
+    acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({inkern_ty});"
+                     f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
+
+    for _ in range(self.N - 1):
+      w1 = acc("core.ParamUse(_0)")
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
+                       f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
+    frag_inner_map = acc(frag_transpose)
+
+    # account for the minibatch dimension that may be omitted.
+    if len(idim) == self.N + 1:
+      return (f"algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
+              f" {frag_inner_map}) }}, {input})")
+
+    assert len(idim) == self.N + 2
+    return (f"algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
+            f" algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
+            f" {frag_inner_map}) }}, core.ParamUse(_0))) }}, {input})")
+
+@register_operator(aten.max_pool2d.default)
+class LowerMaxPool2D(LowerMaxPoolND):
+  @classmethod
+  def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
+            ceil_mode=False) -> str:
+    elt_ty = shir_type.get_element_type(input)
+    ishape = input.meta.get("val").shape
+
+    obj = cls(2, elt_ty, kernel_size, stride, padding, dilation)
+    return obj.emit(input.name, ishape)
+
+@register_operator(aten.max_pool3d.default)
+class LowerMaxPool2D(LowerMaxPoolND):
+  @classmethod
+  def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
+            ceil_mode=False) -> str:
+    elt_ty = shir_type.get_element_type(input)
+    ishape = input.meta.get("val").shape
+
+    obj = cls(3, elt_ty, kernel_size, stride, padding, dilation)
+    return obj.emit(input.name, ishape)

@@ -152,10 +152,12 @@ def apply_shir_ops(gm: torch.fx.GraphModule):
 
 @fake_tensor_unsupported
 def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
-  # # raw ops -> core aten -> rewrite -> prims -> partition -> shir-ify
+  # raw ops -> core aten -> rewrite ->
+  #   prims -> late rewrite -> partition -> shir-ify
 
   def phase_partition(gm, example_inputs):
     # gm.print_readable()
+    rewrite_pattern.late_rewrite(gm)
     supported_ops = SHIROperatorSupport()
     partitioner = CapabilityBasedPartitioner(gm, supported_ops,
                                              allows_single_node_partition=True)
