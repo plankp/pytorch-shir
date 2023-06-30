@@ -28,8 +28,7 @@ def rewrite(gm: GraphModule):
 # but we do want to at least recover it back into max_pool2d.
 def late_rewrite(gm: GraphModule):
   max_pool_repl_map = {
-    # max_pool1d would have been decomposed into max_pool2d, so there's no
-    # need to have it in this map (but the rewrite is valid)
+    aten.max_pool1d_with_indices.default: aten.max_pool1d.default,  # unlikely
     aten.max_pool2d_with_indices.default: aten.max_pool2d.default,
     aten.max_pool3d_with_indices.default: aten.max_pool3d.default,
   }

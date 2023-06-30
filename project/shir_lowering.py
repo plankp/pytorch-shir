@@ -448,15 +448,7 @@ class LowerMM:
 
   def lower(lhs, rhs) -> str:
     ty = shir_type.get_element_type(lhs)
-    match ty:
-      case shir_type.UI(bits):
-        signed = False
-      case shir_type.SI(bits):
-        signed = True
-
-    f = f"_idotp(core.ParamUse(_0), core.ParamUse(_1), {bits})"
-    if signed:
-      f = f"algo.Sub(algo.Tuple({f}, algo.ConstantInteger(0)))"
+    f = f"_idotp({ty.name()}, core.ParamUse(_0), core.ParamUse(_1))"
 
     # lhs: T[i, width], rhs: T[width, j]
     width = lhs.meta.get("val").shape[1]
@@ -614,28 +606,14 @@ class LowerConvolution:
     transpose_axes = (2 * N - x for x in transpose_axes)
     frag_transpose = f"algo.TransposeND({frag_sliding}, Seq{(*transpose_axes,)})"
 
-    match self.elt_ty:
-      case shir_type.SI(bits):
-        signed = True
-      case shir_type.UI(bits):
-        signed = False
-
     if bias is None:
-      acc = lambda t: (f"_idotp(algo.JoinAll({t}),"
-                       f" algo.JoinAll(core.ParamUse(_1)), {bits})")
+      acc = lambda t: (f"_idotp({self.elt_ty.name()}, algo.JoinAll({t}),"
+                       f" algo.JoinAll(core.ParamUse(_1)))")
     else:
-      # we needed to add the bias (and necessary casts),
-      # but also insert algo.Select now that the values come from tuples
-      acc = lambda t: (f"algo.TruncInteger(algo.Add2("
-                       f"algo.TruncInteger(algo.Select(core.ParamUse(_1), 1),"
-                       f" {bits}),"
-                       f" _idotp(algo.JoinAll({t}),"
+      # we needed to add algo.Select now that the values come from tuples
+      acc = lambda t: (f"_idotp({self.elt_ty.name()}, algo.JoinAll({t}),"
                        f" algo.JoinAll(algo.Select(core.ParamUse(_1), 0)),"
-                       f" {bits})), {bits})")
-
-    if signed:
-      t1 = acc  # prevent self-recursive acc!
-      acc = lambda t: f"algo.Sub(algo.Tuple({t1(t)}, algo.ConstantInteger(0)))"
+                       f" Some(algo.Select(core.ParamUse(_1), 1)))")
 
     # recall that JoinAll needs type annotation.
     w1 = acc("core.ParamUse(_0)")
@@ -726,7 +704,7 @@ class LowerMaxPoolND:
   def supports(input, kernel_size, stride=[], padding=0, dilation=1,
                ceil_mode=False) -> bool:
     # padding is a bit annoying because it pads the smallest value
-    if padding != 0 or any(padding):
+    if padding != 0 or (isinstance(padding, list) and any(padding)):
       return False
 
     if ceil_mode:
@@ -746,7 +724,7 @@ class LowerMaxPoolND:
   #
   # we also assume we never do illegal accesses
 
-  def _broadcast_get(u, axis: int) -> int:
+  def _broadcast_get(self, u, axis: int) -> int:
     match u:
       case int(w) | [w]:
         return w
@@ -754,16 +732,13 @@ class LowerMaxPoolND:
         return w[axis]
 
   def kshape(self, axis: int) -> int:
-    return _broadcast_get(self._kernel_size, axis)
+    return self._broadcast_get(self._kernel_size, axis)
 
-  def stride(axis: int) -> int:
-    return _broadcast_get(self._stride, axis)
+  def stride(self, axis: int) -> int:
+    return self._broadcast_get(self._stride, axis)
 
-  def padding(axis: int) -> int:
-    return _broadcast_get(self._padding, axis)
-
-  def dilation(axis: int) -> int:
-    return _broadcast_get(self._dilation, axis)
+  def dilation(self, axis: int) -> int:
+    return self._broadcast_get(self._dilation, axis)
 
   def emit(self, input, idim):
     # JoinAll needs the type of the kernel
@@ -775,11 +750,10 @@ class LowerMaxPoolND:
     for (dim, iwidth) in zip(reversed(range(self.N)), reversed(idim)):
       kwidth = self.kshape(dim)
       stride = self.stride(dim)
-      pad = self.padding(dim)
       dilation = self.dilation(dim)
 
       # compute the widths due to input padding and kernel dilation
-      i = iwidth + 2 * pad
+      i = iwidth
       k = dilation * (kwidth - 1) + 1
       out_width = i - k + 1   # new dimension after sliding
 
@@ -809,7 +783,9 @@ class LowerMaxPoolND:
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
                        f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
 
-    frag_sliding = acc("core.ParamUse(_0)")
+    # we sneak in a Split here (and a Join later) to simplify the mapping
+    # sliding process
+    frag_sliding = acc(f"algo.Split(core.ParamUse(_0), {i})")
 
     # we now have T[Out1, K1, Out2, K2, ..., OutN, KN]
     # we transpose it to T[Out1, Out2, ..., K1, ..., KN]
@@ -817,11 +793,11 @@ class LowerMaxPoolND:
     #
     # (it happens to be identical to SHIR indices)
     transpose_axes = chain(range(0, 2 * self.N, 2), range(1, 2 * self.N + 1, 2))
-    frag_transpose = f"algo.TransposeND({frag_sliding}, Seq({(*transpose_axes,)}))"
+    frag_transpose = f"algo.TransposeND(algo.Join({frag_sliding}), Seq{(*transpose_axes,)})"
 
     # obviously, unlike convolution, max pooling performs a maximum reduction
     # instead of a dot product.
-    acc = lambda t: f"algo.Fold(algo.Max2.asFunction(), algo.JoinAll({t}))"
+    acc = lambda t: f"_iredmax({self.elt_ty.name()}, algo.JoinAll({t}))"
 
     # recall that JoinAll needs type annotation.
     w1 = acc("core.ParamUse(_0)")
@@ -852,7 +828,7 @@ class LowerMaxPool2D(LowerMaxPoolND):
     elt_ty = shir_type.get_element_type(input)
     ishape = input.meta.get("val").shape
 
-    obj = cls(2, elt_ty, kernel_size, stride, padding, dilation)
+    obj = cls(2, elt_ty, kernel_size, stride, dilation)
     return obj.emit(input.name, ishape)
 
 @register_operator(aten.max_pool3d.default)
@@ -863,5 +839,5 @@ class LowerMaxPool2D(LowerMaxPoolND):
     elt_ty = shir_type.get_element_type(input)
     ishape = input.meta.get("val").shape
 
-    obj = cls(3, elt_ty, kernel_size, stride, padding, dilation)
+    obj = cls(3, elt_ty, kernel_size, stride, dilation)
     return obj.emit(input.name, ishape)

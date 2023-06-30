@@ -58,12 +58,38 @@ class SHIRGraphModule(torch.nn.Module):
   def emit(self):
     buffer = \
 """// macros...
-def _idotp(x: Expr, y: Expr, bits: ArithTypeT): Expr =
-  algo.TruncInteger(algo.Fold(algo.Add2.asFunction(),
+def _idotp(ty: IntTypeT, x: Expr, y: Expr, acc: Option[Expr]): Expr = {
+  val e1 = algo.TruncInteger(algo.Fold(algo.Add2.asFunction(),
     algo.Map({
       val _0 = core.ParamDef()
-      algo.AlgoLambda(Seq(_0), algo.TruncInteger(algo.Mul(core.ParamUse(_0)), bits))
-    }, algo.Zip(algo.Tuple(x, y)))), bits)
+      algo.AlgoLambda(Seq(_0), algo.TruncInteger(algo.Mul(core.ParamUse(_0)), ty.width))
+    }, algo.Zip(algo.Tuple(x, y)))), ty.width)
+  val e2 = acc match {
+    case None => e1
+    case Some(e) => algo.TruncInteger(algo.Add2(e1, algo.TruncInteger(e, ty.width)), ty.width)
+  }
+  ty match {
+    case SignedIntType(_) => algo.Sub(algo.Tuple(e2, algo.ConstantInteger(0)))
+    case IntType(_) => e2
+    case _ => ???
+  }
+}
+
+def _iredmax(ty: IntTypeT, x: Expr): Expr = {
+  def signconv(e: Expr): Expr = ty match {
+    case SignedIntType(_) => algo.Sub(algo.Tuple(e, algo.ConstantInteger(0)))
+    case IntType(_) => e
+    case _ => ???
+  }
+  signconv(algo.Fold({
+    val _0 = core.ParamDef()
+    val _1 = core.ParamDef()
+    algo.AlgoLambda(Seq(_0, _1),
+      algo.Max2(
+        signconv(TruncInteger(ParamUse(_0), ty.width)),
+        signconv(TruncInteger(ParamUse(_1), ty.width))))
+  }, x))
+}
 
 // actual emitted stuff starts here...
 """
