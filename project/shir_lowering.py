@@ -170,6 +170,28 @@ class LowerSplitDim:
                        f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
     return acc(a.name)
 
+@register_operator(prims.squeeze.default)
+class LowerSqueeze:
+  def supports(a, dims) -> bool:
+    return True
+
+  def lower(a, dims) -> str:
+    # dims seems to be guaranteed at least an ordered set.
+    if dims == []:
+      return a.name
+
+    shape = a.meta.get("val").shape
+    if len(dims) == len(shape):
+      # this is a special case where we turn T[1, ..., 1] into T.
+      return (f"algo.Convert(algo.JoinAll({a.name}),"
+              f" {shir_type.get_element_type(a).name()})")
+
+    # simplest way to do this is to do the same thing 3D+ inputs:
+    # flatten the whole thing to 1D and then use SplitAll
+    new_shape = (s for (i, s) in enumerate(shape) if i not in dims)
+    return (f"algo.Join(algo.SplitAll(algo.JoinAll({a.name}),"
+            f" Seq{(*new_shape,)}))")
+
 @register_operator(prims.transpose.default)
 class LowerTranspose:
   def supports(a, perm_axes) -> bool:

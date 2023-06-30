@@ -35,6 +35,7 @@ _decomps = get_decompositions([
   aten.view,
   aten.where,
   aten.maximum,
+  aten.squeeze,
   aten.expand.default,
   aten.permute.default,
   aten.unsqueeze.default,
