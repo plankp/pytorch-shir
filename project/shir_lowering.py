@@ -97,6 +97,8 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
     prefix = [i for i in range(N) if i not in dims]
     if any((i != j for (i, j) in zip(prefix, range(N)))):
       # we have a gap in the reduction axes: need to transpose
+      # using tuple splat here is also safe because the axes will have at
+      # least two elements
       axes = [*prefix, *dim]
       x = f"algo.TransposeND({x}, Seq{(*(N - i - 1 for i in reversed(axes)),)})"
 
@@ -125,6 +127,25 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
 """
 magic that actually does the lowering of each node
 """
+
+@register_operator(aten.view.default)
+class LowerView:
+  def supports(a, shape) -> bool:
+    return True
+
+  def lower(a, shape) -> str:
+    ashape = a.meta.get("val").shape
+    if ashape:
+      a = f"algo.JoinAll({a.name})"
+    else:
+      a = f"algo.Repeat({a.name}, 1)"
+
+    if shape == []:
+      # turn T[1, ..., 1] into T
+      return f"algo.Convert({a}, {shir_type.get_element_type(a).name()})"
+
+    shape = ", ".join((str(s) for s in shape))
+    return (f"algo.Join(algo.SplitAll({a}, Seq({shape})))")
 
 @register_operator(prims.collapse_view.default)
 class LowerCollapseView:
@@ -188,9 +209,9 @@ class LowerSqueeze:
 
     # simplest way to do this is to do the same thing 3D+ inputs:
     # flatten the whole thing to 1D and then use SplitAll
-    new_shape = (s for (i, s) in enumerate(shape) if i not in dims)
+    new_shape = ", ".join((str(s) for (i, s) in enumerate(shape) if i not in dims))
     return (f"algo.Join(algo.SplitAll(algo.JoinAll({a.name}),"
-            f" Seq{(*new_shape,)}))")
+            f" Seq({new_shape})))")
 
 @register_operator(prims.transpose.default)
 class LowerTranspose:
@@ -204,8 +225,8 @@ class LowerTranspose:
 
     # convert the axes to SHIR axes, which are reversed
     N = len(a.meta.get("val").shape)
-    axes = (N - i - 1 for i in reversed(perm_axes))
-    return f"algo.TransposeND({a.name}, Seq{(*axes,)})"
+    axes = ", ".join((str(N - i - 1) for i in reversed(perm_axes)))
+    return f"algo.TransposeND({a.name}, Seq({axes}))"
 
 @register_operator(prims.broadcast_in_dim.default)
 class LowerBroadcastInDim:

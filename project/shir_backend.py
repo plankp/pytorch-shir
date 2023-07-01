@@ -32,7 +32,6 @@ _decomps = get_decompositions([
   aten.mul,
   aten.dot,
   aten.sum,
-  aten.view,
   aten.where,
   aten.maximum,
   aten.squeeze,
@@ -118,6 +117,8 @@ def _iredmax(ty: IntTypeT, x: Expr): Expr = {
           if dims < 1:
             v = f"core.Conversion({v}, {typ.name()})"
           if dims > 2:
+            # the tuple splat usage here is safe because shape always has at
+            # least three elements, so the trailing comma case never happens.
             v = f"algo.Join(algo.SplitAll({v}, Seq{(*shape,)}))"
 
           buffer += f"val {n.name} = core.TypeChecker.check({v})\n"
