@@ -121,6 +121,8 @@ class BackendQuantizer(Quantizer):
   def annotate(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # say we just annotate linear layers
     qconfig = self.global_config
+    self._annotate_conv_relu(gm, qconfig)
+    self._annotate_conv(gm, qconfig)
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
 
@@ -139,6 +141,12 @@ class BackendQuantizer(Quantizer):
     return [
       OperatorConfig(qconfig, [[torch.nn.Linear, torch.nn.ReLU]]),
       OperatorConfig(qconfig, [[torch.nn.Linear]]),
+
+      # for simplicity, we only claim to support Conv2d.
+      # we actually support every non-transpoing convolution,
+      # it also isn't too difficult to extend the current stuff
+      OperatorConfig(qconfig, [[torch.nn.Conv2d, torch.nn.ReLU]]),
+      OperatorConfig(qconfig, [[torch.nn.Conv2d]]),
     ]
 
   def _annotate_linear_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
@@ -184,4 +192,63 @@ class BackendQuantizer(Quantizer):
         _annotate_output_qspec(bias, bias_qspec)
 
       _annotate_output_qspec(out, output_qspec)
+      _mark_nodes_as_annotated([*p.nodes])
+
+  def _annotate_conv_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    input_qspec = get_input_act_qspec(qconfig)
+    output_qspec = get_output_act_qspec(qconfig)
+    weight_qspec = get_weight_qspec(qconfig)
+    bias_qspec = get_bias_qspec(qconfig)
+
+    fused_partitions = find_sequential_partitions(gm, [torch.nn.Conv2d, torch.nn.ReLU])
+    for conv_p, relu_p in fused_partitions:
+      conv_node = conv_p.output_nodes[0]
+      relu = relu_p.output_nodes[0]
+
+      assert (
+        conv_node.op == "call_function"
+        and conv_node.target == torch.ops.aten.convolution.default
+      ), "Expected conv layer to call aten.convolution"
+
+      if _is_annotated([conv_node, relu]):
+        continue
+
+      inp = conv_node.args[0]
+      weight = conv_node.args[1]
+      bias = conv_node.args[2]
+      _annotate_input_qspec_map(conv_node, inp, input_qspec)
+      _annotate_input_qspec_map(conv_node, weight, weight_qspec)
+      if bias:
+        _annotate_input_qspec_map(conv_node, bias, bias_qspec)
+
+      _annotate_output_qspec(relu, output_qspec)
+      _mark_nodes_as_annotated([*conv_p.nodes, *relu_p.nodes])
+
+  def _annotate_conv(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    input_qspec = get_input_act_qspec(qconfig)
+    output_qspec = get_output_act_qspec(qconfig)
+    weight_qspec = get_weight_qspec(qconfig)
+    bias_qspec = get_bias_qspec(qconfig)
+
+    all_partitions = get_source_partitions(gm.graph, [torch.nn.Conv2d])
+    partitions = list(itertools.chain(*all_partitions.values()))
+    for p in partitions:
+      conv_node = p.output_nodes[0]
+      assert (
+        conv_node.op == "call_function"
+        and conv_node.target == torch.ops.aten.convolution.default
+      ), "Expected conv layer to call aten.convolution"
+
+      if _is_annotated([conv_node]):
+        continue
+
+      inp = conv_node.args[0]
+      weight = conv_node.args[1]
+      bias = conv_node.args[2]
+      _annotate_input_qspec_map(conv_node, inp, input_qspec)
+      _annotate_input_qspec_map(conv_node, weight, weight_qspec)
+      if bias:
+        _annotate_input_qspec_map(conv_node, bias, bias_qspec)
+
+      _annotate_output_qspec(conv_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
