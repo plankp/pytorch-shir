@@ -10,27 +10,36 @@ model.eval()
 print(model)
 """
 
+import copy
 import torch
 from torchvision.models import vgg11
+
+import torch._dynamo as torchdynamo
+from torch.ao.quantization._quantize_pt2e import (
+  convert_pt2e,
+  prepare_pt2e_quantizer,
+)
+
 import shir_backend
-from torch.ao.quantization import (
-  QConfig,
-  QConfigMapping,
-)
-from torch.ao.quantization.quantize_fx import (
-  prepare_fx,
-  _convert_to_reference_decomposed_fx,  # XXX: private API
-)
+import shir_quantizer
 
 model = vgg11(weights='DEFAULT')
 model.eval()
+example_inputs = (torch.randn(10, 3, 32, 32),)
 
-example_inputs = torch.randn(10, 3, 32, 32)
-qconfig_mapping = QConfigMapping().set_global(torch.ao.quantization.default_qconfig)
-model = prepare_fx(model, qconfig_mapping, example_inputs)
-model = _convert_to_reference_decomposed_fx(model)
-print(model)
+# program capture
+model, guards = torchdynamo.export(
+  model,
+  *copy.deepcopy(example_inputs),
+  aten_graph=True,
+)
+quantizer = shir_quantizer.BackendQuantizer()
+operator_config = shir_quantizer.get_symmetric_quantization_config()
+quantizer.set_global(operator_config)
 
-torch._dynamo.reset()
+model = prepare_pt2e_quantizer(model, quantizer)
+model = convert_pt2e(model)
+
+torchdynamo.reset()
 model = torch.compile(backend=shir_backend.compiler)(model)
-model(example_inputs)
+model(*example_inputs)

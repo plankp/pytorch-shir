@@ -58,7 +58,7 @@ class SHIRGraphModule(torch.nn.Module):
   def emit(self):
     buffer = \
 """// macros...
-def _idotp(ty: IntTypeT, x: Expr, y: Expr, acc: Option[Expr]): Expr = {
+def _idotp(ty: IntTypeT, x: Expr, y: Expr, acc: Option[Expr]=None): Expr = {
   val e1 = algo.TruncInteger(algo.Fold(algo.Add2.asFunction(),
     algo.Map({
       val _0 = core.ParamDef()
