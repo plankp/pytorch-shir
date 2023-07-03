@@ -8,8 +8,6 @@ from torchvision.transforms import ToTensor
 from torchvision import datasets, transforms
 from pathlib import Path
 
-SAVED_MODEL_PATH = "./data/model_mnist.pth"
-
 training_data = datasets.MNIST(
   root="data",
   train=True,
@@ -24,22 +22,9 @@ test_data = datasets.MNIST(
   transform=ToTensor()
 )
 
-class Net(nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.flatten = nn.Flatten()
-    self.linear_relu_stack = nn.Sequential(
-      nn.Linear(28*28, 512),
-      nn.ReLU(),
-      nn.Linear(512, 512),
-      nn.ReLU(),
-      nn.Linear(512, 10),
-    )
-
-  def forward(self, x):
-    x = self.flatten(x)
-    logits = self.linear_relu_stack(x)
-    return logits
+def get_example_input():
+  for X, _ in train_dataloader:
+    return X
 
 def train_loop(dataloader, model, loss_fn, optimizer):
   size = len(dataloader.dataset)
@@ -86,70 +71,33 @@ loss_fn = nn.CrossEntropyLoss()
 train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
 test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
 
-if not Path(SAVED_MODEL_PATH).is_file():
-  print("Model does not exist, training!")
+def reload_cached(file_saved_weights: str, model_ctor):
+  if Path(file_saved_weights).is_file():
+    print("Loading saved model")
+  else:
+    print("Model does not exist, training!")
 
-  learning_rate = 1e-3
-  epochs = 10
+    learning_rate = 1e-3
+    epochs = 10
 
-  model = Net()
-  optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    model = model_ctor()
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 
-  train_features, train_labels = next(iter(train_dataloader))
-  print(f"Feature batch shape: {train_features.size()}")
-  print(f"Labels batch shape: {train_labels.size()}")
+    train_features, train_labels = next(iter(train_dataloader))
+    print(f"Feature batch shape: {train_features.size()}")
+    print(f"Labels batch shape: {train_labels.size()}")
 
-  for t in range(epochs):
-    print(f"Epoch {t+1}\n-------------------------------")
-    train_loop(train_dataloader, model, loss_fn, optimizer)
-    test_loop(test_dataloader, model, loss_fn)
-  print("Done!")
+    for t in range(epochs):
+      print(f"Epoch {t+1}\n-------------------------------")
+      train_loop(train_dataloader, model, loss_fn, optimizer)
+      test_loop(test_dataloader, model, loss_fn)
+    print("Done!")
 
-  torch.save(model.state_dict(), SAVED_MODEL_PATH)
+    torch.save(model.state_dict(), file_saved_weights)
 
-print("Loading saved model:")
-model = Net()
-model.load_state_dict(torch.load(SAVED_MODEL_PATH))
-model.eval()
+  model = model_ctor()
 
-test_loop(test_dataloader, model, loss_fn)
+  model.load_state_dict(torch.load(file_saved_weights))
+  model.eval()
 
-print(model)
-
-for X, _ in train_dataloader:
-  example_inputs = X
-  break
-
-import copy
-import torch
-
-import torch._dynamo as torchdynamo
-from torch.ao.quantization._quantize_pt2e import (
-  convert_pt2e,
-  prepare_pt2e_quantizer,
-)
-
-import shir_backend
-import shir_quantizer
-
-example_inputs = (example_inputs,)
-
-model, guards = torchdynamo.export(
-  model,
-  *copy.deepcopy(example_inputs),
-  aten_graph=True,
-)
-
-quantizer = shir_quantizer.BackendQuantizer()
-operator_config = shir_quantizer.get_symmetric_quantization_config()
-quantizer.set_global(operator_config)
-
-model = prepare_pt2e_quantizer(model, quantizer)
-model(*example_inputs)  # calibration
-model = convert_pt2e(model)
-
-torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
-model(*example_inputs)
-
-test_loop(test_dataloader, model, loss_fn)
+  return model

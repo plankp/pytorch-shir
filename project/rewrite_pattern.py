@@ -84,11 +84,8 @@ def qrelu_pat(x, s_in, z_in, s_out, z_out):
   return x
 
 def qrelu_repl(x, s_in, z_in, s_out, z_out):
-  x = torch.relu(x - z_in)
-  # the following is functionally the same as quantize_per_tensor, except we
-  # can't use that since x is uint8 and not float32.
-  k = s_in / s_out
-  x = torch.clamp(torch.round(k * x + z_out), -128, 127).to(torch.int8)
+  x_q = torch.relu(x - z_in)
+  x = qd.quantize_per_tensor.tensor(x_q.float(), s_out / s_in, z_out, -128, 127, dtype=torch.int8)
   return x
 
 """
@@ -107,7 +104,7 @@ def qlinear_pat(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
 def qlinear_repl(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
   k = scl_x * scl_y
   w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
-  x = torch.clamp(torch.round(w_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return x
 
 """
@@ -129,7 +126,7 @@ def qlinear_bias_repl(bias, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_ou
   bias_q = torch.round(bias / k).int()
   w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
   w_q = bias_q + w_q
-  x = torch.clamp(torch.round(w_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return x
 
 """
@@ -149,7 +146,7 @@ def qlinear_relu_pat(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
 def qlinear_relu_repl(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
   k = scl_x * scl_y
   w_q = torch.relu((x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T)
-  x = torch.clamp(torch.round(w_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return x
 
 """
@@ -171,7 +168,7 @@ def qlinear_bias_relu_repl(bias, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, ze
   bias_q = torch.round(bias / k).int()
   w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
   w_q = torch.relu(bias_q + w_q)
-  x = torch.clamp(torch.round(w_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return x
 
 """
@@ -198,7 +195,7 @@ def qconv_repl(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
       (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), None,
       stride, padding, dilation, transposed, output_padding, groups)
 
-  p = torch.clamp(torch.round(p_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return p
 
 """
@@ -230,7 +227,7 @@ def qconv_bias_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_
       (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), bias_q,
       stride, padding, dilation, transposed, output_padding, groups)
 
-  p = torch.clamp(torch.round(p_q * (k / scl_out) + zero_out), -128, 127).to(torch.int8)
+  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return p
 
 """
@@ -257,7 +254,7 @@ def qconv_relu_repl(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
       stride, padding, dilation, transposed, output_padding, groups)
 
   p_q = torch.relu(p_q)
-  p = torch.clamp(torch.round(p_q * (k / scl_out) + zero_out), -127, 127).to(torch.int8)
+  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return p
 
 """
@@ -285,7 +282,7 @@ def qconv_bias_relu_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, 
       stride, padding, dilation, transposed, output_padding, groups)
 
   p_q = torch.relu(p_q)
-  p = torch.clamp(torch.round(p_q * (k / scl_out) + zero_out), -127, 127).to(torch.int8)
+  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
   return p
 
 """
@@ -302,7 +299,7 @@ def qconv_maxpool2d_pat(x_q, scl_x, zero_x, scl_out, zero_out,
 def qconv_maxpool2d_repl(x_q, scl_x, zero_x, scl_out, zero_out,
                          kernel_size, stride, padding, dilation):
   x_q = aten.max_pool2d.default(x_q.int() - zero_x.int(), kernel_size, stride, padding, dilation, False)
-  x = torch.clamp(torch.round(x_q * (scl_x / scl_out) + zero_out), -127, 127).to(torch.int8)
+  x = qd.quantize_per_tensor.tensor(x_q.float(), scl_out / scl_x, zero_out, -128, 127, dtype=torch.int8)
   return x
 
 _rewrite_patterns.extend([

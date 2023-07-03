@@ -15,6 +15,7 @@ from functorch.compile import make_boxed_func
 import rewrite_pattern
 import shir_type
 import shir_lowering
+import monkey_patcher
 from functools import reduce
 
 # some namespace aliases
@@ -54,7 +55,8 @@ class SHIRGraphModule(torch.nn.Module):
       print(self.emit())
       self.emitted = True
 
-    return self.gm(*args)
+    with monkey_patcher.Patcher():
+      return self.gm(*args)
 
   def emit(self):
     buffer = \
