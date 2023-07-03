@@ -6,5 +6,5 @@ venv/
 .idea/
 .env
 
-# automatically downloaded datasets
+# automatically downloaded datasets and other generated files
 data/

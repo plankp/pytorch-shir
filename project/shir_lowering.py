@@ -570,7 +570,7 @@ class LowerConvolution:
                            f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
 
       if pad:
-        acc = lambda t: (f"{{ val _1 = algo.Repeat({w2}, {pad}); "
+        acc = lambda t: (f"{{ val _1 = algo.Repeat({w2}, {pad});"
                          f" algo.Concat(algo.Concat(_1, {inner(t)}), _1) }}")
       else:
         acc = inner
@@ -614,7 +614,10 @@ class LowerConvolution:
 
       w1 = acc("core.ParamUse(_0)")
       w2 = k
-      w3 = f"algo.Slide({w1}, {w2})"
+      w3 = (
+        f"algo.SlideGeneral({w1}, {w2}, {stride})" if stride > 1
+        else f"algo.Slide({w1}, {w2})"
+      )
       w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
 
       if dilation > 1:
@@ -626,14 +629,6 @@ class LowerConvolution:
         w3 = (f"algo.Map({{"
               f" val _3 = core.ParamDef(algo.SeqType(algo.AlgoDataTypeVar(), {k}));"
               f" algo.AlgoLambda(Seq(_3), {w4}) }}, {w3})")
-
-      if stride > 1:
-        # strides work on the 1st dimension (Out') of the slided input, which is
-        # affected by the dilated kernel width.
-        indices = range(1 if stride > out_width else out_width // stride)
-        indices = (f"algo.Drop(_2, {stride * i}, {out_width - 1 - stride * i})" for i in indices)
-        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
-        w3 = f"{{ val _2 = {w3}; {w4} }}"
 
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
                        f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
@@ -807,7 +802,10 @@ class LowerMaxPoolND:
 
       w1 = acc("core.ParamUse(_0)")
       w2 = k
-      w3 = f"algo.Slide({w1}, {w2})"
+      w3 = (
+        f"algo.SlideGeneral({w1}, {w2}, {stride})" if stride > 1
+        else f"algo.Slide({w1}, {w2})"
+      )
       w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
 
       if dilation > 1:
@@ -819,14 +817,6 @@ class LowerMaxPoolND:
         w3 = (f"algo.Map({{"
               f" val _3 = core.ParamDef(algo.SeqType(algo.AlgoDataTypeVar(), {k}));"
               f" algo.AlgoLambda(Seq(_3), {w4}) }}, {w3})")
-
-      if stride > 1:
-        # strides work on the 1st dimension (Out') of the slided input, which is
-        # affected by the dilated kernel width.
-        indices = range(1 if stride > out_width else out_width // stride)
-        indices = (f"algo.Drop(_2, {stride * i}, {out_width - 1 - stride * i})" for i in indices)
-        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
-        w3 = f"{{ val _2 = {w3}; {w4} }}"
 
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
                        f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
