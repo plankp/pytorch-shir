@@ -3,9 +3,10 @@ import torch
 # Note: torch._dynamo.optimizations.training.aot_autograd got moved
 from torch._dynamo.backends.common import (
   aot_module_simplified,
-  fake_tensor_unsupported,
+  fake_tensor_unsupported,  #  seems like it's not needed
 )
 from torch._decomp import core_aten_decompositions, get_decompositions
+from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
@@ -178,14 +179,14 @@ def apply_shir_ops(gm: torch.fx.GraphModule):
       gm.delete_submodule(n.target)
       gm.add_submodule(n.target, SHIRGraphModule(submod))
 
-@fake_tensor_unsupported
 def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
   # raw ops -> core aten -> rewrite ->
   #   prims -> late rewrite -> partition -> shir-ify
 
   def phase_partition(gm, example_inputs):
-    # gm.print_readable()
     rewrite_pattern.late_rewrite(gm)
+    FakeTensorProp(gm).propagate(*example_inputs) # for shape info
+    # gm.print_readable()
     supported_ops = SHIROperatorSupport()
     partitioner = CapabilityBasedPartitioner(gm, supported_ops,
                                              allows_single_node_partition=True)
@@ -196,6 +197,7 @@ def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     return make_boxed_func(fused_graph.forward)
 
   def phase_rewrite(gm, example_inputs):
+    rewrite_pattern.early_rewrite(gm)
     # gm.print_readable()
     rewrite_pattern.rewrite(gm)
     f = aot_module_simplified(gm, example_inputs,

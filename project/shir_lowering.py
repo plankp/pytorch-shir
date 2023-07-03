@@ -746,9 +746,14 @@ class LowerConvolution:
 class LowerMaxPoolND:
   def supports(input, kernel_size, stride=[], padding=0, dilation=1,
                ceil_mode=False) -> bool:
-    # padding is a bit annoying because it pads the smallest value
-    if padding != 0 or (isinstance(padding, list) and any(padding)):
-      return False
+    # disallow padding for now: it (usually) does not zero-pad
+    match padding:
+      case int(w) if w == 0:
+        return True
+      case list(w) if all(x == 0 for x in padding):
+        return True
+      case _:
+        return False
 
     if ceil_mode:
       return False
@@ -759,7 +764,7 @@ class LowerMaxPoolND:
     self.N = N
     self.elt_ty = elt_ty
     self._kernel_size = kernel_size
-    self._stride = stride
+    self._stride = stride if stride != [] else kernel_size
     self._dilation = dilation
 
   # For some reason, max_pool?d loves to keep things as scalar and rely on

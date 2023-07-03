@@ -16,57 +16,39 @@ def rewrite(gm: GraphModule):
     subgraph_rewriter.replace_pattern(gm, pat, repl)
   gm.graph.lint()
 
-# tries to recover from decomposed forms back into a simpler non-core-ATen
-# form.
-#
-# sometimes AOT autograd decomposes a bit too aggressively, rewriting the
-# operator into a very painful-to-handle form. An extreme form of this is
-# aten.max_pool1d where it turns into a aten.squeeze followed by a
-# aten.max_pool2d_with_indices and a tuple select.
-#
-# for the record, we're probably not going to be able to recover max_pool1d,
-# but we do want to at least recover it back into max_pool2d.
-def late_rewrite(gm: GraphModule):
-  max_pool_repl_map = {
-    aten.max_pool1d_with_indices.default: aten.max_pool1d.default,  # unlikely
-    aten.max_pool2d_with_indices.default: aten.max_pool2d.default,
-    aten.max_pool3d_with_indices.default: aten.max_pool3d.default,
-  }
+def _node_is_getitem(node: torch.fx.Node, value: torch.fx.Node, idx: int) -> bool:
+  if node.op != "call_function" or node.target != operator.getitem:
+    return False
+  if node.kwargs != {}:
+    return False    # assume something strange is happening
+  match node.args:
+    case [v, n] if v is value and n == idx:
+      return True
+    case _:
+      return False
 
-  for n in gm.graph.nodes:
-    if n.op != "call_function":
-      continue
-
-    # turn:
-    #   x = call_function | aten.max_pool?d_with_indices | (w, ...)
-    #   y = call_function | getitem | (x, 0)  <-- all uses of x look like this
-    # into:
-    #   x = call_function | aten.max_pool?d | (w, ...)
-    #   y = x
-    repl = max_pool_repl_map.get(n.target)
-    if repl is not None:
-      def is_get_maxpool(node):
-        if node.op != "call_function" or node.target != operator.getitem:
-          return False
-        if node.kwargs != {}:
-          return False
-        match node.args:
-          case [v, 0] if v is n:
-            return True
-          case _:
-            return False
-
-      if n.users and all((is_get_maxpool(user) for user in n.users)):
-        n.target = repl
-        info = n.meta.get("val")
-        if info:
-          n.meta["val"] = info[0]
-
-        for user in [*n.users]:
-          user.replace_all_uses_with(n)
-          gm.graph.erase_node(user)
-
+def _undo_aten_decomps(gm: GraphModule):
+  subgraph_rewriter.replace_pattern(gm, remat_maxpool2d_pat, remat_maxpool2d_repl)
   gm.graph.lint()
+
+def late_rewrite(gm: GraphModule):
+  _undo_aten_decomps(gm)
+
+def early_rewrite(gm: GraphModule):
+  _undo_aten_decomps(gm)
+
+"""
+Some magic to "undo" the decomposition of max_pool?d
+"""
+
+def remat_maxpool2d_pat(x, kernel_size, stride, padding, dilation):
+  x = aten.max_pool2d_with_indices.default(x, kernel_size, stride, padding, dilation)
+  x = x[0]
+  return x
+
+def remat_maxpool2d_repl(x, kernel_size, stride, padding, dilation):
+  x = aten.max_pool2d.default(x, kernel_size, stride, padding, dilation)
+  return x
 
 """
 def qd.quantize_per_tensor(
@@ -257,7 +239,7 @@ ReLU(CONV(sx (X - zx), sw (W - zw)))
 """
 
 def qconv_relu_pat(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-              stride, padding, dilation, transposed, output_padding, groups):
+                   stride, padding, dilation, transposed, output_padding, groups):
   x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
   w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
   p = aten.convolution.default(
@@ -268,7 +250,7 @@ def qconv_relu_pat(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
   return p
 
 def qconv_relu_repl(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-               stride, padding, dilation, transposed, output_padding, groups):
+                    stride, padding, dilation, transposed, output_padding, groups):
   k = scl_x * scl_w
   p_q = aten.convolution.default(
       (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), None,
@@ -284,7 +266,7 @@ ReLU(CONV(sx (X - zx), sw (W - zw), bias))
 """
 
 def qconv_bias_relu_pat(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                   stride, padding, dilation, transposed, output_padding, groups):
+                        stride, padding, dilation, transposed, output_padding, groups):
   x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
   w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
   p = aten.convolution.default(
@@ -295,7 +277,7 @@ def qconv_bias_relu_pat(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, z
   return p
 
 def qconv_bias_relu_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                    stride, padding, dilation, transposed, output_padding, groups):
+                         stride, padding, dilation, transposed, output_padding, groups):
   k = scl_x * scl_w
   bias_q = torch.round(bias / k).int()
   p_q = aten.convolution.default(
@@ -305,6 +287,23 @@ def qconv_bias_relu_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, 
   p_q = torch.relu(p_q)
   p = torch.clamp(torch.round(p_q * (k / scl_out) + zero_out), -127, 127).to(torch.int8)
   return p
+
+"""
+MAXPOOL2D(sx (X - zx)) = sx MAXPOOL2D(X - zx)
+"""
+
+def qconv_maxpool2d_pat(x_q, scl_x, zero_x, scl_out, zero_out,
+                        kernel_size, stride, padding, dilation):
+  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
+  x = aten.max_pool2d.default(x, kernel_size, stride, padding, dilation)
+  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
+  return x
+
+def qconv_maxpool2d_repl(x_q, scl_x, zero_x, scl_out, zero_out,
+                         kernel_size, stride, padding, dilation):
+  x_q = aten.max_pool2d.default(x_q.int() - zero_x.int(), kernel_size, stride, padding, dilation, False)
+  x = torch.clamp(torch.round(x_q * (scl_x / scl_out) + zero_out), -127, 127).to(torch.int8)
+  return x
 
 _rewrite_patterns.extend([
   (qrelu_pat, qrelu_repl),
@@ -318,4 +317,6 @@ _rewrite_patterns.extend([
   (qconv_bias_pat, qconv_bias_repl),
   (qconv_relu_pat, qconv_relu_repl),
   (qconv_bias_relu_pat, qconv_bias_relu_repl),
+
+  (qconv_maxpool2d_pat, qconv_maxpool2d_repl),
 ])

@@ -125,6 +125,7 @@ class BackendQuantizer(Quantizer):
     self._annotate_conv(gm, qconfig)
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
+    self._annotate_maxpool(gm, qconfig)
 
   # validate the annotated graph is supported by the backend
   def validate(self, gm: torch.fx.GraphModule) -> None:
@@ -251,4 +252,24 @@ class BackendQuantizer(Quantizer):
         _annotate_input_qspec_map(conv_node, bias, bias_qspec)
 
       _annotate_output_qspec(conv_node, output_qspec)
+      _mark_nodes_as_annotated([*p.nodes])
+
+  def _annotate_maxpool(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    all_partitions = get_source_partitions(gm.graph, [torch.nn.MaxPool2d])
+    partitions = list(itertools.chain(*all_partitions.values()))
+    for p in partitions:
+      out = p.output_nodes[0]
+      inp = p.input_nodes[0]
+      if _is_annotated([out]):
+        continue
+
+      # only proceed if the input has an annotation
+      if not _is_annotated([inp]):
+        continue
+      if inp.meta["quantization_annotation"].output_qspec is None:
+        continue
+
+      shared_qspec = SharedQuantizationSpec(inp)
+
+      _annotate_output_qspec(out, shared_qspec)
       _mark_nodes_as_annotated([*p.nodes])
