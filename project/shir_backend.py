@@ -55,8 +55,7 @@ class SHIRGraphModule(torch.nn.Module):
       print(self.emit())
       self.emitted = True
 
-    with monkey_patcher.Patcher():
-      return self.gm(*args)
+    return self.gm(*args)
 
   def emit(self):
     buffer = \
@@ -182,12 +181,10 @@ def apply_shir_ops(gm: torch.fx.GraphModule):
       gm.add_submodule(n.target, SHIRGraphModule(submod))
 
 def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
-  # raw ops -> core aten -> rewrite ->
-  #   prims -> late rewrite -> partition -> shir-ify
+  # raw ops -> quantized rewrite -> core aten + prims
+  #   -> partition -> shir
 
-  def phase_partition(gm, example_inputs):
-    rewrite_pattern.late_rewrite(gm)
-    FakeTensorProp(gm).propagate(*example_inputs) # for shape info
+  def lowering(gm, example_inputs):
     # gm.print_readable()
     supported_ops = SHIROperatorSupport()
     partitioner = CapabilityBasedPartitioner(gm, supported_ops,
@@ -198,16 +195,14 @@ def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
     return make_boxed_func(fused_graph.forward)
 
-  def phase_rewrite(gm, example_inputs):
-    rewrite_pattern.early_rewrite(gm)
-    # gm.print_readable()
-    rewrite_pattern.rewrite(gm)
-    f = aot_module_simplified(gm, example_inputs,
-                              decompositions=_decomps,
-                              fw_compiler=phase_partition)
-    return make_boxed_func(f)
+  rewrite_pattern.rewrite_quantized_ops(gm)
+  gm.graph.lint()
+  gm.recompile()
+
+  augdecomps = core_aten_decompositions()
+  augdecomps.update(_decomps)
 
   f = aot_module_simplified(gm, example_inputs,
-                            decompositions=core_aten_decompositions(),
-                            fw_compiler=phase_rewrite)
+                            decompositions=augdecomps,
+                            fw_compiler=lowering)
   return f

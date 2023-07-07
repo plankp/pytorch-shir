@@ -1,5 +1,7 @@
 import torch
+import struct
 import shir_type
+import shir_intrinsic
 from functools import reduce
 from itertools import chain
 
@@ -13,6 +15,7 @@ signature SHIRLowering:
 """
 
 # some namespace aliases
+shir = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
@@ -127,6 +130,97 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
 """
 magic that actually does the lowering of each node
 """
+
+@register_operator(shir.requantize.default)
+class LowerRequantize:
+  @classmethod
+  def supports(cls, a, s, z) -> bool:
+    if shir_type.get_element_type(a) != shir_type.SI(32):
+      return False
+
+    try:
+      # we just ignore the q > 0 case for simplicity
+      _, q = cls.qscale_to_fixpoint(s)
+      return q <= 0
+    except AssertionError:
+      pass
+
+    return False
+
+  @classmethod
+  def lower(cls, a, s, z) -> str:
+    s, q = cls.qscale_to_fixpoint(s)
+    assert q <= 0
+
+    def gen_kernel(t):
+      width = 32      # we're quantizing a 32-bit integer
+
+      sbits = s.bit_length() + 1  # +1 to make sure it's a positive signed value
+      width += sbits  # we multiply by the scale
+      # XXX: without the extra Id node, algo to arch lowering seems to fail...
+      acc = (f"algo.Mul(algo.Tuple(algo.Id({t}),"
+             f" algo.ConstantInteger({s}, Some(algo.SignedIntType({sbits})))))")
+
+      # as usual, ClipBankersRound (both algo and arch versions) need exact
+      # width information. we're already tracking it, so just insert
+      # TruncIntegers type checking for sanity.
+      if q < 0:
+        width += q    # we dropped q bits via rounding
+        acc = (f"algo.Sub(algo.Tuple(algo.TruncInteger("
+               f"algo.ClipBankersRound({acc}, {-q}, 0), {width}),"
+               f" algo.ConstantInteger(0)))")
+
+      if z != 0:
+        # algo.Add will sneak in an extra bit if both are 32 bits (unlikely)
+        width = max(width, 32) if width != 32 else 33
+        acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
+
+      return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
+
+    ashape = a.meta.get("val").shape
+    if not ashape:
+      return gen_kernel(a.name)
+
+    w = gen_kernel("core.ParamUse(_0)")
+    acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(algo.SignedIntType(32));"
+                     f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
+    for _ in ashape[1:]:
+      w = acc("core.ParamUse(_0)")
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
+                       f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
+
+    return acc(a.name)
+
+  @staticmethod
+  def qscale_to_fixpoint(f: float) -> (int, int):
+    if f == 0:
+      return (0, 0)
+
+    assert f >= 0, "qscale cannot be negative"
+    bits = struct.unpack(">l", struct.pack(">f", f))[0]
+    exp = bits >> 23
+    assert 0 < exp < 0xff, "qscale must be normal"
+
+    man = (bits & 0x7f_ffff) | 0x80_0000
+    width = 0
+    if (man & 0xffff) == 0:
+      man >>= 16
+      width += 16
+    if (man & 0xff) == 0:
+      man >>= 8
+      width += 8
+    if (man & 0xf) == 0:
+      man >>= 4
+      width += 4
+    if (man & 0x3) == 0:
+      man >>= 2
+      width += 2
+    if (man & 0x1) == 0:
+      man >>= 1
+      width += 1
+
+    return (man, exp - 127 - 23 + width)
+
 
 @register_operator(aten.view.default)
 class LowerView:
@@ -858,7 +952,7 @@ class LowerMaxPoolND:
             f" algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
             f" {frag_inner_map}) }}, core.ParamUse(_0))) }}, {input})")
 
-@register_operator(aten.max_pool2d.default)
+@register_operator(shir.int_max_pool2d.default)
 class LowerMaxPool2D(LowerMaxPoolND):
   @classmethod
   def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
@@ -867,15 +961,4 @@ class LowerMaxPool2D(LowerMaxPoolND):
     ishape = input.meta.get("val").shape
 
     obj = cls(2, elt_ty, kernel_size, stride, dilation)
-    return obj.emit(input.name, ishape)
-
-@register_operator(aten.max_pool3d.default)
-class LowerMaxPool2D(LowerMaxPoolND):
-  @classmethod
-  def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
-            ceil_mode=False) -> str:
-    elt_ty = shir_type.get_element_type(input)
-    ishape = input.meta.get("val").shape
-
-    obj = cls(3, elt_ty, kernel_size, stride, dilation)
     return obj.emit(input.name, ishape)
