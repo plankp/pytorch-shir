@@ -636,25 +636,9 @@ class LowerConvolution:
     self.dilation = dilation
 
   def _zero_pad(self, input, idim):
-    iter = zip(reversed(self.padding), reversed(idim))
-    frag_padding = f"algo.ConstantInteger(0, Some({self.elt_ty.name()}))"
-
-    (pad, width) = next(iter)
-    w2 = frag_padding
-    if not pad:
-      acc = lambda t: None
-    else:
-      acc = lambda t: (f"{{ val _1 = algo.Repeat({w2}, {pad});"
-                       f" algo.Concat(algo.Concat(_1, {t}), _1) }}")
-
-    for (next_pad, next_width) in iter:
-      frag_padding = f"algo.Repeat({frag_padding}, {width + 2 * pad})"
-
+    acc = lambda t: None
+    for (pad, width) in zip(reversed(self.padding), reversed(idim)):
       w1 = acc("core.ParamUse(_0)")
-      w2 = frag_padding
-      pad = next_pad
-      width = next_width
-
       if w1 is None:
         if not pad:
           continue  # acc is lambda t: None
@@ -664,8 +648,8 @@ class LowerConvolution:
                            f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
 
       if pad:
-        acc = lambda t: (f"{{ val _1 = algo.Repeat({w2}, {pad});"
-                         f" algo.Concat(algo.Concat(_1, {inner(t)}), _1) }}")
+        w2 = pad
+        acc = lambda t: f"algo.Pad({inner(t)}, {w2}, {w2}, 0)"
       else:
         acc = inner
 
