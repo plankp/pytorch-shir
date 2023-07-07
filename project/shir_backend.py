@@ -15,7 +15,6 @@ from functorch.compile import make_boxed_func
 import rewrite_pattern
 import shir_type
 import shir_lowering
-import monkey_patcher
 from functools import reduce
 
 # some namespace aliases
