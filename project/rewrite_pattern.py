@@ -1,319 +1,333 @@
+from typing import Optional
 from torch.fx.graph_module import GraphModule
-from torch.fx import subgraph_rewriter
+from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
+from torch._dynamo.source import (
+  NNModuleSource,
+  LocalSource,
+  AttrSource,
+)
+from torch.fx import subgraph_rewriter, Node
 import torch
-import operator
+import shir_intrinsic   # make sure these are loaded
 
 # don't match or emit prims ops at this level!
 aten = torch.ops.aten
+shir = torch.ops.shir_intrinsic
 qd = torch.ops.quantized_decomposed
 
-# we'll register rewrites into this list
-# earlier patterns are matched first
-_rewrite_patterns = []
+class QuantOpRewrite:
 
-def rewrite(gm: GraphModule):
-  for (pat, repl) in _rewrite_patterns:
-    subgraph_rewriter.replace_pattern(gm, pat, repl)
-  gm.graph.lint()
+  def __init__(self, gm: GraphModule):
+    self.counter = -1
+    self.gm = gm
 
-def _node_is_getitem(node: torch.fx.Node, value: torch.fx.Node, idx: int) -> bool:
-  if node.op != "call_function" or node.target != operator.getitem:
-    return False
-  if node.kwargs != {}:
-    return False    # assume something strange is happening
-  match node.args:
-    case [v, n] if v is value and n == idx:
-      return True
-    case _:
-      return False
+  def rewrite(self):
+    self._rewrite_qconv_relu()
+    self._rewrite_qconv()
+    self._rewrite_qlinear_relu()
+    self._rewrite_qlinear()
+    self._rewrite_qmaxpool()
 
-def _undo_aten_decomps(gm: GraphModule):
-  subgraph_rewriter.replace_pattern(gm, remat_maxpool2d_pat, remat_maxpool2d_repl)
-  gm.graph.lint()
+  def find_free_name(self) -> str:
+    while True:
+      self.counter += 1
+      name = f"_fixed_qconst{self.counter}"
+      if not hasattr(self.gm, name):
+        assert name not in self.gm._param_name_to_source
+        return name
 
-def late_rewrite(gm: GraphModule):
-  _undo_aten_decomps(gm)
+  def synthesize_tensor(self, tensor: torch.Tensor) -> str:
+    # because fx nodes don't like raw tensors appearing in arguments, we
+    # follow the workaround used in pytorch/pytorch #43512, which is to make
+    # it a module-level attribute
 
-def early_rewrite(gm: GraphModule):
-  _undo_aten_decomps(gm)
+    name = self.find_free_name()
+    self.gm.register_buffer(name, tensor)
+    self.gm._param_name_to_source[name] = NNModuleSource(
+      AttrSource(LocalSource("self"), name)
+    )
+    return name
 
-"""
-Some magic to "undo" the decomposition of max_pool?d
-"""
+  def extract_tensor(self, n: Node) -> Optional[torch.Tensor]:
+    if n.op != "get_attr" or n.args != () or n.kwargs != {}:
+      return None
+    return getattr(self.gm, n.target)
 
-def remat_maxpool2d_pat(x, kernel_size, stride, padding, dilation):
-  x = aten.max_pool2d_with_indices.default(x, kernel_size, stride, padding, dilation)
-  x = x[0]
-  return x
+  def find_first_user(self, n: Node) -> Optional[Node]:
+    if len(n.users) == 1:
+      return list(n.users.keys())[0]
 
-def remat_maxpool2d_repl(x, kernel_size, stride, padding, dilation):
-  x = aten.max_pool2d.default(x, kernel_size, stride, padding, dilation)
-  return x
+    # TODO: actually find
+    return None
 
-"""
-def qd.quantize_per_tensor(
-  x: float,
-  s: positive float,
-  z: T,
-  min: T,
-  max: T,
-  type_of_t
-) -> T:
-  return clamp(round(x / s + z), min, max).to(type_of_T)
+  """
+  b + (sx (X - zx)) @ (sy (Y - zy))
+    = b + sx sy ((X - zx) @ (Y - zy))
+    = (sx sy) ([b / (sx sy)] + (X - zx) @ (Y - zy))   <-- bias is quantized
+  """
 
-def qd.dequantize_per_tensor(
-  x: T,
-  s: positive float,
-  z: T,
-  min: T,
-  max: T,
-  type_of_t
-) -> float:
-  return s * (x - z)
-"""
+  def _rewrite_qlinear(self):
+    def biased_pattern(x, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
+      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = aten.t.default(w)
+      x = aten.addmm.default(b, x, w)
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
 
-"""
-ReLU(sx * (x - zx))
-  = sx * ReLU(x - zx)
-"""
+    pattern = torch.fx.symbolic_trace(biased_pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=False))
 
-def qrelu_pat(x, s_in, z_in, s_out, z_out):
-  x = qd.dequantize_per_tensor.tensor(x, s_in, z_in, -128, 127, torch.int8)
-  x = aten.relu.default(x)
-  x = qd.quantize_per_tensor.tensor(x, s_out, z_out, -128, 127, torch.int8)
-  return x
+    def unbiased_pattern(x, w, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
+      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = aten.t.default(w)
+      x = aten.mm.default(x, w)
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
 
-def qrelu_repl(x, s_in, z_in, s_out, z_out):
-  x_q = torch.relu(x - z_in)
-  x = qd.quantize_per_tensor.tensor(x_q.float(), s_out / s_in, z_out, -128, 127, dtype=torch.int8)
-  return x
+    pattern = torch.fx.symbolic_trace(unbiased_pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=False))
 
-"""
-(sx (X - zx)) @ (sy (Y - zy))
-  = sx sy ((X - zx) @ (Y - zy))
-"""
+  """
+  ReLU(b + (sx (X - zx)) @ (sy (Y - zy)))
+    = (sx sy) ReLU([b / (sx sy)] + (X - zx) @ (Y - zy))
+  """
 
-def qlinear_pat(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  w = qd.dequantize_per_tensor.tensor(x, scl_x, zero_x, -128, 127, torch.int8)
-  x = qd.dequantize_per_tensor.tensor(y, scl_y, zero_y, -127, 127, torch.int8)
-  x = aten.permute.default(x, [1, 0])
-  x = aten.mm.default(w, x)
-  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
-  return x
+  def _rewrite_qlinear_relu(self):
+    def biased_pattern(x, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
+      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = aten.t.default(w)
+      x = aten.addmm.default(b, x, w)
+      x = aten.relu.default(x)
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
 
-def qlinear_repl(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  k = scl_x * scl_y
-  w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
-  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return x
+    pattern = torch.fx.symbolic_trace(biased_pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=True))
 
-"""
-b + (sx (X - zx)) @ (sy (Y - zy))
-  = b + sx sy ((X - zx) @ (Y - zy))
-  = (sx sy) ([b / (sx sy)] + (X - zx) @ (Y - zy))   <-- bias is quantized
-"""
+    def unbiased_pattern(x, w, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
+      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = aten.t.default(w)
+      x = aten.mm.default(x, w)
+      x = aten.relu.default(x)
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
 
-def qlinear_bias_pat(b, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  w = qd.dequantize_per_tensor.tensor(x, scl_x, zero_x, -128, 127, torch.int8)
-  x = qd.dequantize_per_tensor.tensor(y, scl_y, zero_y, -127, 127, torch.int8)
-  x = aten.permute.default(x, [1, 0])
-  x = aten.addmm.default(b, w, x)
-  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
-  return x
+    pattern = torch.fx.symbolic_trace(unbiased_pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=True))
 
-def qlinear_bias_repl(bias, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  k = scl_x * scl_y
-  bias_q = torch.round(bias / k).int()
-  w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
-  w_q = bias_q + w_q
-  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return x
+  """
+  CONV(sx (X - zx), sw (W - zw), b)
+    = sx sw (CONV(X - zx, W - zw, [b / (sx sw)])
+  """
 
-"""
-ReLU((sx (X - zx)) @ (sy (Y - zy)))
-  = sx sy ReLU((X - zx) @ (Y - zy))
-"""
+  def _rewrite_qconv(self):
+    def pattern(stride, padding, dilation, transposed, output_padding, groups,
+                x_q, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
+      w_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w_q, s_w, z_w, -127, 127, torch.int8)
+      p = aten.convolution.default(
+          x, w, b,
+          stride, padding, dilation, transposed, output_padding, groups)
+      p = qd.quantize_per_tensor(p, s_out, z_out, -128, 127, torch.int8)
+      return p
 
-def qlinear_relu_pat(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  w = qd.dequantize_per_tensor.tensor(x, scl_x, zero_x, -128, 127, torch.int8)
-  x = qd.dequantize_per_tensor.tensor(y, scl_y, zero_y, -127, 127, torch.int8)
-  x = aten.permute.default(x, [1, 0])
-  x = aten.mm.default(w, x)
-  x = aten.relu.default(x)
-  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
-  return x
+    pattern = torch.fx.symbolic_trace(pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qconv(m, relu=False))
 
-def qlinear_relu_repl(x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  k = scl_x * scl_y
-  w_q = torch.relu((x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T)
-  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return x
+  """
+  ReLU(CONV(sx (X - zx), sw (W - zw)), b)
+    = sx sw ReLU(CONV(X - zx, W - zw, [b / (sx sw)]))
+  """
 
-"""
-ReLU(b + (sx (X - zx)) @ (sy (Y - zy)))
-  = sx sy ReLU([b / (sx sy)] + (X - zx) @ (Y - zy))
-"""
+  def _rewrite_qconv_relu(self):
+    def pattern(stride, padding, dilation, transposed, output_padding, groups,
+                x_q, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
+      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
+      w_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+      w = qd.dequantize_per_tensor(w_q, s_w, z_w, -127, 127, torch.int8)
+      p = aten.convolution.default(
+          x, w, b,
+          stride, padding, dilation, transposed, output_padding, groups)
+      p = aten.relu.default(p)
+      p = qd.quantize_per_tensor(p, s_out, z_out, -128, 127, torch.int8)
+      return p
 
-def qlinear_bias_relu_pat(b, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  w = qd.dequantize_per_tensor.tensor(x, scl_x, zero_x, -128, 127, torch.int8)
-  x = qd.dequantize_per_tensor.tensor(y, scl_y, zero_y, -127, 127, torch.int8)
-  x = aten.permute.default(x, [1, 0])
-  x = aten.addmm.default(b, w, x)
-  x = aten.relu.default(x)
-  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
-  return x
+    pattern = torch.fx.symbolic_trace(pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qconv(m, relu=True))
 
-def qlinear_bias_relu_repl(bias, x, scl_x, zero_x, y, scl_y, zero_y, scl_out, zero_out):
-  k = scl_x * scl_y
-  bias_q = torch.round(bias / k).int()
-  w_q = (x.int() - zero_x.int()) @ (y.int() - zero_y.int()).T
-  w_q = torch.relu(bias_q + w_q)
-  x = qd.quantize_per_tensor.tensor(w_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return x
+  """
+  MAXPOOL2D(sx (X - zx)) = sx MAXPOOL2D(X - zx)
+  """
 
-"""
-CONV(sx (X - zx), sw (W - zw))
-  = sx sw CONV(X - zx, W - zw)    <-- it's a repeated dot product
+  def _rewrite_qmaxpool(self):
+    def pattern(kernel_size, stride, padding, dilation, x_q,
+                s_x, z_x, s_out, z_out):
+      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
+      x = aten.max_pool2d_with_indices.default(x, kernel_size, stride, padding, dilation)
+      x = x[0]
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
 
-Translating it this way allows implementing padding as zero padding.
-"""
+    pattern = torch.fx.symbolic_trace(pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qmaxpool(m))
 
-def qconv_pat(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-              stride, padding, dilation, transposed, output_padding, groups):
-  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
-  w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
-  p = aten.convolution.default(
-      x, w, None,
-      stride, padding, dilation, transposed, output_padding, groups)
-  p = qd.quantize_per_tensor.tensor(p, scl_out, zero_out, -128, 127, torch.int8)
-  return p
+  def _match_and_rewrite(self, pattern: torch.fx.Graph, callback):
+    graph = self.gm.graph
+    matcher = SubgraphMatcher(pattern)
+    matches = matcher.match(graph)
+    replacement_map = {}
+    for m in matches:
+      for i, old in enumerate(m.placeholder_nodes):
+        if isinstance(old, Node) and old in replacement_map:
+          replaced = replacement_map[old]
+          m.placeholder_nodes[i] = replaced
+          for k, v in m.nodes_map.items():
+            if v is old:
+              m.nodes_map[k] = replaced
 
-def qconv_repl(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-               stride, padding, dilation, transposed, output_padding, groups):
-  k = scl_x * scl_w
-  p_q = aten.convolution.default(
-      (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), None,
-      stride, padding, dilation, transposed, output_padding, groups)
+      r = callback(m)
+      if r is not None:
+        original, replacement = r
+        original.replace_all_uses_with(replacement)
+        replacement_map[original] = replacement
 
-  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return p
+      for node in m.nodes_map.values():
+        if node not in m.placeholder_nodes:
+          graph.erase_node(node)
 
-"""
-CONV(sx (X - zx), sw (W - zw), bias)
-  = sx sw (CONV(X - zx, W - zw, bias / (sx sw))
+  def _template_qlinear(self, m, relu=False):
+    if len(m.returning_nodes) != 1:
+      return None
 
-As it turns out, the shape of bias makes it pretty difficult to decompose it
-into broadcasted add:
-After CONV, we have T[N, OutChan, D1, D2, ...].
-We need to broadcast bias to that shape.
-The difficult part is we don't know the number of dimesions.
-"""
+    [x, *rest] = m.placeholder_nodes
+    tensors = [self.extract_tensor(n) for n in rest]
+    if not all((isinstance(t, torch.Tensor) for t in tensors)):
+      return None
 
-def qconv_bias_pat(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                   stride, padding, dilation, transposed, output_padding, groups):
-  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
-  w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
-  p = aten.convolution.default(
-      x, w, bias,
-      stride, padding, dilation, transposed, output_padding, groups)
-  p = qd.quantize_per_tensor.tensor(p, scl_out, zero_out, -128, 127, torch.int8)
-  return p
+    match tensors:
+      case [w, s_x, z_x, s_w, z_w, s_out, z_out]:
+        b = None
+      case [w, b, s_x, z_x, s_w, z_w, s_out, z_out]:
+        pass
+      case _:
+        assert False, "invalid qlinear-relu match"
 
-def qconv_bias_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                    stride, padding, dilation, transposed, output_padding, groups):
-  k = scl_x * scl_w
-  bias_q = torch.round(bias / k).int()
-  p_q = aten.convolution.default(
-      (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), bias_q,
-      stride, padding, dilation, transposed, output_padding, groups)
+    k = (s_x * s_w).item()
+    weight_v = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int()
+    if b is not None:
+      bias_v = torch.round(b / k).int()
 
-  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return p
+    last_node = m.returning_nodes[0]
+    first_user = self.find_first_user(last_node)
+    if first_user is None:
+      return None
 
-"""
-ReLU(CONV(sx (X - zx), sw (W - zw)))
-  = sx sw ReLU(CONV(X - zx, W - zw))
-"""
+    weight_attr = self.synthesize_tensor(weight_v)
+    if b is not None:
+      bias_attr = self.synthesize_tensor(bias_v)
 
-def qconv_relu_pat(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                   stride, padding, dilation, transposed, output_padding, groups):
-  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
-  w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
-  p = aten.convolution.default(
-      x, w, None,
-      stride, padding, dilation, transposed, output_padding, groups)
-  p = aten.relu.default(p)
-  p = qd.quantize_per_tensor.tensor(p, scl_out, zero_out, -128, 127, torch.int8)
-  return p
+    graph = self.gm.graph
+    with graph.inserting_before(first_user):
+      n1 = graph.call_method("int", (x,))
+      n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
+      n3 = graph.get_attr(weight_attr)
+      if b is not None:
+        n4 = graph.get_attr(bias_attr)
+      n5 = graph.call_function(aten.t, (n3,))
+      n6 = graph.call_function(aten.mm, (n2, n5))
+      if b is not None:
+        n6 = graph.call_function(aten.add, (n4, n6))
+      if relu:
+        n6 = graph.call_function(aten.relu, (n6,))
+      n7 = graph.call_function(shir.requantize, (n6, k / s_out.item(), z_out.item()))
 
-def qconv_relu_repl(x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                    stride, padding, dilation, transposed, output_padding, groups):
-  k = scl_x * scl_w
-  p_q = aten.convolution.default(
-      (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), None,
-      stride, padding, dilation, transposed, output_padding, groups)
+    return (last_node, n7)
 
-  p_q = torch.relu(p_q)
-  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return p
+  def _template_qconv(self, m, relu=False):
+    if len(m.returning_nodes) != 1:
+      return None
 
-"""
-ReLU(CONV(sx (X - zx), sw (W - zw), bias))
-  = sx sw ReLU((CONV(X - zx, W - zw, bias / (sx sw)))
-"""
+    [stride, padding, dilation, transposed, output_padding, groups,
+     x, *rest] = m.placeholder_nodes
+    tensors = [self.extract_tensor(n) for n in rest]
+    if not all((isinstance(t, torch.Tensor) for t in tensors)):
+      return None
 
-def qconv_bias_relu_pat(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                        stride, padding, dilation, transposed, output_padding, groups):
-  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
-  w = qd.dequantize_per_tensor.tensor(w_q, scl_w, zero_w, -127, 127, torch.int8)
-  p = aten.convolution.default(
-      x, w, bias,
-      stride, padding, dilation, transposed, output_padding, groups)
-  p = aten.relu.default(p)
-  p = qd.quantize_per_tensor.tensor(p, scl_out, zero_out, -128, 127, torch.int8)
-  return p
+    [w, b, s_x, z_x, s_w, z_w, s_out, z_out] = tensors
 
-def qconv_bias_relu_repl(bias, x_q, scl_x, zero_x, w_q, scl_w, zero_w, scl_out, zero_out,
-                         stride, padding, dilation, transposed, output_padding, groups):
-  k = scl_x * scl_w
-  bias_q = torch.round(bias / k).int()
-  p_q = aten.convolution.default(
-      (x_q.int() - zero_x.int()), (w_q.int() - zero_w.int()), bias_q,
-      stride, padding, dilation, transposed, output_padding, groups)
+    k = (s_x * s_w).item()
+    kernel_v = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int()
+    if b is not None:
+      bias_v = torch.round(b / k).int()
 
-  p_q = torch.relu(p_q)
-  p = qd.quantize_per_tensor.tensor(p_q.float(), scl_out / k, zero_out, -128, 127, dtype=torch.int8)
-  return p
+    last_node = m.returning_nodes[0]
+    first_user = self.find_first_user(last_node)
+    if first_user is None:
+      return None
 
-"""
-MAXPOOL2D(sx (X - zx)) = sx MAXPOOL2D(X - zx)
-"""
+    kernel_attr = self.synthesize_tensor(kernel_v)
+    if b is not None:
+      bias_attr = self.synthesize_tensor(bias_v)
 
-def qconv_maxpool2d_pat(x_q, scl_x, zero_x, scl_out, zero_out,
-                        kernel_size, stride, padding, dilation):
-  x = qd.dequantize_per_tensor.tensor(x_q, scl_x, zero_x, -128, 127, torch.int8)
-  x = aten.max_pool2d.default(x, kernel_size, stride, padding, dilation)
-  x = qd.quantize_per_tensor.tensor(x, scl_out, zero_out, -128, 127, torch.int8)
-  return x
+    graph = self.gm.graph
+    with graph.inserting_before(first_user):
+      n1 = graph.call_method("int", (x,))
+      n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
+      n3 = graph.get_attr(kernel_attr)
+      if b is None:
+        n4 = None
+      else:
+        n4 = graph.get_attr(bias_attr)
+      n5 = graph.call_function(aten.convolution, (
+        n2, n3, n4,
+        stride, padding, dilation, transposed, output_padding, groups))
+      if relu:
+        n5 = graph.call_function(aten.relu, (n5,))
+      n6 = graph.call_function(shir.requantize, (n5, k / s_out.item(), z_out.item()))
 
-def qconv_maxpool2d_repl(x_q, scl_x, zero_x, scl_out, zero_out,
-                         kernel_size, stride, padding, dilation):
-  x_q = aten.max_pool2d.default(x_q.int() - zero_x.int(), kernel_size, stride, padding, dilation, False)
-  x = qd.quantize_per_tensor.tensor(x_q.float(), scl_out / scl_x, zero_out, -128, 127, dtype=torch.int8)
-  return x
+    return (last_node, n6)
 
-_rewrite_patterns.extend([
-  (qrelu_pat, qrelu_repl),
+  def _template_qmaxpool(self, m):
+    if len(m.returning_nodes) != 1:
+      return None
 
-  (qlinear_pat, qlinear_repl),
-  (qlinear_bias_pat, qlinear_bias_repl),
-  (qlinear_relu_pat, qlinear_relu_repl),
-  (qlinear_bias_relu_pat, qlinear_bias_relu_repl),
+    [kernel_size, stride, padding, dilation, x, *rest] = m.placeholder_nodes
+    tensors = [self.extract_tensor(n) for n in rest]
+    if not all((isinstance(t, torch.Tensor) for t in tensors)):
+      return None
+    [s_x, z_x, s_out, z_out] = tensors
 
-  (qconv_pat, qconv_repl),
-  (qconv_bias_pat, qconv_bias_repl),
-  (qconv_relu_pat, qconv_relu_repl),
-  (qconv_bias_relu_pat, qconv_bias_relu_repl),
+    last_node = m.returning_nodes[0]
+    first_user = self.find_first_user(last_node)
+    if first_user is None:
+      return None
 
-  (qconv_maxpool2d_pat, qconv_maxpool2d_repl),
-])
+    # note that the shir quantizer would have tried to share the qparams
+    # between the input and outputs!
+    shared_qparams = s_x.item() == s_out.item() and z_x.item() == z_out.item()
+
+    graph = self.gm.graph
+    with graph.inserting_before(first_user):
+      if shared_qparams:
+        n4 = graph.call_function(shir.int_max_pool2d, (
+          x, kernel_size, stride, padding, dilation))
+      else:
+        n1 = graph.call_method("int", (x,))
+        n2 = graph.call_function(aten.sub, (n1, z_x.int().item))
+        n3 = graph.call_function(shir.int_max_pool2d, (
+          n2, kernel_size, stride, padding, dilation))
+        n4 = graph.call_function(shir.requantize, (n3, s_x.item() / s_out.item(), z_out.item()))
+    return (last_node, n4)
+
+def rewrite_quantized_ops(gm: GraphModule):
+  obj = QuantOpRewrite(gm)
+  obj.rewrite()

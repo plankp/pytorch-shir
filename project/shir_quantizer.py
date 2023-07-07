@@ -39,8 +39,8 @@ from torch.ao.quantization.observer import (
 
 def get_symmetric_quantization_config():
   act_quantization_spec = QuantizationSpec(
-    dtype=torch.int8,
-    quant_min=-128,
+    dtype=torch.int8,   # has to be a signed integer
+    quant_min=-128,     # min/max need to fill the same number of bits
     quant_max=127,
     qscheme=torch.per_tensor_affine,
     is_dynamic=False,

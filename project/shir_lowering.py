@@ -962,7 +962,7 @@ class LowerMaxPoolND:
             f" algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
             f" {frag_inner_map}) }}, core.ParamUse(_0))) }}, {input})")
 
-@register_operator(aten.max_pool2d.default)
+@register_operator(shir.int_max_pool2d.default)
 class LowerMaxPool2D(LowerMaxPoolND):
   @classmethod
   def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
@@ -971,15 +971,4 @@ class LowerMaxPool2D(LowerMaxPoolND):
     ishape = input.meta.get("val").shape
 
     obj = cls(2, elt_ty, kernel_size, stride, dilation)
-    return obj.emit(input.name, ishape)
-
-@register_operator(aten.max_pool3d.default)
-class LowerMaxPool2D(LowerMaxPoolND):
-  @classmethod
-  def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
-            ceil_mode=False) -> str:
-    elt_ty = shir_type.get_element_type(input)
-    ishape = input.meta.get("val").shape
-
-    obj = cls(3, elt_ty, kernel_size, stride, dilation)
     return obj.emit(input.name, ishape)
