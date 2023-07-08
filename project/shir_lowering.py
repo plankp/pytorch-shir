@@ -688,9 +688,12 @@ class LowerConvolution:
       # compute the widths due to input padding and kernel dilation
       i = iwidth + 2 * pad
       k = dilation * (kwidth - 1) + 1
-      out_width = i - k + 1   # the new dimension after sliding
 
-      w1 = acc("core.ParamUse(_0)")
+      leftovers = (i - k) % stride
+      if leftovers:
+        w1 = acc(f"algo.Drop(core.ParamUse(_0), 0, {leftovers})")
+      else:
+        w1 = acc("core.ParamUse(_0)")
       w2 = k
       w3 = f"algo.SlideGeneral({w1}, {w2}, {stride})"
       w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
