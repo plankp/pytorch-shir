@@ -692,21 +692,16 @@ class LowerConvolution:
 
       w1 = acc("core.ParamUse(_0)")
       w2 = k
-      w3 = (
-        f"algo.SlideGeneral({w1}, {w2}, {stride})" if stride > 1
-        else f"algo.Slide({w1}, {w2})"
-      )
+      w3 = f"algo.SlideGeneral({w1}, {w2}, {stride})"
       w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
 
       if dilation > 1:
-        # now that the slided input (w3) has type T[Out', K', ...], we drop the
-        # the dilated indices from the 2nd dimension (K') of the slided input.
-        indices = range(k // dilation + 1)
-        indices = (f"algo.Drop(core.ParamUse(_3), {dilation * i}, {k - 1 - dilation * i})" for i in indices)
-        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
+        # map over the slided input (w3) a (slide + join) to drop the dilated
+        # indices from the 2nd dimension (K') dimension.
         w3 = (f"algo.Map({{"
               f" val _3 = core.ParamDef(algo.SeqType(algo.AlgoDataTypeVar(), {k}));"
-              f" algo.AlgoLambda(Seq(_3), {w4}) }}, {w3})")
+              f" algo.AlgoLambda(Seq(_3),"
+              f" algo.Join(algo.SlideGeneral(core.ParamUse(_3), 1, {dilation}))) }}, {w3})")
 
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
                        f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
