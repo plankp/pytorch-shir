@@ -815,90 +815,105 @@ class LowerConvolution:
     return f"algo.Map(algo.Join.asFunction(), algo.Transpose({conv}))"
 
 class LowerMaxPoolND:
-  def supports(input, kernel_size, stride=[], padding=0, dilation=1,
-               ceil_mode=False) -> bool:
-    # disallow padding for now: it (usually) does not zero-pad
-    match padding:
-      case int(w) if w == 0:
-        return True
-      case list(w) if all(x == 0 for x in padding):
-        return True
-      case _:
-        return False
+  # class-level field N controls the amount of dimensions
 
-    if ceil_mode:
+  @classmethod
+  def supports(cls, input, kernel_size, stride, padding, dilation) -> bool:
+    # sanity check, make sure the sizes match:
+    N = cls.N
+    if N != len(kernel_size) or N != len(stride) or N != len(padding) or N != len(dilation):
       return False
 
     return True
 
-  def __init__(self, N, elt_ty, kernel_size, stride, dilation):
-    self.N = N
+  @classmethod
+  def lower(cls, input, kernel_size, stride, padding, dilation) -> str:
+    elt_ty = shir_type.get_element_type(input)
+    ishape = input.meta.get("val").shape
+
+    obj = cls(elt_ty, kernel_size, stride, padding, dilation)
+    return obj.emit(input.name, ishape)
+
+  def __init__(self, elt_ty, kernel_size, stride, padding, dilation):
     self.elt_ty = elt_ty
-    self._kernel_size = kernel_size
-    self._stride = stride if stride != [] else kernel_size
-    self._dilation = dilation
+    self.kernel_size = kernel_size
+    self.stride = stride
+    self.padding = padding
+    self.dilation = dilation
 
-  # For some reason, max_pool?d loves to keep things as scalar and rely on
-  # implicit broadcasting, hence all these helpers to fetch the widths.
-  #
-  # we also assume we never do illegal accesses
+  def _min_pad(self, input, idim):
+    v = self.elt_ty.minval()
+    acc = lambda t: None
+    for (pad, width) in zip(reversed(self.padding), reversed(idim)):
+      w1 = acc("core.ParamUse(_0)")
+      if w1 is None:
+        if not pad:
+          continue  # acc is lambda t: None
+        inner = lambda t: t
+      else:
+        inner = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
+                           f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
 
-  def _broadcast_get(self, u, axis: int) -> int:
-    match u:
-      case int(w) | [w]:
-        return w
-      case w:
-        return w[axis]
+      if pad:
+        w2 = pad
+        acc = lambda t: f"algo.Pad({inner(t)}, {w2}, {w2}, {v})"
+      else:
+        acc = inner
 
-  def kshape(self, axis: int) -> int:
-    return self._broadcast_get(self._kernel_size, axis)
+    w1 = acc("core.ParamUse(_0)")
+    if w1 is None:
+      # when no padding is required
+      return input
 
-  def stride(self, axis: int) -> int:
-    return self._broadcast_get(self._stride, axis)
+    if len(idim) == self.N + 1:
+      return (f"algo.Map({{ val _0 = core.ParamDef();"
+              f" algo.AlgoLambda(Seq(_0), {w1}) }}, {input})")
 
-  def dilation(self, axis: int) -> int:
-    return self._broadcast_get(self._dilation, axis)
+    return (f"algo.Map({{ val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0), algo.Map({{"
+            f" val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0), {w1}) }},"
+            f" core.ParamUse(_0))) }}, {input})")
 
   def emit(self, input, idim):
     # JoinAll needs the type of the kernel
     inkern_ty = self.elt_ty.name()
-    for dim in reversed(range(self.N)):
-      inkern_ty = f"algo.SeqType({inkern_ty}, {self.kshape(dim)})"
+    for w in reversed(self.kernel_size):
+      inkern_ty = f"algo.SeqType({inkern_ty}, {w})"
+
+    stream = zip(reversed(self.kernel_size), reversed(idim),
+                 reversed(self.stride),
+                 reversed(self.padding),
+                 reversed(self.dilation))
 
     acc = lambda t: t
-    for (dim, iwidth) in zip(reversed(range(self.N)), reversed(idim)):
-      kwidth = self.kshape(dim)
-      stride = self.stride(dim)
-      dilation = self.dilation(dim)
-
+    for (kwidth, iwidth, stride, pad, dilation) in stream:
       # compute the widths due to input padding and kernel dilation
-      i = iwidth
+      i = iwidth + 2 * pad
       k = dilation * (kwidth - 1) + 1
-      out_width = i - k + 1   # new dimension after sliding
 
-      w1 = acc("core.ParamUse(_0)")
+      leftovers = (i - k) % stride
+      if leftovers:
+        w1 = acc(f"algo.Drop(core.ParamUse(_0), 0, {leftovers})")
+      else:
+        w1 = acc("core.ParamUse(_0)")
       w2 = k
-      w3 = (
-        f"algo.SlideGeneral({w1}, {w2}, {stride})" if stride > 1
-        else f"algo.Slide({w1}, {w2})"
-      )
+      w3 = f"algo.SlideGeneral({w1}, {w2}, {stride})"
       w5 = f"algo.SeqType(algo.AlgoDataTypeVar(), {i})"
 
       if dilation > 1:
-        # now that the slided input (w3) has type T[Out', K', ...], we drop the
-        # the dilated indices from the 2nd dimension (K') of the slided input.
-        indices = range(k // dilation + 1)
-        indices = (f"algo.Drop(core.ParamUse(_3), {dilation * i}, {k - 1 - dilation * i})" for i in indices)
-        w4 = reduce(lambda x, y: f"algo.Concat({x}, {y})", indices)
+        # map over the slided input (w3) a (slide + join) to drop the dilated
+        # indices from the 2nd dimension (K') dimension.
         w3 = (f"algo.Map({{"
               f" val _3 = core.ParamDef(algo.SeqType(algo.AlgoDataTypeVar(), {k}));"
-              f" algo.AlgoLambda(Seq(_3), {w4}) }}, {w3})")
+              f" algo.AlgoLambda(Seq(_3),"
+              f" algo.Join(algo.SlideGeneral(core.ParamUse(_3), 1, {dilation}))) }}, {w3})")
 
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({w5});"
                        f" algo.AlgoLambda(Seq(_0), {w3}) }}, {t})")
 
     # we sneak in a Split here (and a Join later) to simplify the mapping
-    # sliding process
+    # sliding process / undo the last map
     frag_sliding = acc(f"algo.Split(core.ParamUse(_0), {i})")
 
     # we now have T[Out1, K1, Out2, K2, ..., OutN, KN]
@@ -924,6 +939,8 @@ class LowerMaxPoolND:
                        f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
     frag_inner_map = acc(frag_transpose)
 
+    input = self._min_pad(input, idim)
+
     # account for the minibatch dimension that may be omitted.
     if len(idim) == self.N + 1:
       return (f"algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
@@ -936,11 +953,4 @@ class LowerMaxPoolND:
 
 @register_operator(shir.int_max_pool2d.default)
 class LowerMaxPool2D(LowerMaxPoolND):
-  @classmethod
-  def lower(cls, input, kernel_size, stride=[], padding=0, dilation=1,
-            ceil_mode=False) -> str:
-    elt_ty = shir_type.get_element_type(input)
-    ishape = input.meta.get("val").shape
-
-    obj = cls(2, elt_ty, kernel_size, stride, dilation)
-    return obj.emit(input.name, ishape)
+  N = 2

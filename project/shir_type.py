@@ -13,12 +13,24 @@ class SI:
   def name(self) -> str:
     return f"algo.SignedIntType({self.bits})"
 
+  def minval(self) -> int:
+    return -1 << (self.bits - 1)
+
+  def maxval(self) -> int:
+    return (1 << (self.bits - 1)) - 1
+
 @dataclass(frozen=True)
 class UI:
   bits: int   # must be at least 1
 
   def name(self) -> str:
     return f"algo.IntType({self.bits})"
+
+  def minval(self) -> int:
+    return 0
+
+  def maxval(self) -> int:
+    return (1 << self.bits) - 1
 
 @dataclass(frozen=True)
 class Seq:
