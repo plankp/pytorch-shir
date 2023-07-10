@@ -204,6 +204,11 @@ class QuantOpRewrite:
         if node not in m.placeholder_nodes:
           graph.erase_node(node)
 
+  """
+  When rewriting, we want to try to quantize the weighs right now. Once that
+  happens, we just wipe-out the original weights.
+  """
+
   def _template_qlinear(self, m, relu=False):
     if len(m.returning_nodes) != 1:
       return None
@@ -222,18 +227,23 @@ class QuantOpRewrite:
         assert False, "invalid qlinear-relu match"
 
     k = (s_x * s_w).item()
-    weight_v = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int()
+    weight_v = torch.nn.Parameter(
+      qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int(),
+      False
+    )
     if b is not None:
-      bias_v = torch.round(b / k).int()
+      bias_v = torch.nn.Parameter(torch.round(b / k).int(), False)
 
     last_node = m.returning_nodes[0]
     first_user = self.find_first_user(last_node)
     if first_user is None:
       return None
 
-    weight_attr = self.synthesize_tensor(weight_v)
+    weight_attr = rest[0].target
+    setattr(self.gm, weight_attr, weight_v)
     if b is not None:
-      bias_attr = self.synthesize_tensor(bias_v)
+      bias_attr = rest[1].target
+      setattr(self.gm, bias_attr, bias_v)
 
     graph = self.gm.graph
     with graph.inserting_before(first_user):
@@ -265,18 +275,23 @@ class QuantOpRewrite:
     [w, b, s_x, z_x, s_w, z_w, s_out, z_out] = tensors
 
     k = (s_x * s_w).item()
-    kernel_v = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int()
+    kernel_v = torch.nn.Parameter(
+      qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int(),
+      False
+    )
     if b is not None:
-      bias_v = torch.round(b / k).int()
+      bias_v = torch.nn.Parameter(torch.round(b / k).int(), False)
 
     last_node = m.returning_nodes[0]
     first_user = self.find_first_user(last_node)
     if first_user is None:
       return None
 
-    kernel_attr = self.synthesize_tensor(kernel_v)
+    kernel_attr = rest[0].target
+    setattr(self.gm, kernel_attr, kernel_v)
     if b is not None:
-      bias_attr = self.synthesize_tensor(bias_v)
+      bias_attr = rest[1].target
+      setattr(self.gm, bias_attr, bias_v)
 
     graph = self.gm.graph
     with graph.inserting_before(first_user):
