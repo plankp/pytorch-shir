@@ -127,6 +127,35 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
 
   return acc(x)
 
+def qscale_to_fixpoint(f: float) -> (int, int):
+  if f == 0:
+    return (0, 0)
+
+  assert f >= 0, "qscale cannot be negative"
+  bits = struct.unpack(">l", struct.pack(">f", f))[0]
+  exp = bits >> 23
+  assert 0 < exp < 0xff, "qscale must be normal"
+
+  man = (bits & 0x7f_ffff) | 0x80_0000
+  width = 0
+  if (man & 0xffff) == 0:
+    man >>= 16
+    width += 16
+  if (man & 0xff) == 0:
+    man >>= 8
+    width += 8
+  if (man & 0xf) == 0:
+    man >>= 4
+    width += 4
+  if (man & 0x3) == 0:
+    man >>= 2
+    width += 2
+  if (man & 0x1) == 0:
+    man >>= 1
+    width += 1
+
+  return (man, exp - 127 - 23 + width)
+
 """
 magic that actually does the lowering of each node
 """
@@ -140,7 +169,7 @@ class LowerRequantize:
 
     try:
       # we just ignore the q > 0 case for simplicity
-      _, q = cls.qscale_to_fixpoint(s)
+      _, q = qscale_to_fixpoint(s)
       return q <= 0
     except AssertionError:
       pass
@@ -149,7 +178,7 @@ class LowerRequantize:
 
   @classmethod
   def lower(cls, a, s, z) -> str:
-    s, q = cls.qscale_to_fixpoint(s)
+    s, q = qscale_to_fixpoint(s)
     assert q <= 0
 
     def gen_kernel(t):
@@ -190,37 +219,6 @@ class LowerRequantize:
                        f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
 
     return acc(a.name)
-
-  @staticmethod
-  def qscale_to_fixpoint(f: float) -> (int, int):
-    if f == 0:
-      return (0, 0)
-
-    assert f >= 0, "qscale cannot be negative"
-    bits = struct.unpack(">l", struct.pack(">f", f))[0]
-    exp = bits >> 23
-    assert 0 < exp < 0xff, "qscale must be normal"
-
-    man = (bits & 0x7f_ffff) | 0x80_0000
-    width = 0
-    if (man & 0xffff) == 0:
-      man >>= 16
-      width += 16
-    if (man & 0xff) == 0:
-      man >>= 8
-      width += 8
-    if (man & 0xf) == 0:
-      man >>= 4
-      width += 4
-    if (man & 0x3) == 0:
-      man >>= 2
-      width += 2
-    if (man & 0x1) == 0:
-      man >>= 1
-      width += 1
-
-    return (man, exp - 127 - 23 + width)
-
 
 @register_operator(aten.view.default)
 class LowerView:
