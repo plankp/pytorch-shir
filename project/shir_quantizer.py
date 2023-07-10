@@ -38,16 +38,19 @@ from torch.ao.quantization.observer import (
 )
 
 def get_symmetric_quantization_config():
+  # the dtype for activation (input/output) must be signed integer and the
+  # range must occupy all the available bits. this is because SHIR's
+  # algo.ClipBankersRound works this way.
   act_quantization_spec = QuantizationSpec(
-    dtype=torch.int8,   # has to be a signed integer
-    quant_min=-128,     # min/max need to fill the same number of bits
+    dtype=torch.int8,
+    quant_min=-128,
     quant_max=127,
     qscheme=torch.per_tensor_affine,
     is_dynamic=False,
     observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=2**-12),
   )
 
-  # this one has to have a symmetric qscheme
+  # this one has to have a symmetric qscheme (enforced by PyTorch)
   weight_quantization_spec = QuantizationSpec(
     dtype=torch.int8,
     quant_min=-127,
@@ -58,6 +61,7 @@ def get_symmetric_quantization_config():
   )
 
   # assume we don't quantize the bias (we haven't been doing so anyway)
+  # (PyTorch also does not support anything else at the moment.)
   bias_quantization_spec = QuantizationSpec(
     dtype=torch.float,
     observer_or_fake_quant_ctr=PlaceholderObserver,
