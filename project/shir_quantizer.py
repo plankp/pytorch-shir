@@ -3,10 +3,16 @@
 # *   Gist linked near the end of the wikipage^
 # *   existing quantizer implementations
 
+import operator
 import itertools
 from typing import Dict, List, Optional, Callable
 
 import torch
+from torch.nn.utils.fusion import fuse_linear_bn_weights
+from torch.ao.quantization._pt2e.utils import (
+  _get_tensor_constant_from_node,
+  _get_all_arguments,
+)
 
 from torch.ao.quantization._pt2e.quantizer.utils import (
   _annotate_input_qspec_map,
@@ -22,7 +28,6 @@ from torch.fx.passes.utils.source_matcher_utils import (
   SourcePartition
 )
 from torch.ao.quantization._pt2e.graph_utils import find_sequential_partitions
-
 from torch.ao.quantization._pt2e.quantizer.quantizer import (
   OperatorConfig,
   QuantizationConfig,
@@ -125,6 +130,7 @@ class BackendQuantizer(Quantizer):
   def annotate(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # say we just annotate linear layers
     qconfig = self.global_config
+    self._fuse_bn_weights(gm)
     self._annotate_conv_relu(gm, qconfig)
     self._annotate_conv(gm, qconfig)
     self._annotate_linear_relu(gm, qconfig)
@@ -153,6 +159,80 @@ class BackendQuantizer(Quantizer):
       OperatorConfig(qconfig, [[torch.nn.Conv2d, torch.nn.ReLU]]),
       OperatorConfig(qconfig, [[torch.nn.Conv2d]]),
     ]
+
+  def _fuse_bn_weights(self, gm: torch.fx.GraphModule):
+    # conv-bn fusion case is already handled by the prepare routine that
+    # drives this annotation process.
+
+    # however, we need to handle linear-bn fusion ourselves (likely because
+    # linear layers are a more painful to deal with)
+    #
+    # turn:
+    # wt = aten.t.default(w)
+    # m  = addmm.default(b, x, wt)    || mm.default(x, wt)
+    # _  = _native_bn(m)
+    #
+    # into:
+    # wt = aten.t.default(w')
+    # m  = addmm.default(b', x, wt)   <-- batch norm introduces bias
+    # _  = m
+    for n in gm.graph.nodes:
+      if n.op != "call_function" or n.target != torch.ops.aten._native_batch_norm_legit_no_training.default:
+        continue
+      bn_node = n
+      n = bn_node.args[0]
+
+      if n.op != "call_function":
+        continue
+      if n.target == torch.ops.aten.addmm.default:
+        mm_node = n
+        mm_bias_node = mm_node.args[0]
+        mm_input_node = mm_node.args[1]
+        mm_wt_node = mm_node.args[2]
+      elif n.target == torch.ops.aten.mm.default:
+        mm_node = n
+        mm_bias_node = None
+        mm_input_node = mm_node.args[0]
+        mm_wt_node = mm_node.args[1]
+      else:
+        continue
+      n = mm_wt_node
+
+      if n.op != "call_function" or n.target != torch.ops.aten.t.default:
+        continue
+      mm_weight_node = n.args[0]
+
+      linear_w = _get_tensor_constant_from_node(mm_weight_node, gm)
+      linear_b = _get_tensor_constant_from_node(mm_bias_node, gm)
+
+      bn_args_schema = bn_node.target._schema.arguments
+      bn_args = _get_all_arguments(bn_node.args, bn_node.kwargs, bn_args_schema)
+      bn_w = _get_tensor_constant_from_node(bn_args[1], gm)
+      bn_b = _get_tensor_constant_from_node(bn_args[2], gm)
+      bn_rm = _get_tensor_constant_from_node(bn_args[3], gm)
+      bn_rv = _get_tensor_constant_from_node(bn_args[4], gm)
+      bn_eps = bn_args[6]
+
+      fused_weight, fused_bias = fuse_linear_bn_weights(linear_w, linear_b, bn_rm, bn_rv, bn_eps, bn_w, bn_b)
+      weight_attr_name = mm_weight_node.target
+      setattr(gm, weight_attr_name, fused_weight)
+      if mm_bias_node is not None:
+        bias_attr_name = mm_bias_node.target
+      else:
+        bias_attr_name = weight_attr_name + "_bias"
+        with m.graph.inserting_before(mm_node):
+          mm_bias_node = m.graph.get_attr(bias_attr_name)
+      setattr(gm, bias_attr_name, fused_bias)
+      mm_node.target = torch.ops.aten.addmm.default
+      mm_node.args = (mm_bias_node, mm_input_node, mm_wt_node)
+
+      for user in bn_node.users:
+        if user.op != "call_function" or user.target != operator.getitem or user.args[1] != 0:
+          continue
+        user.replace_all_uses_with(mm_node)
+
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
 
   def _annotate_linear_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
     input_qspec = get_input_act_qspec(qconfig)
