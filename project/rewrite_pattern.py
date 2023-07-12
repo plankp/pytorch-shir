@@ -37,18 +37,6 @@ class QuantOpRewrite:
         assert name not in self.gm._param_name_to_source
         return name
 
-  def synthesize_tensor(self, tensor: torch.Tensor) -> str:
-    # because fx nodes don't like raw tensors appearing in arguments, we
-    # follow the workaround used in pytorch/pytorch #43512, which is to make
-    # it a module-level attribute
-
-    name = self.find_free_name()
-    self.gm.register_buffer(name, tensor)
-    self.gm._param_name_to_source[name] = NNModuleSource(
-      AttrSource(LocalSource("self"), name)
-    )
-    return name
-
   def extract_tensor(self, n: Node) -> Optional[torch.Tensor]:
     if n.op != "get_attr" or n.args != () or n.kwargs != {}:
       return None
@@ -65,6 +53,10 @@ class QuantOpRewrite:
   b + (sx (X - zx)) @ (sy (Y - zy))
     = b + sx sy ((X - zx) @ (Y - zy))
     = (sx sy) ([b / (sx sy)] + (X - zx) @ (Y - zy))   <-- bias is quantized
+
+  in our case, zy is 0, so:
+    = (sx sy) ([b / (sx sy)] + (X - zx) @ Y)
+    = (sx sy) ([b / (sx sy) - sum(zx Y, axis=1)] + X @ Y)
   """
 
   def _rewrite_qlinear(self):
@@ -241,41 +233,42 @@ class QuantOpRewrite:
       case _:
         assert False, "invalid qlinear-relu match"
 
-    k = (s_x * s_w).item()
-    weight_v = torch.nn.Parameter(
-      qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int(),
-      False
-    )
-    if b is not None:
-      bias_v = torch.nn.Parameter(torch.round(b / k).int(), False)
+    if z_w.int().item() != 0:
+      return None
 
     last_node = m.returning_nodes[0]
     first_user = self.find_first_user(last_node)
     if first_user is None:
       return None
 
+    k = (s_x * s_w).item()
+    weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+
+    if b is None:
+      bias_q = torch.zero([], dtype=torch.int32)
+    else:
+      bias_q = torch.round(b / k).int()
+    bias_q = bias_q - torch.sum(z_x.int().item() * weight_q.int(), dim=1, dtype=torch.int32)
+
     weight_attr = rest[0].target
-    setattr(self.gm, weight_attr, weight_v)
-    if b is not None:
+    setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
+
+    if b is None:
+      bias_attr = self.find_free_name()
+    else:
       bias_attr = rest[1].target
-      setattr(self.gm, bias_attr, bias_v)
+    setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     graph = self.gm.graph
     with graph.inserting_before(first_user):
-      n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
-      n3 = graph.get_attr(weight_attr)
-      if b is not None:
-        n4 = graph.get_attr(bias_attr)
-      n5 = graph.call_function(aten.t, (n3,))
-      n6 = graph.call_function(aten.mm, (n2, n5))
-      if b is not None:
-        n6 = graph.call_function(aten.add, (n4, n6))
+      n1 = graph.get_attr(weight_attr)
+      n2 = graph.get_attr(bias_attr)
+      n3 = graph.call_function(shir.int_addmm, (n2, x, n1))
       if relu:
-        n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shir.requantize, (n6, k / s_out.item(), z_out.item()))
+        n3 = graph.call_function(aten.relu, (n3,))
+      n4 = graph.call_function(shir.requantize, (n3, k / s_out.item(), z_out.item()))
 
-    return (last_node, n7)
+    return (last_node, n4)
 
   def _template_qconv(self, m, relu=False):
     if len(m.returning_nodes) != 1:

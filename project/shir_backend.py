@@ -101,6 +101,30 @@ def _iredmax(ty: IntTypeT, x: Expr): Expr = {
         signconv(TruncInteger(ParamUse(_1), ty.width))))
   }, x))
 }
+      
+def _add32_mm8(acc: Expr, lhs: Expr, rhs: Expr): Expr = {
+  val seq = algo.SeqType(algo.SignedIntType(8), core.ArithTypeVar())
+  algo.Map({
+    val _0 = core.ParamDef(seq)
+    algo.AlgoLambda(Seq(_0),
+      algo.Map({
+        val _1 = core.ParamDef(algo.TupleType(seq, algo.SignedIntType(32)))
+        algo.AlgoLambda(Seq(_1),
+          // trunc(u32 + at least u32) -> u32, sext(u32) -> s32
+          algo.Sub(algo.Tuple(algo.TruncInteger(
+            algo.Add2(algo.TruncInteger(algo.Select(core.ParamUse(_1), 1), 32),
+              // u32 + u32 + ... -> at least u32
+              algo.Fold(Add2.asFunction(), algo.Map({
+                val _0 = core.ParamDef(algo.TupleType(algo.SignedIntType(8), algo.SignedIntType(8)))
+                algo.AlgoLambda(Seq(_0),
+                  algo.TruncInteger(algo.Add2(
+                    // s8 * s8 -> s16; sext(16) -> s32; trunc(s32) -> u32
+                    algo.Mul(core.ParamUse(_0)), algo.ConstantInteger(0, Some(algo.SignedIntType(32)))), 32))
+              }, algo.Zip(algo.Tuple(core.ParamUse(_0), algo.Select(core.ParamUse(_1), 0)))))),
+            32), algo.ConstantInteger(0))))
+      }, algo.Zip(algo.Tuple(rhs, acc))))
+  }, lhs)
+}
 
 // actual emitted stuff starts here...
 """

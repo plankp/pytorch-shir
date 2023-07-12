@@ -596,6 +596,19 @@ class LowerMM:
             f" algo.AlgoLambda(Seq(_1), {f})"
             f" }}, algo.Transpose({rhs.name}))) }}, {lhs.name})")
 
+@register_operator(shir.int_addmm.default)
+class LowerIntAddmm:
+  @staticmethod
+  def supports(acc, lhs, rhs) -> bool:
+    assert shir_type.get_element_type(lhs) == shir_type.SI(8)
+    assert shir_type.get_element_type(rhs) == shir_type.SI(8)
+    assert shir_type.get_element_type(acc) == shir_type.SI(32)
+    return True
+
+  @staticmethod
+  def lower(acc, lhs, rhs) -> str:
+    return f"_add32_mm8({acc.name}, {lhs.name}, {rhs.name})"
+
 @register_operator(aten.convolution.default)
 class LowerConvolution:
   def supports(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> bool:
