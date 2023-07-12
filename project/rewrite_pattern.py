@@ -119,6 +119,12 @@ class QuantOpRewrite:
   """
   CONV(sx (X - zx), sw (W - zw), b)
     = sx sw (CONV(X - zx, W - zw, [b / (sx sw)])
+
+  in our case, zw is 0, so:
+    = sx sw (CONV(X - zx, W, [b / (sx sw)]))
+
+  Note that when there is padding, we cannot factor out the zx term (like in
+  the qlinear case). here we assume that it's never safe to do this.
   """
 
   def _rewrite_qconv(self):
@@ -248,7 +254,7 @@ class QuantOpRewrite:
       bias_q = torch.zero([], dtype=torch.int32)
     else:
       bias_q = torch.round(b / k).int()
-    bias_q = bias_q - torch.sum(z_x.int().item() * weight_q.int(), dim=1, dtype=torch.int32)
+    bias_q = bias_q - z_x.int().item() * torch.sum(weight_q, dim=1, dtype=torch.int32)
 
     weight_attr = rest[0].target
     setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
@@ -282,42 +288,41 @@ class QuantOpRewrite:
 
     [w, b, s_x, z_x, s_w, z_w, s_out, z_out] = tensors
 
-    k = (s_x * s_w).item()
-    kernel_v = torch.nn.Parameter(
-      qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int32) - z_w.int(),
-      False
-    )
-    if b is not None:
-      bias_v = torch.nn.Parameter(torch.round(b / k).int(), False)
-
     last_node = m.returning_nodes[0]
     first_user = self.find_first_user(last_node)
     if first_user is None:
       return None
 
+    # keep the kernel as an int8 to save memory.
+    # SHIR will likely able to fuse the sign extension.
+    k = (s_x * s_w).item()
+    kernel_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+
+    if b is not None:
+      bias_q = torch.round(b / k).int()
+
     kernel_attr = rest[0].target
-    setattr(self.gm, kernel_attr, kernel_v)
+    setattr(self.gm, kernel_attr, torch.nn.Parameter(kernel_q, False))
+
     if b is not None:
       bias_attr = rest[1].target
-      setattr(self.gm, bias_attr, bias_v)
+      setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     graph = self.gm.graph
     with graph.inserting_before(first_user):
       n1 = graph.call_method("int", (x,))
       n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
       n3 = graph.get_attr(kernel_attr)
-      if b is None:
-        n4 = None
-      else:
-        n4 = graph.get_attr(bias_attr)
-      n5 = graph.call_function(aten.convolution, (
-        n2, n3, n4,
+      n4 = graph.call_method("int", (n3,))
+      n5 = None if b is None else graph.get_attr(bias_attr)
+      n6 = graph.call_function(aten.convolution, (
+        n2, n4, n5,
         stride, padding, dilation, transposed, output_padding, groups))
       if relu:
-        n5 = graph.call_function(aten.relu, (n5,))
-      n6 = graph.call_function(shir.requantize, (n5, k / s_out.item(), z_out.item()))
+        n6 = graph.call_function(aten.relu, (n6,))
+      n7 = graph.call_function(shir.requantize, (n6, k / s_out.item(), z_out.item()))
 
-    return (last_node, n6)
+    return (last_node, n7)
 
   def _template_qmaxpool(self, m):
     if len(m.returning_nodes) != 1:
