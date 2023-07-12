@@ -952,3 +952,174 @@ class LowerMaxPoolND:
 @register_operator(shir.int_max_pool2d.default)
 class LowerMaxPool2D(LowerMaxPoolND):
   N = 2
+
+class LowerAdaptiveAvgPoolND:
+  # class-level field N controls the amount of dimensions
+
+  @classmethod
+  def supports(cls, input, output_size) -> bool:
+    elt_ty = shir_type.get_element_type(input)
+    if elt_ty != shir_type.SI(32):
+      # sanity check
+      return False
+
+    if cls.N != len(output_size):
+      return False
+    return True
+
+  @classmethod
+  def lower(cls, input, output_size) -> str:
+    def gen_indices():
+      yield cls.N - 1
+      for i in range(cls.N - 1):
+        yield i
+      yield cls.N
+
+    indices = ", ".join((str(x) for x in gen_indices()))
+    ishape = input.meta.get("val").shape
+
+    # we need to account for the fact that it input may have shape
+    # T[_, _, D1, ..., DN] or T[_, D1, ..., DN]
+    body = cls._helper("core.ParamUse(_0)", -cls.N, [],
+                       ishape, output_size, indices)
+    # inner_ty = reduce(lambda x, y: f"algo.Seq({x}, {y})",
+    #                   reversed(ishape[-N:]), "algo.SignedIntType(32)")
+
+    if len(ishape) == cls.N + 1:
+      return (f"algo.Map({{ val _0 = core.ParamDef();"
+              f" algo.AlgoLambda(Seq(_0), {body}) }}, {input.name})")
+
+    assert len(ishape) == cls.N + 2
+    return (f"algo.Map({{ val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0),"
+            f" algo.Map({{ val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0), {body}) }},"
+            f" core.ParamUse(_0))) }}, {input.name})")
+
+  @classmethod
+  def _helper(cls, input, level, dims, ishape, output_size, indices):
+    ranges = cls._decompose_range(ishape[level], output_size[level])
+    def gen_subparts():
+      for (hd, tl, w, stride, reps) in ranges:
+        s = input
+        if hd != 0 or tl != 0:
+          s = f"algo.Drop({s}, {hd}, {tl})"
+        s = f"algo.SlideGeneral({s}, {w}, {stride})"
+
+        # recall that level starts from -N
+        if level != -1:
+          # there is at least one more dimension, s : T[FN, WN, D..., W...].
+          # 1.  push WN downwards: T[FN, D..., W..., WN]
+          # 2.  map over FN: T[D..., W..., WN]
+          # 3.  recursively generate the next level
+          dims.append(w)
+          recr = cls._helper("core.ParamUse(_0)", level + 1, dims,
+                             ishape, output_size, indices)
+          dims.pop()
+          s = (f"algo.Map({{ val _0 = core.ParamDef();"
+               f" algo.AlgoLambda(Seq(_0), {recr}) }},"
+               f" algo.TransposeND({s}, Seq({indices})))")
+
+        else:
+          # this is the innermost dimension, s : T[FN, WN, W1, W2, ...].
+          # JoinAll (if necessary) + reduction
+          elts = reduce(lambda x, y: x * y, dims, w)
+          ty = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
+                      chain(reversed(dims), [w]), "algo.SignedIntType(32)")
+
+          if dims == []:
+            flatseq = "core.ParamUse(_0)"
+          else:
+            flatseq = "algo.JoinAll(core.ParamUse(_0))"
+
+          f, q = qscale_to_fixpoint(1.0 / elts)
+          assert q <= 0
+          round_bits = -1
+          clip_bits = max(f.bit_length() + 1 + q, 0)
+
+          s = (f"algo.Map({{ val _0 = core.ParamDef({ty});"
+              f" algo.AlgoLambda(Seq(_0),"
+              f" algo.Sub(algo.Tuple(algo.TruncInteger(algo.Add2(algo.ConstantInteger(0,"
+              f" Some(algo.SignedIntType(32))),"
+              f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f},"
+              f" Some(algo.SignedIntType({f.bit_length() + 1}))),"
+              f" _iredsum(algo.SignedIntType(32),"
+              f" {flatseq}))), {round_bits}, {clip_bits})), 32),"
+              f" algo.ConstantInteger(0)))) }}, {s})")
+        yield s
+    return reduce(lambda x, y: f"algo.Concat({x}, {y})", gen_subparts())
+
+  @staticmethod
+  def _decompose_range(idim, output_size):
+    """
+    Turns it into a bunch of (hd, tl, w, s, reps):
+    Repeat(SlideGeneral(Drop(input, hd, tl), w, s), reps)
+    """
+
+    assert output_size > 0
+
+    def gen_range():
+      # start uses floor division
+      # end uses ceiling division
+      repetition = 1
+      last_start = 0
+      last_end = -(idim // -output_size)
+
+      for i in range(1, output_size):
+        start = i * idim // output_size
+        end = -((i + 1) * idim // -output_size)
+        if start == last_start and end == last_end:
+          repetition += 1
+          continue
+
+        yield repetition, last_start, last_end
+        repetition = 1
+        last_start = start
+        last_end = end
+      yield repetition, last_start, last_end
+
+    slides = []
+    last_run = None
+    last_stride = None
+    last_idx = None
+    drop_left = None
+
+    def save_slide(reps):
+      if last_run is not None:
+        s = 1 if last_stride is None else last_stride
+        leftover = idim - last_idx - last_run
+        slides.append((drop_left, leftover, last_run, s, reps))
+
+    for (rep, start, end) in gen_range():
+      run = end - start
+      if rep != 1:
+        # this has to be it's own group
+        save_slide(1)
+        slides.append((
+            start,
+            idim - end,
+            run,
+            1,
+            rep,
+        ))
+        last_run = None
+      elif last_run == run:
+        new_stride = start - last_idx
+        if last_stride is None:
+          last_stride = new_stride
+        assert last_stride == new_stride, "Stride mismatch"
+        last_idx = start
+      else:
+        save_slide(1)
+
+        last_run = run
+        drop_left = start
+        last_idx = start
+        last_stride = None
+
+    save_slide(1)
+    return slides
+
+@register_operator(shir.int_adaptive_avg_pool2d.default)
+class LowerAdaptiveAvgPool2D(LowerAdaptiveAvgPoolND):
+  N = 2

@@ -128,14 +128,16 @@ class BackendQuantizer(Quantizer):
 
   # where the magic happens
   def annotate(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-    # say we just annotate linear layers
-    qconfig = self.global_config
     self._fuse_bn_weights(gm)
+
+    qconfig = self.global_config
     self._annotate_conv_relu(gm, qconfig)
     self._annotate_conv(gm, qconfig)
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
-    self._annotate_maxpool(gm, qconfig)
+
+    self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm, qconfig)
+    self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm, qconfig)
 
   # validate the annotated graph is supported by the backend
   def validate(self, gm: torch.fx.GraphModule) -> None:
@@ -338,8 +340,8 @@ class BackendQuantizer(Quantizer):
       _annotate_output_qspec(conv_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
-  def _annotate_maxpool(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
-    all_partitions = get_source_partitions(gm.graph, [torch.nn.MaxPool2d])
+  def _annotate_in_out_shared_qspec(self, op: Callable, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    all_partitions = get_source_partitions(gm.graph, [op])
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:
       out = p.output_nodes[0]

@@ -27,6 +27,7 @@ class QuantOpRewrite:
     self._rewrite_qlinear_relu()
     self._rewrite_qlinear()
     self._rewrite_qmaxpool()
+    self._rewrite_qavgpool()
 
   def find_free_name(self) -> str:
     while True:
@@ -179,6 +180,20 @@ class QuantOpRewrite:
 
     pattern = torch.fx.symbolic_trace(pattern).graph
     self._match_and_rewrite(pattern, lambda m: self._template_qmaxpool(m))
+
+  """
+  AVGPOOL2D(sx (X - zx)) = sx AVGPOOL2D(X - zx)
+  """
+
+  def _rewrite_qavgpool(self):
+    def pattern(output_size, x_q, s_x, z_x, s_out, z_out):
+      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
+      x = aten._adaptive_avg_pool2d.default(x, output_size)
+      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
+      return x
+
+    pattern = torch.fx.symbolic_trace(pattern).graph
+    self._match_and_rewrite(pattern, lambda m: self._template_qavgpool(m))
 
   def _match_and_rewrite(self, pattern: torch.fx.Graph, callback):
     graph = self.gm.graph
@@ -340,6 +355,37 @@ class QuantOpRewrite:
         n2 = graph.call_function(aten.sub, (n1, z_x.int().item))
         n3 = graph.call_function(shir.int_max_pool2d, (
           n2, kernel_size, stride, padding, dilation))
+        n4 = graph.call_function(shir.requantize, (n3, s_x.item() / s_out.item(), z_out.item()))
+    return (last_node, n4)
+
+  def _template_qavgpool(self, m):
+    if len(m.returning_nodes) != 1:
+      return None
+
+    [output_size, x, *rest] = m.placeholder_nodes
+    tensors = [self.extract_tensor(n) for n in rest]
+    if not all((isinstance(t, torch.Tensor) for t in tensors)):
+      return None
+    [s_x, z_x, s_out, z_out] = tensors
+
+    last_node = m.returning_nodes[0]
+    first_user = self.find_first_user(last_node)
+    if first_user is None:
+      return None
+
+    # note that the shir quantizer would have tried to share the qparams
+    # between the input and outputs!
+    shared_qparams = s_x.item() == s_out.item() and z_x.item() == z_out.item()
+
+    graph = self.gm.graph
+    with graph.inserting_before(first_user):
+      n1 = graph.call_method("int", (x,))
+      if shared_qparams:
+        n3 = graph.call_function(shir.int_adaptive_avg_pool2d, (n1, output_size))
+        n4 = graph.call_method("to", (n3, torch.int8))
+      else:
+        n2 = graph.call_function(aten.sub, (n1, z_x.int().item))
+        n3 = graph.call_function(shir.int_adaptive_avg_pool2d, (n2, output_size))
         n4 = graph.call_function(shir.requantize, (n3, s_x.item() / s_out.item(), z_out.item()))
     return (last_node, n4)
 

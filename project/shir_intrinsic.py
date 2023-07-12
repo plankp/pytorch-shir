@@ -11,15 +11,12 @@ shir_intrinsic_lib.define(
   "int_max_pool2d(Tensor self, int[2] kernel_size, int[2] stride, int[2] padding, int[2] dilation) -> Tensor"
 )
 
+shir_intrinsic_lib.define(
+  "int_adaptive_avg_pool2d(Tensor self, int[2] output_size) -> Tensor"
+)
+
 aten = torch.ops.aten
 qd = torch.ops.quantized_decomposed
-
-INT_TYPES = {
-  torch.uint8,
-  torch.int8,
-  torch.int16,
-  torch.int32,
-}
 
 # CompositeExplicitAutograd is needed becase we later define a Meta version.
 # We define both instead of using the default to avoid
@@ -41,8 +38,10 @@ def requantize_meta(self, s, z):
 
 @impl(shir_intrinsic_lib, "int_max_pool2d", "CompositeExplicitAutograd")
 def int_max_pool2d(self, kern_size, stride, pad, dilation):
+  assert self.dtype in {torch.int8, torch.int32}
   return aten.max_pool2d(self.float(), kern_size, stride, pad, dilation).to(self.dtype)
 
-@impl(shir_intrinsic_lib, "int_max_pool2d", "Meta")
-def int_max_pool2d_meta(self, kern_size, stride, pad, dilation):
-  return aten.max_pool2d(self.float(), kern_size, stride, pad, dilation).to(self.dtype)
+@impl(shir_intrinsic_lib, "int_adaptive_avg_pool2d", "CompositeExplicitAutograd")
+def int_adaptive_avg_pool2d(self, output_size):
+  assert self.dtype == torch.int32
+  return aten._adaptive_avg_pool2d(self.float(), output_size).to(self.dtype)

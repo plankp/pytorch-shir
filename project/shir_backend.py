@@ -76,6 +76,16 @@ def _idotp(ty: IntTypeT, x: Expr, y: Expr, acc: Option[Expr]=None): Expr = {
   }
 }
 
+def _iredsum(ty: IntTypeT, x: Expr): Expr = {
+  val e1 = algo.TruncInteger(algo.Fold(algo.Add2.asFunction(),
+    algo.Map(algo.TruncInteger.asFunction(Seq(None), Seq(ty.width)), x)), ty.width)
+  ty match {
+    case SignedIntType(_) => algo.Sub(algo.Tuple(e1, algo.ConstantInteger(0)))
+    case IntType(_) => e1
+    case _ => ???
+  }
+}
+
 def _iredmax(ty: IntTypeT, x: Expr): Expr = {
   def signconv(e: Expr): Expr = ty match {
     case SignedIntType(_) => algo.Sub(algo.Tuple(e, algo.ConstantInteger(0)))
