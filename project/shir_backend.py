@@ -229,8 +229,6 @@ def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     return make_boxed_func(fused_graph.forward)
 
   rewrite_pattern.rewrite_quantized_ops(gm)
-  gm.graph.lint()
-  gm.recompile()
 
   augdecomps = core_aten_decompositions()
   augdecomps.update(_decomps)
