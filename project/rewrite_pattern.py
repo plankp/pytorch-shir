@@ -55,17 +55,50 @@ class QuantOpRewrite:
       return None
     return getattr(self.gm, n.target)
 
-  @staticmethod
-  def is_quant_per_tensor(n: Node, min, max, ty) -> bool:
-    if n.op != "call_function" or n.target != qd.quantize_per_tensor:
-      return False
-    return n.args[3] == min and n.args[4] == max and n.args[5] == ty
+  """
+  slightly annoying because an older revision has:
+    y = qd.quant(x, node1, node2, -128, 127, int8)
+  but a new revision has:
+    y = qd.quant.default(x, 0.02, -10, -128, 128, int8)
 
-  @staticmethod
-  def is_dequant_per_tensor(n: Node, min, max, ty) -> bool:
-    if n.op != "call_function" or n.target != qd.dequantize_per_tensor:
-      return False
-    return n.args[3] == min and n.args[4] == max and n.args[5] == ty
+  we handle both cases for now...
+  """
+
+  def fetch_quant_per_tensor(self, n: Node, min, max, ty) -> Optional[Tuple[float, int]]:
+    if n.op != "call_function":
+      return None
+    if n.target == qd.quantize_per_tensor.default:
+      s = n.args[1]
+      z = n.args[2]
+    elif n.target == qd.quantize_per_tensor:
+      s = self.extract_tensor(n.args[1])
+      z = self.extract_tensor(n.args[2])
+      if s is None or z is None:
+        return None
+    else:
+      return None
+
+    if n.args[3] == min and n.args[4] == max and n.args[5] == ty:
+      return (s, z)
+    return None
+
+  def fetch_dequant_per_tensor(self, n: Node, min, max, ty) -> bool:
+    if n.op != "call_function":
+      return None
+    if n.target == qd.dequantize_per_tensor.default:
+      s = n.args[1]
+      z = n.args[2]
+    elif n.target == qd.dequantize_per_tensor:
+      s = self.extract_tensor(n.args[1])
+      z = self.extract_tensor(n.args[2])
+      if s is None or z is None:
+        return None
+    else:
+      return None
+
+    if n.args[3] == min and n.args[4] == max and n.args[5] == ty:
+      return (s, z)
+    return None
 
   """
   b + (sx (X - zx)) @ (sy (Y - zy))
@@ -78,7 +111,8 @@ class QuantOpRewrite:
   """
 
   def _match_qlinear(self, node_q_output: Node):
-    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
       return None
 
     node_relu = node_q_output.args[0]
@@ -111,19 +145,19 @@ class QuantOpRewrite:
 
     node_dq_weight = node_dq_wt.args[0]
 
-    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
       return None
-    if not self.is_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8):
+    qparam_weight = self.fetch_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8)
+    if not qparam_weight:
       return None
 
     node_q_weight = node_dq_weight.args[0]
-    if not self.is_quant_per_tensor(node_q_weight, -127, 127, torch.int8):
+    qparam_weight1 = self.fetch_quant_per_tensor(node_q_weight, -127, 127, torch.int8)
+    if not qparam_weight1:
       return None
 
-    if (
-      node_dq_weight.args[1] != node_q_weight.args[1] or
-      node_dq_weight.args[2] != node_q_weight.args[2]
-    ):
+    if qparam_weight != qparam_weight1:
       return None
 
     return (
@@ -131,12 +165,9 @@ class QuantOpRewrite:
       node_dq_input.args[0],
       node_q_weight.args[0],
       node_bias,
-      node_dq_input.args[1],
-      node_dq_input.args[2],
-      node_q_weight.args[1],
-      node_q_weight.args[2],
-      node_q_output.args[1],
-      node_q_output.args[2],
+      qparam_input,
+      qparam_weight,
+      qparam_out,
     )
 
   def _rewrite_qlinear(self, anchor: Node) -> bool:
