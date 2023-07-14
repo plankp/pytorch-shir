@@ -75,6 +75,8 @@ class QuantOpRewrite:
       z = self.extract_tensor(n.args[2])
       if s is None or z is None:
         return None
+      s = s.item()
+      z = z.item()
     else:
       return None
 
@@ -82,7 +84,7 @@ class QuantOpRewrite:
       return (s, z)
     return None
 
-  def fetch_dequant_per_tensor(self, n: Node, min, max, ty) -> bool:
+  def fetch_dequant_per_tensor(self, n: Node, min, max, ty) -> Optional[Tuple[float, int]]:
     if n.op != "call_function":
       return None
     if n.target == qd.dequantize_per_tensor.default:
@@ -93,6 +95,8 @@ class QuantOpRewrite:
       z = self.extract_tensor(n.args[2])
       if s is None or z is None:
         return None
+      s = s.item()
+      z = z.item()
     else:
       return None
 
@@ -175,28 +179,24 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [needs_relu, x, w_node, b_node, *rest] = node_map
-    tensors = [self.extract_tensor(n) for n in rest]
-    if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return None
-
-    [s_x, z_x, s_w, z_w, s_out, z_out] = tensors
+    [needs_relu, x_node, w_node, b_node,
+     (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
     b = self.extract_tensor(b_node)
     w = self.extract_tensor(w_node)
     if w is None:
       return None
 
-    if z_w.int().item() != 0:
+    if z_w != 0:
       return None
 
-    k = (s_x * s_w).item()
+    k = s_x * s_w
     weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is None:
       bias_q = torch.zero([], dtype=torch.int32)
     else:
       bias_q = torch.round(b / k).int()
-    bias_q = bias_q - z_x.int().item() * torch.sum(weight_q, dim=1, dtype=torch.int32)
+    bias_q = bias_q - z_x * torch.sum(weight_q, dim=1, dtype=torch.int32)
 
     weight_attr = w_node.target
     setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
@@ -211,10 +211,10 @@ class QuantOpRewrite:
     with graph.inserting_before(anchor):
       n1 = graph.get_attr(weight_attr)
       n2 = graph.get_attr(bias_attr)
-      n3 = graph.call_function(shir.int_addmm, (n2, x, n1))
+      n3 = graph.call_function(shir.int_addmm, (n2, x_node, n1))
       if needs_relu:
         n3 = graph.call_function(aten.relu, (n3,))
-      n4 = graph.call_function(shir.requantize, (n3, k / s_out.item(), z_out.item()))
+      n4 = graph.call_function(shir.requantize, (n3, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n4)
     return True
@@ -231,7 +231,8 @@ class QuantOpRewrite:
   """
 
   def _match_qconv(self, node_q_output: Node):
-    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
       return None
 
     node_relu = node_q_output.args[0]
@@ -249,19 +250,19 @@ class QuantOpRewrite:
     node_dq_input = node_conv.args[0]
     node_dq_weight = node_conv.args[1]
 
-    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
       return None
-    if not self.is_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8):
+    qparam_weight = self.fetch_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8)
+    if not qparam_weight:
       return None
 
     node_q_weight = node_dq_weight.args[0]
-    if not self.is_quant_per_tensor(node_q_weight, -127, 127, torch.int8):
+    qparam_weight1 = self.fetch_quant_per_tensor(node_q_weight, -127, 127, torch.int8)
+    if not qparam_weight1:
       return None
 
-    if (
-      node_dq_weight.args[1] != node_q_weight.args[1] or
-      node_dq_weight.args[2] != node_q_weight.args[2]
-    ):
+    if qparam_weight != qparam_weight1:
       return None
 
     return (
@@ -270,12 +271,9 @@ class QuantOpRewrite:
       node_dq_input.args[0],
       node_q_weight.args[0],
       node_conv.args[2],
-      node_dq_input.args[1],
-      node_dq_input.args[2],
-      node_q_weight.args[1],
-      node_q_weight.args[2],
-      node_q_output.args[1],
-      node_q_output.args[2],
+      qparam_input,
+      qparam_weight,
+      qparam_out,
     )
 
   def _rewrite_qconv(self, anchor: Node) -> bool:
@@ -283,21 +281,17 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [needs_relu, conv_params, x, w_node, b_node, *rest] = node_map
-    tensors = [self.extract_tensor(n) for n in rest]
-    if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return False
-
-    [s_x, z_x, s_w, z_w, s_out, z_out] = tensors
+    [needs_relu, conv_params, x_node, w_node, b_node,
+     (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
     b = self.extract_tensor(b_node)
     w = self.extract_tensor(w_node)
     if w is None:
       return False
 
-    if z_w.int().item() != 0:
+    if z_w != 0:
       return False
 
-    k = (s_x * s_w).item()
+    k = s_x * s_w
     kernel_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is not None:
@@ -312,15 +306,15 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
+      n1 = graph.call_method("int", (x_node,))
+      n2 = graph.call_function(aten.sub, (n1, z_x))
       n3 = graph.get_attr(kernel_attr)
       n4 = graph.call_method("int", (n3,))
       n5 = None if b is None else graph.get_attr(bias_attr)
       n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
       if needs_relu:
         n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shir.requantize, (n6, k / s_out.item(), z_out.item()))
+      n7 = graph.call_function(shir.requantize, (n6, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n7)
     return True
@@ -330,7 +324,8 @@ class QuantOpRewrite:
   """
 
   def _match_qmaxpool(self, node_q_output: Node):
-    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
       return None
 
     node_getitem = node_q_output.args[0]
@@ -347,7 +342,12 @@ class QuantOpRewrite:
       return None
 
     node_dq_input = node_pool.args[0]
-    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    # make sure qinput and qoutput are shared
+    if qparam_out != qparam_input:
       return None
 
     # ceil_mode=True is not supported
@@ -360,10 +360,6 @@ class QuantOpRewrite:
     return (
       pool_args[1:-1],
       node_dq_input.args[0],
-      node_dq_input.args[1],
-      node_dq_input.args[2],
-      node_q_output.args[1],
-      node_q_output.args[2],
     )
 
   def _rewrite_qmaxpool(self, anchor: Node) -> bool:
@@ -371,14 +367,7 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [pool_args, x, *rest] = node_map
-    tensors = [self.extract_tensor(n) for n in rest]
-    if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return False
-
-    [s_x, z_x, s_out, z_out] = tensors
-    if s_x.item() != s_out.item() or z_x.item() != z_out.item():
-      return False
+    [pool_args, x] = node_map
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
@@ -392,7 +381,8 @@ class QuantOpRewrite:
   """
 
   def _match_qavgpool(self, node_q_output: Node):
-    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
       return None
 
     node_pool = node_q_output.args[0]
@@ -400,16 +390,17 @@ class QuantOpRewrite:
       return None
 
     node_dq_input = node_pool.args[0]
-    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    # make sure qinput and qoutput are shared
+    if qparam_out != qparam_input:
       return None
 
     return (
       node_pool.args[1],
       node_dq_input.args[0],
-      node_dq_input.args[1],
-      node_dq_input.args[2],
-      node_q_output.args[1],
-      node_q_output.args[2],
     )
 
   def _rewrite_qavgpool(self, anchor: Node) -> bool:
@@ -417,14 +408,7 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [output_size, x, *rest] = node_map
-    tensors = [self.extract_tensor(n) for n in rest]
-    if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return False
-
-    [s_x, z_x, s_out, z_out] = tensors
-    if s_x.item() != s_out.item() or z_x.item() != z_out.item():
-      return False
+    [output_size, x] = node_map
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
