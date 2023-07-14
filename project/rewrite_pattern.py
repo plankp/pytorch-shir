@@ -1,14 +1,12 @@
-from typing import Optional
+from typing import Optional, Tuple
 from torch.fx.graph_module import GraphModule
-from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
-from torch._dynamo.source import (
-  NNModuleSource,
-  LocalSource,
-  AttrSource,
-)
 from torch.fx import subgraph_rewriter, Node
 import torch
 import shir_intrinsic   # make sure these are loaded
+import operator
+from torch.ao.quantization._pt2e.utils import (
+  _get_all_arguments,
+)
 
 # don't match or emit prims ops at this level!
 aten = torch.ops.aten
@@ -16,18 +14,31 @@ shir = torch.ops.shir_intrinsic
 qd = torch.ops.quantized_decomposed
 
 class QuantOpRewrite:
-
   def __init__(self, gm: GraphModule):
     self.counter = -1
     self.gm = gm
 
+  def _rewrite_node(self, n: Node) -> bool:
+    if self._rewrite_qconv(n):
+      return True
+    if self._rewrite_qlinear(n):
+      return True
+    if self._rewrite_qmaxpool(n):
+      return True
+    if self._rewrite_qavgpool(n):
+      return True
+
+    return False
+
   def rewrite(self):
-    self._rewrite_qconv_relu()
-    self._rewrite_qconv()
-    self._rewrite_qlinear_relu()
-    self._rewrite_qlinear()
-    self._rewrite_qmaxpool()
-    self._rewrite_qavgpool()
+    changed = False
+    for n in self.gm.graph.nodes:
+      changed |= self._rewrite_node(n)
+
+    if changed:
+      self.gm.graph.eliminate_dead_code()
+      self.gm.graph.lint()
+      self.gm.recompile()
 
   def find_free_name(self) -> str:
     while True:
@@ -37,84 +48,145 @@ class QuantOpRewrite:
         assert name not in self.gm._param_name_to_source
         return name
 
-  def extract_tensor(self, n: Node) -> Optional[torch.Tensor]:
+  def extract_tensor(self, n: Optional[Node]) -> Optional[torch.Tensor]:
+    if n is None:
+      return None
     if n.op != "get_attr" or n.args != () or n.kwargs != {}:
       return None
     return getattr(self.gm, n.target)
 
-  def find_first_user(self, n: Node) -> Optional[Node]:
-    if len(n.users) == 1:
-      return list(n.users.keys())[0]
+  @staticmethod
+  def is_quant_per_tensor(n: Node, min, max, ty) -> bool:
+    if n.op != "call_function" or n.target != qd.quantize_per_tensor:
+      return False
+    return n.args[3] == min and n.args[4] == max and n.args[5] == ty
 
-    # TODO: actually find
-    return None
+  @staticmethod
+  def is_dequant_per_tensor(n: Node, min, max, ty) -> bool:
+    if n.op != "call_function" or n.target != qd.dequantize_per_tensor:
+      return False
+    return n.args[3] == min and n.args[4] == max and n.args[5] == ty
 
   """
   b + (sx (X - zx)) @ (sy (Y - zy))
     = b + sx sy ((X - zx) @ (Y - zy))
-    = (sx sy) ([b / (sx sy)] + (X - zx) @ (Y - zy))   <-- bias is quantized
+    = (sx sy) ([b / (sx sy)] + (X - zx) @ (Y - zy))
 
   in our case, zy is 0, so:
     = (sx sy) ([b / (sx sy)] + (X - zx) @ Y)
     = (sx sy) ([b / (sx sy) - sum(zx Y, axis=1)] + X @ Y)
   """
 
-  def _rewrite_qlinear(self):
-    def biased_pattern(x, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
-      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = aten.t.default(w)
-      x = aten.addmm.default(b, x, w)
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
+  def _match_qlinear(self, node_q_output: Node):
+    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
+      return None
 
-    pattern = torch.fx.symbolic_trace(biased_pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=False))
+    node_relu = node_q_output.args[0]
+    if node_relu.op != "call_function":
+      return None
+    if node_relu.target in {aten.relu.default, aten.relu_.default}:
+      node_matprod = node_relu.args[0]
+    else:
+      node_matprod = node_relu
+      node_relu = None
 
-    def unbiased_pattern(x, w, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
-      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = aten.t.default(w)
-      x = aten.mm.default(x, w)
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
+    # depending on if there is bias, the linear layer could be addmm(b, x, wt)
+    # or mm(x, wt).
 
-    pattern = torch.fx.symbolic_trace(unbiased_pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=False))
+    if node_matprod.op != "call_function":
+      return None
+    if node_matprod.target == aten.mm.default:
+      node_bias = None
+      node_dq_input = node_matprod.args[0]
+      node_dq_wt = node_matprod.args[1]
+    elif node_matprod.target == aten.addmm.default:
+      node_bias = node_matprod.args[0]
+      node_dq_input = node_matprod.args[1]
+      node_dq_wt = node_matprod.args[2]
+    else:
+      return None
 
-  """
-  ReLU(b + (sx (X - zx)) @ (sy (Y - zy)))
-    = (sx sy) ReLU([b / (sx sy)] + (X - zx) @ (Y - zy))
-  """
+    if node_dq_wt.op != "call_function" or node_dq_wt.target != aten.t.default:
+      return None
 
-  def _rewrite_qlinear_relu(self):
-    def biased_pattern(x, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
-      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = aten.t.default(w)
-      x = aten.addmm.default(b, x, w)
-      x = aten.relu.default(x)
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
+    node_dq_weight = node_dq_wt.args[0]
 
-    pattern = torch.fx.symbolic_trace(biased_pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=True))
+    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+      return None
+    if not self.is_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8):
+      return None
 
-    def unbiased_pattern(x, w, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x, s_x, z_x, -128, 127, torch.int8)
-      w = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = aten.t.default(w)
-      x = aten.mm.default(x, w)
-      x = aten.relu.default(x)
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
+    node_q_weight = node_dq_weight.args[0]
+    if not self.is_quant_per_tensor(node_q_weight, -127, 127, torch.int8):
+      return None
 
-    pattern = torch.fx.symbolic_trace(unbiased_pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qlinear(m, relu=True))
+    if (
+      node_dq_weight.args[1] != node_q_weight.args[1] or
+      node_dq_weight.args[2] != node_q_weight.args[2]
+    ):
+      return None
+
+    return (
+      node_relu is not None,
+      node_dq_input.args[0],
+      node_q_weight.args[0],
+      node_bias,
+      node_dq_input.args[1],
+      node_dq_input.args[2],
+      node_q_weight.args[1],
+      node_q_weight.args[2],
+      node_q_output.args[1],
+      node_q_output.args[2],
+    )
+
+  def _rewrite_qlinear(self, anchor: Node) -> bool:
+    node_map = self._match_qlinear(anchor)
+    if node_map is None:
+      return False
+
+    [needs_relu, x, w_node, b_node, *rest] = node_map
+    tensors = [self.extract_tensor(n) for n in rest]
+    if not all((isinstance(t, torch.Tensor) for t in tensors)):
+      return None
+
+    [s_x, z_x, s_w, z_w, s_out, z_out] = tensors
+    b = self.extract_tensor(b_node)
+    w = self.extract_tensor(w_node)
+    if w is None:
+      return None
+
+    if z_w.int().item() != 0:
+      return None
+
+    k = (s_x * s_w).item()
+    weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
+
+    if b is None:
+      bias_q = torch.zero([], dtype=torch.int32)
+    else:
+      bias_q = torch.round(b / k).int()
+    bias_q = bias_q - z_x.int().item() * torch.sum(weight_q, dim=1, dtype=torch.int32)
+
+    weight_attr = w_node.target
+    setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
+
+    if b is None:
+      bias_attr = self.find_free_name()
+    else:
+      bias_attr = b_node.target
+    setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.get_attr(weight_attr)
+      n2 = graph.get_attr(bias_attr)
+      n3 = graph.call_function(shir.int_addmm, (n2, x, n1))
+      if needs_relu:
+        n3 = graph.call_function(aten.relu, (n3,))
+      n4 = graph.call_function(shir.requantize, (n3, k / s_out.item(), z_out.item()))
+
+    anchor.replace_all_uses_with(n4)
+    return True
 
   """
   CONV(sx (X - zx), sw (W - zw), b)
@@ -127,265 +199,210 @@ class QuantOpRewrite:
   the qlinear case). here we assume that it's never safe to do this.
   """
 
-  def _rewrite_qconv(self):
-    def pattern(stride, padding, dilation, transposed, output_padding, groups,
-                x_q, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
-      w_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w_q, s_w, z_w, -127, 127, torch.int8)
-      p = aten.convolution.default(
-          x, w, b,
-          stride, padding, dilation, transposed, output_padding, groups)
-      p = qd.quantize_per_tensor(p, s_out, z_out, -128, 127, torch.int8)
-      return p
-
-    pattern = torch.fx.symbolic_trace(pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qconv(m, relu=False))
-
-  """
-  ReLU(CONV(sx (X - zx), sw (W - zw)), b)
-    = sx sw ReLU(CONV(X - zx, W - zw, [b / (sx sw)]))
-  """
-
-  def _rewrite_qconv_relu(self):
-    def pattern(stride, padding, dilation, transposed, output_padding, groups,
-                x_q, w, b, s_x, z_x, s_w, z_w, s_out, z_out):
-      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
-      w_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-      w = qd.dequantize_per_tensor(w_q, s_w, z_w, -127, 127, torch.int8)
-      p = aten.convolution.default(
-          x, w, b,
-          stride, padding, dilation, transposed, output_padding, groups)
-      p = aten.relu.default(p)
-      p = qd.quantize_per_tensor(p, s_out, z_out, -128, 127, torch.int8)
-      return p
-
-    pattern = torch.fx.symbolic_trace(pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qconv(m, relu=True))
-
-  """
-  MAXPOOL2D(sx (X - zx)) = sx MAXPOOL2D(X - zx)
-  """
-
-  def _rewrite_qmaxpool(self):
-    def pattern(kernel_size, stride, padding, dilation, x_q,
-                s_x, z_x, s_out, z_out):
-      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
-      x = aten.max_pool2d_with_indices.default(x, kernel_size, stride, padding, dilation)
-      x = x[0]
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
-
-    pattern = torch.fx.symbolic_trace(pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qmaxpool(m))
-
-  """
-  AVGPOOL2D(sx (X - zx)) = sx AVGPOOL2D(X - zx)
-  """
-
-  def _rewrite_qavgpool(self):
-    def pattern(output_size, x_q, s_x, z_x, s_out, z_out):
-      x = qd.dequantize_per_tensor(x_q, s_x, z_x, -128, 127, torch.int8)
-      x = aten._adaptive_avg_pool2d.default(x, output_size)
-      x = qd.quantize_per_tensor(x, s_out, z_out, -128, 127, torch.int8)
-      return x
-
-    pattern = torch.fx.symbolic_trace(pattern).graph
-    self._match_and_rewrite(pattern, lambda m: self._template_qavgpool(m))
-
-  def _match_and_rewrite(self, pattern: torch.fx.Graph, callback):
-    graph = self.gm.graph
-    matcher = SubgraphMatcher(pattern)
-    matches = matcher.match(graph)
-    replacement_map = {}
-    for m in matches:
-      for i, old in enumerate(m.placeholder_nodes):
-        if isinstance(old, Node) and old in replacement_map:
-          replaced = replacement_map[old]
-          m.placeholder_nodes[i] = replaced
-          for k, v in m.nodes_map.items():
-            if v is old:
-              m.nodes_map[k] = replaced
-
-      r = callback(m)
-      if r is not None:
-        original, replacement = r
-        original.replace_all_uses_with(replacement)
-        replacement_map[original] = replacement
-
-      for node in m.nodes_map.values():
-        if node not in m.placeholder_nodes:
-          graph.erase_node(node)
-
-  """
-  When rewriting, we want to try to quantize the weighs right now. Once that
-  happens, we just wipe-out the original weights.
-  """
-
-  def _template_qlinear(self, m, relu=False):
-    if len(m.returning_nodes) != 1:
+  def _match_qconv(self, node_q_output: Node):
+    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
       return None
 
-    [x, *rest] = m.placeholder_nodes
+    node_relu = node_q_output.args[0]
+    if node_relu.op != "call_function":
+      return None
+    if node_relu.target in {aten.relu.default, aten.relu_.default}:
+      node_conv = node_relu.args[0]
+    else:
+      node_conv = node_relu
+      node_relu = None
+
+    if node_conv.op != "call_function" or node_conv.target != aten.convolution.default:
+      return None
+
+    node_dq_input = node_conv.args[0]
+    node_dq_weight = node_conv.args[1]
+
+    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+      return None
+    if not self.is_dequant_per_tensor(node_dq_weight, -127, 127, torch.int8):
+      return None
+
+    node_q_weight = node_dq_weight.args[0]
+    if not self.is_quant_per_tensor(node_q_weight, -127, 127, torch.int8):
+      return None
+
+    if (
+      node_dq_weight.args[1] != node_q_weight.args[1] or
+      node_dq_weight.args[2] != node_q_weight.args[2]
+    ):
+      return None
+
+    return (
+      node_relu is not None,
+      node_conv.args[3:],
+      node_dq_input.args[0],
+      node_q_weight.args[0],
+      node_conv.args[2],
+      node_dq_input.args[1],
+      node_dq_input.args[2],
+      node_q_weight.args[1],
+      node_q_weight.args[2],
+      node_q_output.args[1],
+      node_q_output.args[2],
+    )
+
+  def _rewrite_qconv(self, anchor: Node) -> bool:
+    node_map = self._match_qconv(anchor)
+    if node_map is None:
+      return False
+
+    [needs_relu, conv_params, x, w_node, b_node, *rest] = node_map
     tensors = [self.extract_tensor(n) for n in rest]
     if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return None
+      return False
 
-    match tensors:
-      case [w, s_x, z_x, s_w, z_w, s_out, z_out]:
-        b = None
-      case [w, b, s_x, z_x, s_w, z_w, s_out, z_out]:
-        pass
-      case _:
-        assert False, "invalid qlinear-relu match"
+    [s_x, z_x, s_w, z_w, s_out, z_out] = tensors
+    b = self.extract_tensor(b_node)
+    w = self.extract_tensor(w_node)
+    if w is None:
+      return False
 
     if z_w.int().item() != 0:
-      return None
+      return False
 
-    last_node = m.returning_nodes[0]
-    first_user = self.find_first_user(last_node)
-    if first_user is None:
-      return None
-
-    k = (s_x * s_w).item()
-    weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
-
-    if b is None:
-      bias_q = torch.zero([], dtype=torch.int32)
-    else:
-      bias_q = torch.round(b / k).int()
-    bias_q = bias_q - z_x.int().item() * torch.sum(weight_q, dim=1, dtype=torch.int32)
-
-    weight_attr = rest[0].target
-    setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
-
-    if b is None:
-      bias_attr = self.find_free_name()
-    else:
-      bias_attr = rest[1].target
-    setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
-
-    graph = self.gm.graph
-    with graph.inserting_before(first_user):
-      n1 = graph.get_attr(weight_attr)
-      n2 = graph.get_attr(bias_attr)
-      n3 = graph.call_function(shir.int_addmm, (n2, x, n1))
-      if relu:
-        n3 = graph.call_function(aten.relu, (n3,))
-      n4 = graph.call_function(shir.requantize, (n3, k / s_out.item(), z_out.item()))
-
-    return (last_node, n4)
-
-  def _template_qconv(self, m, relu=False):
-    if len(m.returning_nodes) != 1:
-      return None
-
-    [stride, padding, dilation, transposed, output_padding, groups,
-     x, *rest] = m.placeholder_nodes
-    tensors = [self.extract_tensor(n) for n in rest]
-    if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return None
-
-    [w, b, s_x, z_x, s_w, z_w, s_out, z_out] = tensors
-
-    last_node = m.returning_nodes[0]
-    first_user = self.find_first_user(last_node)
-    if first_user is None:
-      return None
-
-    # keep the kernel as an int8 to save memory.
-    # SHIR will likely able to fuse the sign extension.
     k = (s_x * s_w).item()
     kernel_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is not None:
       bias_q = torch.round(b / k).int()
 
-    kernel_attr = rest[0].target
+    kernel_attr = w_node.target
     setattr(self.gm, kernel_attr, torch.nn.Parameter(kernel_q, False))
 
     if b is not None:
-      bias_attr = rest[1].target
+      bias_attr = b_node.target
       setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     graph = self.gm.graph
-    with graph.inserting_before(first_user):
+    with graph.inserting_before(anchor):
       n1 = graph.call_method("int", (x,))
       n2 = graph.call_function(aten.sub, (n1, z_x.int().item()))
       n3 = graph.get_attr(kernel_attr)
       n4 = graph.call_method("int", (n3,))
       n5 = None if b is None else graph.get_attr(bias_attr)
-      n6 = graph.call_function(aten.convolution, (
-        n2, n4, n5,
-        stride, padding, dilation, transposed, output_padding, groups))
-      if relu:
+      n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
+      if needs_relu:
         n6 = graph.call_function(aten.relu, (n6,))
       n7 = graph.call_function(shir.requantize, (n6, k / s_out.item(), z_out.item()))
 
-    return (last_node, n7)
+    anchor.replace_all_uses_with(n7)
+    return True
 
-  def _template_qmaxpool(self, m):
-    if len(m.returning_nodes) != 1:
+  """
+  MAXPOOL2D(sx (X - zx)) = sx MAXPOOL2D(X - zx)
+  """
+
+  def _match_qmaxpool(self, node_q_output: Node):
+    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
       return None
 
-    [kernel_size, stride, padding, dilation, x, *rest] = m.placeholder_nodes
+    node_getitem = node_q_output.args[0]
+    if (
+      node_getitem.op != "call_function" or
+      node_getitem.target != operator.getitem or
+      node_getitem.args[1] != 0
+    ):
+      return None
+
+    node_pool = node_getitem.args[0]
+
+    if node_pool.op != "call_function" or node_pool.target != aten.max_pool2d_with_indices.default:
+      return None
+
+    node_dq_input = node_pool.args[0]
+    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+      return None
+
+    # ceil_mode=True is not supported
+    pool_args = _get_all_arguments(
+      node_pool.args, node_pool.kwargs, node_pool.target._schema.arguments
+    )
+    if pool_args[-1]:
+      return None
+
+    return (
+      pool_args[1:-1],
+      node_dq_input.args[0],
+      node_dq_input.args[1],
+      node_dq_input.args[2],
+      node_q_output.args[1],
+      node_q_output.args[2],
+    )
+
+  def _rewrite_qmaxpool(self, anchor: Node) -> bool:
+    node_map = self._match_qmaxpool(anchor)
+    if node_map is None:
+      return False
+
+    [pool_args, x, *rest] = node_map
     tensors = [self.extract_tensor(n) for n in rest]
     if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return None
+      return False
+
     [s_x, z_x, s_out, z_out] = tensors
-
-    last_node = m.returning_nodes[0]
-    first_user = self.find_first_user(last_node)
-    if first_user is None:
-      return None
-
-    # note that the shir quantizer would have tried to share the qparams
-    # between the input and outputs!
-    shared_qparams = s_x.item() == s_out.item() and z_x.item() == z_out.item()
+    if s_x.item() != s_out.item() or z_x.item() != z_out.item():
+      return False
 
     graph = self.gm.graph
-    with graph.inserting_before(first_user):
-      if shared_qparams:
-        n4 = graph.call_function(shir.int_max_pool2d, (
-          x, kernel_size, stride, padding, dilation))
-      else:
-        n1 = graph.call_method("int", (x,))
-        n2 = graph.call_function(aten.sub, (n1, z_x.int().item))
-        n3 = graph.call_function(shir.int_max_pool2d, (
-          n2, kernel_size, stride, padding, dilation))
-        n4 = graph.call_function(shir.requantize, (n3, s_x.item() / s_out.item(), z_out.item()))
-    return (last_node, n4)
+    with graph.inserting_before(anchor):
+      n1 = graph.call_function(shir.int_max_pool2d, (x, *pool_args))
 
-  def _template_qavgpool(self, m):
-    if len(m.returning_nodes) != 1:
+    anchor.replace_all_uses_with(n1)
+    return True
+
+  """
+  AVGPOOL2D(sx (X - zx)) = sx AVGPOOL2D(X - zx)
+  """
+
+  def _match_qavgpool(self, node_q_output: Node):
+    if not self.is_quant_per_tensor(node_q_output, -128, 127, torch.int8):
       return None
 
-    [output_size, x, *rest] = m.placeholder_nodes
+    node_pool = node_q_output.args[0]
+    if node_pool.op != "call_function" or node_pool.target != aten._adaptive_avg_pool2d.default:
+      return None
+
+    node_dq_input = node_pool.args[0]
+    if not self.is_dequant_per_tensor(node_dq_input, -128, 127, torch.int8):
+      return None
+
+    return (
+      node_pool.args[1],
+      node_dq_input.args[0],
+      node_dq_input.args[1],
+      node_dq_input.args[2],
+      node_q_output.args[1],
+      node_q_output.args[2],
+    )
+
+  def _rewrite_qavgpool(self, anchor: Node) -> bool:
+    node_map = self._match_qavgpool(anchor)
+    if node_map is None:
+      return False
+
+    [output_size, x, *rest] = node_map
     tensors = [self.extract_tensor(n) for n in rest]
     if not all((isinstance(t, torch.Tensor) for t in tensors)):
-      return None
+      return False
+
     [s_x, z_x, s_out, z_out] = tensors
-
-    last_node = m.returning_nodes[0]
-    first_user = self.find_first_user(last_node)
-    if first_user is None:
-      return None
-
-    # note that the shir quantizer would have tried to share the qparams
-    # between the input and outputs!
-    shared_qparams = s_x.item() == s_out.item() and z_x.item() == z_out.item()
+    if s_x.item() != s_out.item() or z_x.item() != z_out.item():
+      return False
 
     graph = self.gm.graph
-    with graph.inserting_before(first_user):
+    with graph.inserting_before(anchor):
       n1 = graph.call_method("int", (x,))
-      if shared_qparams:
-        n3 = graph.call_function(shir.int_adaptive_avg_pool2d, (n1, output_size))
-        n4 = graph.call_method("to", (n3, torch.int8))
-      else:
-        n2 = graph.call_function(aten.sub, (n1, z_x.int().item))
-        n3 = graph.call_function(shir.int_adaptive_avg_pool2d, (n2, output_size))
-        n4 = graph.call_function(shir.requantize, (n3, s_x.item() / s_out.item(), z_out.item()))
-    return (last_node, n4)
+      n2 = graph.call_function(shir.int_adaptive_avg_pool2d, (n1, output_size))
+      n3 = graph.call_method("to", (n2, torch.int8))
+
+    anchor.replace_all_uses_with(n3)
+    return True
 
 def rewrite_quantized_ops(gm: GraphModule):
   obj = QuantOpRewrite(gm)
