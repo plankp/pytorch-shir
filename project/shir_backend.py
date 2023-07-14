@@ -16,6 +16,7 @@ import rewrite_pattern
 import shir_type
 import shir_lowering
 from functools import reduce
+from itertools import count
 
 # some namespace aliases
 aten = torch.ops.aten
@@ -41,6 +42,28 @@ _decomps = get_decompositions([
   aten.unsqueeze.default,
 ])
 
+class SHIRGraphModule(torch.nn.Module):
+  _iid_couter = counter()   # assigns a number of each instance
+
+  gm: torch.fx.GraphModule
+  _inst_id: int
+  _call_id: int
+  _compiled: bool
+
+  def __init__(self, gm: torch.fx.GraphModule):
+    super(SHIRGraphModule, self).__init__()
+    self.gm = gm
+    self._compiled = False
+    self._inst_id = next(self._iid_couter)
+    self._call_id = 0
+
+  def __call__(self, *args):
+    if not self._compiled:
+      self._compiled = True
+      with open(f"Module{self._inst_id}.scala") as f:
+        //
+
+'''
 class SHIRGraphModule(torch.nn.Module):
   gm: torch.fx.GraphModule
 
@@ -186,6 +209,7 @@ def _add32_mm8(acc: Expr, lhs: Expr, rhs: Expr): Expr = {
           assert False, "Unhandled fx node type when emitting"
 
     return buffer
+'''
 
 class SHIROperatorSupport(OperatorSupport):
   def is_node_supported(self, submodules, n: torch.fx.Node) -> bool:
