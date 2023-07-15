@@ -124,7 +124,7 @@ class SHIRGraphModule(torch.nn.Module):
     self._emit_body(f)
     print("  }", file=f)
     print(file=f)
-    print("  def _read_csv(fname: String): Seq(Seq(Int)) = {", file=f)
+    print("  def _read_csv(fname: String): Seq[Seq[Int]] = {", file=f)
     print("    val f = Source.fromFile(fname)", file=f)
     print("    val s = f.getLines().map(_.split(\",\").map(_.toInt).toList).toList", file=f)
     print("    f.close()", file=f)
