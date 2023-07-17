@@ -236,8 +236,18 @@ class LowerView:
       # turn T[1, ..., 1] into T
       return f"algo.Convert({a}, {shir_type.get_element_type(a).name()})"
 
-    shape = ", ".join((str(s) for s in shape))
-    return (f"algo.Join(algo.SplitAll({a}, Seq({shape})))")
+    def iter_shape():
+      for s in shape:
+        if s == -1:
+          # there's only supposed to be one that is -1, which is whatever is
+          # left over.
+          total = reduce(lambda x, y: x * y, ashape)
+          divisor = reduce(lambda x, y: x * y, shape)
+          s = total // -divisor
+        yield s
+
+    w = ", ".join((str(s) for s in iter_shape()))
+    return (f"algo.Join(algo.SplitAll({a}, Seq({w})))")
 
 @register_operator(prims.collapse_view.default)
 class LowerCollapseView:
@@ -617,9 +627,8 @@ class LowerConvolution:
     if any((p != 0 for p in output_padding)):
       return False
 
-    # allow bias if it's also the same type.
-    # (aten.convolution seems to do weird coercion business otherwise)
-    if bias and shir_type.get_element_type(bias) != shir_type.get_element_type(input):
+    # disallow bias here. expect a rewrite to move it into a separate add.
+    if bias is not None:
       return False
 
     # some cases that are technically allowed, but we weren't able to
@@ -635,10 +644,9 @@ class LowerConvolution:
     elt_ty = shir_type.get_element_type(input)
     ishape = input.meta.get("val").shape
     wshape = weight.meta.get("val").shape
-    bias = bias.name if bias else None
 
     obj = cls(elt_ty, stride, padding, dilation)
-    return obj.emit_many(input.name, ishape, weight, wshape, bias, groups)
+    return obj.emit_many(input.name, ishape, weight, wshape, groups)
 
   def __init__(self, elt_ty, stride, padding, dilation):
     self.elt_ty = elt_ty
@@ -675,7 +683,7 @@ class LowerConvolution:
             f" algo.AlgoLambda(Seq(_0), {w1}) }},"
             f" core.ParamUse(_0))) }}, {input})")
 
-  def emit_single(self, input, idim, kernel, kdim, bias):
+  def emit_single(self, input, idim, kernel, kdim):
     # idim[0]: number of inputs
     # idim[1]: InChan
     # kdim[0]: OutChan
@@ -731,14 +739,8 @@ class LowerConvolution:
     transpose_axes = (2 * N - x for x in transpose_axes)
     frag_transpose = f"algo.TransposeND({frag_sliding}, Seq{(*transpose_axes,)})"
 
-    if bias is None:
-      acc = lambda t: (f"_idotp({self.elt_ty.name()}, algo.JoinAll({t}),"
-                       f" algo.JoinAll(core.ParamUse(_1)))")
-    else:
-      # we needed to add algo.Select now that the values come from tuples
-      acc = lambda t: (f"_idotp({self.elt_ty.name()}, algo.JoinAll({t}),"
-                       f" algo.JoinAll(algo.Select(core.ParamUse(_1), 0)),"
-                       f" Some(algo.Select(core.ParamUse(_1), 1)))")
+    acc = lambda t: (f"_idotp({self.elt_ty.name()}, algo.JoinAll({t}),"
+                     f" algo.JoinAll(core.ParamUse(_1)))")
 
     # recall that JoinAll needs type annotation.
     w1 = acc("core.ParamUse(_0)")
@@ -751,23 +753,16 @@ class LowerConvolution:
                        f" algo.AlgoLambda(Seq(_0), {w1}) }}, {t})")
     frag_inner_map = acc(frag_transpose)
 
-    if bias is None:
-      annot = "_2"
-    else:
-      # the type of the output-channel (2nd dimension) map is a tuple
-      annot = f"algo.TupleType(_2, {self.elt_ty.name()})"
-      kernel = f"algo.Zip(algo.Tuple({kernel}, {bias}))"
-
     input = self._zero_pad(input, idim)
     return (f"algo.Map({{ val _0 = core.ParamDef();"
             f" algo.AlgoLambda(Seq(_0), algo.Map({{"
-            f" val _2 = {inkern_ty}; val _1 = core.ParamDef({annot});"
+            f" val _2 = {inkern_ty}; val _1 = core.ParamDef(_2);"
             f" algo.AlgoLambda(Seq(_1), {frag_inner_map}) }},"
             f" {kernel})) }}, {input})")
 
-  def emit_many(self, input, idim, kernel, kdim, bias, groups):
+  def emit_many(self, input, idim, kernel, kdim, groups):
     if groups == 1:
-      return self.emit_single(input, idim, kernel, kdim, bias)
+      return self.emit_single(input, idim, kernel, kdim)
 
     # we rewrite the grouped convolution into many smaller parallelizable
     # convolutions and then concatenate (using algo.Join) the result.
@@ -798,28 +793,13 @@ class LowerConvolution:
     for d in reversed(inner_kdim):
       kernel_ty = f"algo.SeqType({kernel_ty}, {d})"
 
-    if bias is not None:
-      bias = f"algo.Split({bias}, {kwindow})"
-      bias_ty = f"algo.SeqType({self.elt_ty.name()}, {kwindow})"
-
-    if bias is None:
-      conv = self.emit_single(
-          "algo.Transpose(algo.Select(core.ParamUse(_4), 0))", inner_idim,
-          "algo.Select(core.ParamUse(_4), 1)", inner_kdim,
-          None)
-      conv = (f"algo.Map({{ val _4 = core.ParamDef("
-              f"algo.TupleType({input_ty}, {kernel_ty}));"
-              f" algo.AlgoLambda(Seq(_4), {conv}) }},"
-              f" algo.Zip(algo.Tuple({input}, {kernel})))")
-    else:
-      conv = self.emit_single(
-          "algo.Transpose(algo.Select3(core.ParamUse(_4), 0))", inner_idim,
-          "algo.Select3(core.ParamUse(_4), 1)", inner_kdim,
-          "algo.Select3(core.ParamUse(_4), 2)")
-      conv = (f"algo.Map({{ val _4 = core.ParamDef("
-              f"algo.TupleType({input_ty}, {kernel_ty}, {bias_ty}));"
-              f" algo.AlgoLambda(Seq(_4), {conv}) }},"
-              f" algo.Zip3(algo.Tuple3({input}, {kernel}, {bias})))")
+    conv = self.emit_single(
+        "algo.Transpose(algo.Select(core.ParamUse(_4), 0))", inner_idim,
+        "algo.Select(core.ParamUse(_4), 1)", inner_kdim)
+    conv = (f"algo.Map({{ val _4 = core.ParamDef("
+            f"algo.TupleType({input_ty}, {kernel_ty}));"
+            f" algo.AlgoLambda(Seq(_4), {conv}) }},"
+            f" algo.Zip(algo.Tuple({input}, {kernel})))")
 
     # at this point, we have T[Groups, N, OutChan, S1, S2, ...].
     # merge the 0th (Groups) dimension into the 2nd (OutChan) dimension.

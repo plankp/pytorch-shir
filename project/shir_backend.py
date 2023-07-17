@@ -316,12 +316,16 @@ def compiler(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
     return make_boxed_func(fused_graph.forward)
 
+  def prelowering(gm, example_inputs):
+    rewrite_pattern.rewrite_late(gm)
+    f = aot_module_simplified(gm, example_inputs,
+                              decompositions=_decomps,
+                              fw_compiler=lowering)
+    return make_boxed_func(f)
+
   rewrite_pattern.rewrite_quantized_ops(gm)
 
-  augdecomps = core_aten_decompositions()
-  augdecomps.update(_decomps)
-
   f = aot_module_simplified(gm, example_inputs,
-                            decompositions=augdecomps,
-                            fw_compiler=lowering)
+                            decompositions=core_aten_decompositions(),
+                            fw_compiler=prelowering)
   return f

@@ -422,3 +422,38 @@ class QuantOpRewrite:
 def rewrite_quantized_ops(gm: GraphModule):
   obj = QuantOpRewrite(gm)
   obj.rewrite()
+
+def rewrite_late(gm: GraphModule):
+  changed = False
+  for n in gm.graph.nodes:
+    if n.op != "call_function" or n.target != aten.convolution.default:
+      continue
+    if n.args[2] is None:
+      continue
+
+    kernel_node = n.args[1]
+    info = kernel_node.meta.get("val")
+    if info is None:
+      continue
+
+    # Turn:
+    #   n = aten.convolution(i, k, b, ...)
+    # into:
+    #   p = aten.convolution(i, k, None, ...)
+    #   q = torch.reshape(b, [-1, 1, 1, ...])
+    #   n = torch.add(p, q)
+    changed = True
+    broadcast = [-1] + [1] * (len(info.shape) - 2)
+    new_args = list(n.args)
+    new_args[2] = None
+    graph = gm.graph
+    with graph.inserting_before(n):
+      p = graph.call_function(aten.convolution, tuple(new_args))
+      q = graph.call_function(torch.reshape, (n.args[2], broadcast))
+    n.target = torch.add
+    n.args = (p, q)
+
+  if changed:
+    gm.graph.eliminate_dead_code()
+    gm.graph.lint()
+    gm.recompile()
