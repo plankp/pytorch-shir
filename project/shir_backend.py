@@ -265,7 +265,7 @@ class SHIRGraphModule(torch.nn.Module):
             inner_sz = reduce(lambda x, y: x * y, shape[1:])
             v = f"algo.Split(algo.JoinAll({v}), {inner_sz})"
 
-          f.write(f"    return core.TypeChecker.check({v})")
+          f.write(f"    return core.TypeChecker.check({v})\n")
 
         case "call_function":
           obj = shir_lowering.fetch_lowering(n.target)
