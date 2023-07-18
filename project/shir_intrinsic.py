@@ -29,6 +29,30 @@ def requantize_meta(self, s, z):
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
+  "requantize_channel(Tensor self, Tensor scale, int z) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "requantize_channel", "CompositeExplicitAutograd")
+def requantize_channel(self, s, z):
+  # self : i32[N, C, ...]
+  # s : i32[C]    <-- bitcasted from float32
+  # we are requantizing over the C dimension
+  c = s.size(0)
+  return qd.quantize_per_channel(
+    self.float(), 1 / s.view(torch.float32), torch.tensor(z).expand(c),
+    1, -128, 127, torch.int8
+  )
+
+@impl(shir_intrinsic_lib, "requantize_channel", "Meta")
+def requantize_channel(self, s, z):
+  assert self.dtype == torch.int32
+  assert s.dtype == torch.int32
+  assert isinstance(z, int)
+  assert s.ndim == 1 and self.ndim > 1 and s.size(0) == self.size(1)
+
+  return torch.empty_like(self, dtype=torch.int8)
+
+shir_intrinsic_lib.define(
   "int_addmm(Tensor self, Tensor lhs, Tensor rhs) -> Tensor"
 )
 

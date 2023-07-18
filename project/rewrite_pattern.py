@@ -7,6 +7,11 @@ import operator
 from torch.ao.quantization._pt2e.utils import (
   _get_all_arguments,
 )
+from torch._dynamo.source import (
+  NNModuleSource,
+  LocalSource,
+  AttrSource,
+)
 
 # don't match or emit prims ops at this level!
 aten = torch.ops.aten
@@ -19,6 +24,8 @@ class QuantOpRewrite:
     self.gm = gm
 
   def _rewrite_node(self, n: Node) -> bool:
+    if self._rewrite_qconv_per_channel(n):
+      return True
     if self._rewrite_qconv(n):
       return True
     if self._rewrite_qlinear(n):
@@ -40,12 +47,16 @@ class QuantOpRewrite:
       self.gm.graph.lint()
       self.gm.recompile()
 
-  def find_free_name(self) -> str:
+  def create_new_param(self) -> str:
     while True:
       self.counter += 1
       name = f"_fixed_qconst{self.counter}"
       if not hasattr(self.gm, name):
         assert name not in self.gm._param_name_to_source
+        self.gm.register_parameter(name, None)
+        self.gm._param_name_to_source[name] = NNModuleSource(
+          AttrSource(LocalSource("self"), name)
+        )
         return name
 
   def extract_tensor(self, n: Optional[Node]) -> Optional[torch.Tensor]:
@@ -102,6 +113,26 @@ class QuantOpRewrite:
 
     if n.args[3] == min and n.args[4] == max and n.args[5] == ty:
       return (s, z)
+    return None
+
+  def fetch_quant_per_channel(self, n: Node, chan, min, max, ty) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if n.op != "call_function":
+      return None
+    if n.target != qd.quantize_per_channel:
+      return None
+
+    if n.args[3] == chan and n.args[4] == min and n.args[5] == max and n.args[6] == ty:
+      return self.extract_tensor(n.args[1]), self.extract_tensor(n.args[2])
+    return None
+
+  def fetch_dequant_per_channel(self, n: Node, chan, min, max, ty) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if n.op != "call_function":
+      return None
+    if n.target != qd.dequantize_per_channel:
+      return None
+
+    if n.args[3] == chan and n.args[4] == min and n.args[5] == max and n.args[6] == ty:
+      return self.extract_tensor(n.args[1]), self.extract_tensor(n.args[2])
     return None
 
   """
@@ -202,7 +233,7 @@ class QuantOpRewrite:
     setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
 
     if b is None:
-      bias_attr = self.find_free_name()
+      bias_attr = self.create_new_param()
     else:
       bias_attr = b_node.target
     setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
@@ -317,6 +348,115 @@ class QuantOpRewrite:
       n7 = graph.call_function(shir.requantize, (n6, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n7)
+    return True
+
+  """
+  Per channel convolution is the almost the same as per tensor convolution.
+  The difference is that now each output channel of the kernel has it's own
+  scale, implying that s_w is now a tensor. z_w is still zero since it's
+  symmetric.
+
+  The input is still quantized per tensor!
+  """
+
+  def _match_qconv_per_channel(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_relu = node_q_output.args[0]
+    if node_relu.op != "call_function":
+      return None
+    if node_relu.target in {aten.relu.default, aten.relu_.default}:
+      node_conv = node_relu.args[0]
+    else:
+      node_conv = node_relu
+      node_relu = None
+
+    if node_conv.op != "call_function" or node_conv.target != aten.convolution.default:
+      return None
+
+    node_dq_input = node_conv.args[0]
+    node_dq_weight = node_conv.args[1]
+
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+    qparam_weight = self.fetch_dequant_per_channel(node_dq_weight, 0, -127, 127, torch.int8)
+    if not qparam_weight:
+      return None
+
+    node_q_weight = node_dq_weight.args[0]
+    qparam_weight1 = self.fetch_quant_per_channel(node_q_weight, 0, -127, 127, torch.int8)
+    if not qparam_weight1:
+      return None
+
+    if qparam_weight != qparam_weight1:
+      return None
+
+    return (
+      node_relu is not None,
+      node_conv.args[3:],
+      node_dq_input.args[0],
+      node_q_weight.args[0],
+      node_conv.args[2],
+      qparam_input,
+      qparam_weight,
+      qparam_out,
+    )
+
+  def _rewrite_qconv_per_channel(self, anchor: Node) -> bool:
+    node_map = self._match_qconv_per_channel(anchor)
+    if node_map is None:
+      return False
+
+    [needs_relu, conv_params, x_node, w_node, b_node,
+     (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
+    b = self.extract_tensor(b_node)
+    w = self.extract_tensor(w_node)
+    if w is None:
+      return False
+
+    # check if z_w is all zeros
+    if torch.any(z_w).item():
+      return False
+
+    k = s_x * s_w
+    kernel_q = qd.quantize_per_channel(w, s_w, z_w, 0, -127, 127, torch.int8)
+
+    if b is not None:
+      bias_q = torch.round(b / k).int()
+
+    kernel_attr = w_node.target
+    setattr(self.gm, kernel_attr, torch.nn.Parameter(kernel_q, False))
+
+    if b is not None:
+      bias_attr = b_node.target
+      setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
+
+    # we need to requantize as the last step (just like before),
+    # but now that k / s_out is a tensor (since it's per channel)
+    #
+    # the result is a float, but since we disallow float lowering,
+    # we use #view to bitcast it into a int32 (which is fine)
+    scl_attr = self.create_new_param()
+    scale_q = (k / s_out).float().view(torch.int32)
+    setattr(self.gm, scl_attr, torch.nn.Parameter(scale_q, False))
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (x_node,))
+      n2 = graph.call_function(aten.sub, (n1, z_x))
+      n3 = graph.get_attr(kernel_attr)
+      n4 = graph.call_method("int", (n3,))
+      n5 = None if b is None else graph.get_attr(bias_attr)
+      n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
+      if needs_relu:
+        n6 = graph.call_function(aten.relu, (n6,))
+      n7 = graph.get_attr(scl_attr)
+      n8 = graph.call_function(shir.requantize_channel, (n6, n7, z_out))
+
+    anchor.replace_all_uses_with(n8)
     return True
 
   """
