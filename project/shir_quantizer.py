@@ -39,46 +39,79 @@ from torch.ao.quantization._pt2e.quantizer.quantizer import (
 from torch.ao.quantization.observer import (
   HistogramObserver,
   MinMaxObserver,
+  PerChannelMinMaxObserver,
   PlaceholderObserver,
 )
 
-def get_symmetric_quantization_config():
-  # the dtype for activation (input/output) must be signed integer and the
-  # range must occupy all the available bits. this is because SHIR's
-  # algo.ClipBankersRound works this way.
-  act_quantization_spec = QuantizationSpec(
-    dtype=torch.int8,
-    quant_min=-128,
-    quant_max=127,
-    qscheme=torch.per_tensor_affine,
-    is_dynamic=False,
-    observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=2**-12),
-  )
+"""
+Quantization specs that are used by SHIR.
+"""
 
-  # this one has to have a symmetric qscheme (enforced by PyTorch)
-  weight_quantization_spec = QuantizationSpec(
-    dtype=torch.int8,
-    quant_min=-127,
-    quant_max=127,
-    qscheme=torch.per_tensor_symmetric,
-    is_dynamic=False,
-    observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
-  )
+# the quantization spec for activations must be signed and the min and max
+# must use up all possible values (as in [-2**(b-1), 2**(b-1)-1]) because this
+# is how rounding and clipping works in SHIR.
+#
+# use per tensor here because per channel makes things complicated.
+_act_qspec = QuantizationSpec(
+  dtype=torch.int8,
+  quant_min=-128,
+  quant_max=127,
+  qscheme=torch.per_tensor_affine,
+  is_dynamic=False,
+  observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=2**-12),
+)
 
-  # assume we don't quantize the bias (we haven't been doing so anyway)
-  # (PyTorch also does not support anything else at the moment.)
-  bias_quantization_spec = QuantizationSpec(
-    dtype=torch.float,
-    observer_or_fake_quant_ctr=PlaceholderObserver,
-  )
-  quantization_config = QuantizationConfig(
-    act_quantization_spec,
-    act_quantization_spec,
-    weight_quantization_spec,
-    bias_quantization_spec,
-    False,
-  )
-  return quantization_config
+# for weights, we want to use symmetric scheme to avoid doing too much weight
+# adjustment (due to the zero point) at runtime. besides, PyTorch only allows
+# symmetric for weights anyways.
+_weight_qspec_per_tensor = QuantizationSpec(
+  dtype=torch.int8,
+  quant_min=-127,
+  quant_max=127,
+  qscheme=torch.per_tensor_symmetric,
+  is_dynamic=False,
+  observer_or_fake_quant_ctr=MinMaxObserver.with_args(eps=2**-12),
+)
+
+# sometimes it makes sense to use per channel quantization for weights
+_weight_qspec_per_channel = QuantizationSpec(
+  dtype=torch.int8,
+  quant_min=-127,
+  quant_max=127,
+  qscheme=torch.per_channel_symmetric,
+  ch_axis=0,
+  is_dynamic=False,
+  observer_or_fake_quant_ctr=PerChannelMinMaxObserver.with_args(eps=2**-12),
+)
+
+# bias is not quantized because we can derive the qparams from the weights and
+# input but also because PyTorch does not allow it.
+_bias_qspec = QuantizationSpec(
+  dtype=torch.float,
+  observer_or_fake_quant_ctr=PlaceholderObserver,
+)
+
+"""
+Quantization configs (since it's easier to pass these around than qspecs)
+"""
+
+_qconfig_per_tensor = QuantizationConfig(
+  _act_qspec,
+  _act_qspec,
+  _weight_qspec_per_tensor,
+  _bias_qspec,
+)
+
+_qconfig_per_channel = QuantizationConfig(
+  _act_qspec,
+  _act_qspec,
+  _weight_qspec_per_channel,
+  _bias_qspec,
+)
+
+"""
+Utility functions
+"""
 
 def _mark_nodes_as_annotated(nodes: List[torch.fx.Node]):
   for node in nodes:
@@ -115,29 +148,33 @@ def _extract_linear_fields(gm: torch.fx.GraphModule, p: SourcePartition):
 
   return (input_use_node, input_node, weight_node, bias_node, output_node)
 
+"""
+The actual magic behind deciding where each qspec goes
+"""
+
 class BackendQuantizer(Quantizer):
 
-  def __init__(self):
+  def __init__(self, allow_per_channel=True):
     super().__init__()
-    self.global_config: QuantizationConfig = None
-    self.operator_type_config: Dict[str, Optional[QuantizationConfig]] = {}
-
-  def set_global(self, quantization_config: QuantizationConfig):
-    self.global_config = quantization_config
-    return self
+    self.allow_per_channel = allow_per_channel
 
   # where the magic happens
   def annotate(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     self._fuse_bn_weights(gm)
 
-    qconfig = self.global_config
+    # allow per channel for convolution
+    qconfig = _qconfig_per_channel if self.allow_per_channel else _qconfig_per_tensor
     self._annotate_conv_relu(gm, qconfig)
     self._annotate_conv(gm, qconfig)
+
+    # otherwise it's just per tensor
+    qconfig = _qconfig_per_tensor
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
 
-    self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm, qconfig)
-    self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm, qconfig)
+    # these ones use the annotations we added just before
+    self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm)
+    self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm)
 
   # validate the annotated graph is supported by the backend
   def validate(self, gm: torch.fx.GraphModule) -> None:
@@ -150,16 +187,16 @@ class BackendQuantizer(Quantizer):
   # it looks like this is more like documentation than actually being useful
   @classmethod
   def get_supported_operators(cls) -> List[OperatorConfig]:
-    qconfig = get_symmetric_quantization_config()
+    # bare minimum, per-tensor variants are supported
     return [
-      OperatorConfig(qconfig, [[torch.nn.Linear, torch.nn.ReLU]]),
-      OperatorConfig(qconfig, [[torch.nn.Linear]]),
+      OperatorConfig(_qconfig_per_tensor, [[torch.nn.Linear, torch.nn.ReLU]]),
+      OperatorConfig(_qconfig_per_tensor, [[torch.nn.Linear]]),
 
       # for simplicity, we only claim to support Conv2d.
       # we actually support every non-transpoing convolution,
       # it also isn't too difficult to extend the current stuff
-      OperatorConfig(qconfig, [[torch.nn.Conv2d, torch.nn.ReLU]]),
-      OperatorConfig(qconfig, [[torch.nn.Conv2d]]),
+      OperatorConfig(_qconfig_per_tensor, [[torch.nn.Conv2d, torch.nn.ReLU]]),
+      OperatorConfig(_qconfig_per_tensor, [[torch.nn.Conv2d]]),
     ]
 
   def _fuse_bn_weights(self, gm: torch.fx.GraphModule):
@@ -340,7 +377,7 @@ class BackendQuantizer(Quantizer):
       _annotate_output_qspec(conv_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
-  def _annotate_in_out_shared_qspec(self, op: Callable, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+  def _annotate_in_out_shared_qspec(self, op: Callable, gm: torch.fx.GraphModule):
     all_partitions = get_source_partitions(gm.graph, [op])
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:

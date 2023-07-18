@@ -72,8 +72,6 @@ model, guards = torchdynamo.export(
 )
 
 quantizer = shir_quantizer.BackendQuantizer()
-operator_config = shir_quantizer.get_symmetric_quantization_config()
-quantizer.set_global(operator_config)
 
 model = prepare_pt2e_quantizer(model, quantizer)
 model(*example_inputs)  # calibration
