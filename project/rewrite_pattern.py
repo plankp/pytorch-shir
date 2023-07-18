@@ -118,7 +118,7 @@ class QuantOpRewrite:
   def fetch_quant_per_channel(self, n: Node, chan, min, max, ty) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     if n.op != "call_function":
       return None
-    if n.target != qd.quantize_per_channel:
+    if n.target not in {qd.quantize_per_channel, qd.quantize_per_channel.default}:
       return None
 
     if n.args[3] == chan and n.args[4] == min and n.args[5] == max and n.args[6] == ty:
@@ -128,7 +128,7 @@ class QuantOpRewrite:
   def fetch_dequant_per_channel(self, n: Node, chan, min, max, ty) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     if n.op != "call_function":
       return None
-    if n.target != qd.dequantize_per_channel:
+    if n.target not in {qd.dequantize_per_channel, qd.dequantize_per_channel.default}:
       return None
 
     if n.args[3] == chan and n.args[4] == min and n.args[5] == max and n.args[6] == ty:
