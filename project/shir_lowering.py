@@ -220,6 +220,65 @@ class LowerRequantize:
 
     return acc(a.name)
 
+@register_operator(shir.requantize_channel.default)
+class LowerRequantizeChannel:
+  @staticmethod
+  def supports(a, s, z) -> bool:
+    if shir_type.get_element_type(a) != shir_type.SI(32):
+      return False
+
+    return True
+
+  @staticmethod
+  def lower(a, s, z) -> str:
+    # by requantize-channel's restrictions, a must have dimensions N and C.
+    # in essense, we want to do this:
+    #
+    #   a |> Map (\c ->
+    #     Zip (c, s) |> Map (\(d, s) ->
+    #       d |> MapND (\d -> Requantization d s z)))
+    #
+    # Of course, we generally need to JoinAll c before zipping and later
+    # SplitAll the result.
+
+    ashape = a.meta.get("val").shape
+
+    # we will be emitting the outer map last (as usual), so here we start with
+    # the C dimension, for which we zip it with the scales.
+    #
+    # just like in the shir.requantize case, we need to account for the bits
+    # when adjusting by the zero point.
+    sbits = max(1, z.bit_length()) + 1
+    width = max(sbits, 32) if sbits != 32 else 33
+    clip_bits = width - 8
+
+    if len(ashape) == 2:
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0),"
+                       f" algo.ClipBankersRound(algo.Add2(algo.QRescale(core.ParamUse(_0)),"
+                       f" algo.ConstantInteger({z}, Some(algo.SignedIntType({sbits})))),"
+                       f" 0, {clip_bits})) }}, algo.Zip(algo.Tuple({t}, {s.name})))")
+    else:
+      ty = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
+                  reversed(ashape[2:]), "algo.SignedIntType(32)")
+      kernel = (f"algo.Map({{ val _1 = core.ParamDef(); algo.AlgoLambda(Seq(_1),"
+                f" algo.ClipBankersRound(algo.Add2(algo.QRescale(algo.Tuple(core.ParamUse(_1),"
+                f" algo.Select(core.ParamUse(_0), 1))), algo.ConstantInteger({z},"
+                f" Some(algo.SignedIntType({sbits})))), 0, {clip_bits})) }},"
+                f" algo.Select(core.ParamUse(_0), 0))")
+      for i in reversed(ashape[3:]):
+        kernel = f"algo.Split({kernel}, {i})"
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(); algo.AlgoLambda(Seq(_0), {kernel}) }},"
+                       f" algo.Zip(algo.Tuple(algo.Map({{ val _0 = core.ParamDef({ty});"
+                       f" algo.AlgoLambda(Seq(_0), algo.JoinAll(core.ParamUse(_0))) }},"
+                       f" {t}), {s.name})))")
+
+    # regardless of a's shape, there is at least the first two dimensions.
+    # N is the number of instances, C is the number of channels / the one we
+    # are requantizing over.
+    w = acc("core.ParamUse(_0)")
+    return (f"algo.Map({{ val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0), {w}) }}, {a.name})")
+
 @register_operator(aten.view.default)
 class LowerView:
   def supports(a, shape) -> bool:

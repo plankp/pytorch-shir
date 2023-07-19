@@ -154,7 +154,7 @@ The actual magic behind deciding where each qspec goes
 
 class BackendQuantizer(Quantizer):
 
-  def __init__(self, allow_per_channel=True):
+  def __init__(self, allow_per_channel=False):
     super().__init__()
     self.allow_per_channel = allow_per_channel
 
