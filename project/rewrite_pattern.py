@@ -18,6 +18,54 @@ aten = torch.ops.aten
 shir = torch.ops.shir_intrinsic
 qd = torch.ops.quantized_decomposed
 
+def _qscale_to_qi32(x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+  assert x.ndim == 1 and x.dtype == torch.float and x.size(0) != 0
+  assert torch.all(x > 0), "Invalid qscale <= 0"
+
+  # assuming the inputs are qscales, then it should be normal (non-zero),
+  # positive, and not be crazily scaled.
+  fbits = x.view(torch.int32)
+  frac = (1 << 23) | (fbits & ((1 << 23) - 1))
+  shamt = 127 + 23 - ((fbits >> 23) & 0xff)   # 23 comes from the mantissa
+  assert torch.all((shamt >= 0) & (shamt < 64)), "Invalid shift amount outside [0, 64)"
+
+  # if all of them are already on the same scale, then we're done
+  if torch.all(shamt == shamt[0]):
+    return frac, shamt[0].item()
+
+  # start off by dropping off as many trailing zeros as we can
+  # without making the shift amount invalid
+  n = x.size(0)
+  max_shamt = 0
+  for i in range(n):
+    f = frac[i].item()
+    s = shamt[i].item()
+    while s > 0 and (f & 1) == 0:
+      f >>= 1
+      s -= 1
+    frac[i] = f
+    shamt[i] = s
+    max_shamt = max(max_shamt, s)
+
+  # now try to do the reverse by dropping off just enough leading zeros so
+  # that all values have the same scale.
+  for i in range(n):
+    rshamt = max_shamt - shamt[i].item()
+    if rshamt <= 0:
+      # note: rshamt is never negative
+      continue
+
+    # make sure frac does have that many leading zeros.
+    # XXX: Python ints are bigints, so masking is needed
+    f = frac[i].item()
+    scaled = (f << rshamt) & ((1 << 32) - 1)
+    if scaled & (1 << 31) or (scaled >> rshamt) != f:
+      # maybe it's viable, but we crash for now
+      assert False, "Cannot do so without losing precision"
+    frac[i] = scaled
+
+  return frac, max_shamt
+
 class QuantOpRewrite:
   def __init__(self, gm: GraphModule):
     self.counter = -1
@@ -436,12 +484,9 @@ class QuantOpRewrite:
 
     # we need to requantize as the last step (just like before),
     # but now that k / s_out is a tensor (since it's per channel)
-    #
-    # the result is a float, but since we disallow float lowering,
-    # we use #view to bitcast it into a int32 (which is fine)
     scl_attr = self.create_new_param()
-    scale_q = (k / s_out).float().view(torch.int32)
-    setattr(self.gm, scl_attr, torch.nn.Parameter(scale_q, False))
+    scale_qf, scale_qs = _qscale_to_qi32((k / s_out).float())
+    setattr(self.gm, scl_attr, torch.nn.Parameter(scale_qf, False))
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
@@ -454,7 +499,7 @@ class QuantOpRewrite:
       if needs_relu:
         n6 = graph.call_function(aten.relu, (n6,))
       n7 = graph.get_attr(scl_attr)
-      n8 = graph.call_function(shir.requantize_channel, (n6, n7, z_out))
+      n8 = graph.call_function(shir.requantize_channel_fixpoint, (n6, n7, scale_qs, z_out))
 
     anchor.replace_all_uses_with(n8)
     return True
