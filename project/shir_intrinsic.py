@@ -29,80 +29,28 @@ def requantize_meta(self, s, z):
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
-  "requantize_channel(Tensor self, Tensor scale, int z) -> Tensor"
+  "requantize_channel(Tensor self, float[] scale, int z) -> Tensor"
 )
 
 @impl(shir_intrinsic_lib, "requantize_channel", "CompositeExplicitAutograd")
 def requantize_channel(self, s, z):
-  # self : i32[N, C, ...]
-  # s : i32[C]    <-- bitcasted from float32
-  # we are requantizing over the C dimension
-  c = s.size(0)
+  c = self.size(1)
   return qd.quantize_per_channel(
-    self.float(), 1 / s.view(torch.float32), torch.tensor(z).expand(c),
+    self.float(), 1 / torch.Tensor(s), torch.tensor(z).expand(c),
     1, -128, 127, torch.int8
   )
 
 @impl(shir_intrinsic_lib, "requantize_channel", "Meta")
 def requantize_channel_meta(self, s, z):
   assert self.dtype == torch.int32
-  assert s.dtype == torch.int32
   assert isinstance(z, int)
-  assert s.ndim == 1 and self.ndim > 1 and s.size(0) == self.size(1)
+  assert self.ndim > 1 and self.size(1) == len(s)
 
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
   "int_addmm(Tensor self, Tensor lhs, Tensor rhs) -> Tensor"
 )
-
-shir_intrinsic_lib.define(
-  "requantize_channel_fixpoint(Tensor self, Tensor scale, int fracbits, int z) -> Tensor"
-)
-
-@impl(shir_intrinsic_lib, "requantize_channel_fixpoint", "CompositeExplicitAutograd")
-def requantize_channel_fixpoint(self, s, sra, z):
-  # we are reqantizing over the C dimension
-  n = self.size(0)
-  c = self.size(1)
-
-  res = torch.empty_like(self, dtype=torch.int8)
-  for i in range(n):
-    for j in range(c):
-      # after multiplying by scale, we want to shift out sra bits, all the
-      # while performing bankerssrounding on it. after that, we add the zero
-      # point, clamp and cast to i8.
-      prod = self[i, j].to(torch.int64) * s[j].to(torch.int64)
-
-      # clearly if there are no fractional bits (which is unlikely, but say
-      # it happened), then none of this banker rounding should happen
-      if sra != 0:
-        # check if it is odd
-        rv = (prod & (1 << sra)).to(torch.bool)
-        # or if it's even and fractional part is non-zero
-        rv |= ((prod << 1) & ((1 << sra) - 1)).to(torch.bool)
-        # then check if fractional part >= 0.5
-        # (combined with earlier condition, even numbers must be > 0.5)
-        rv &= (prod & (1 << (sra - 1))).to(torch.bool)
-
-        # perform the rounded division on the 64-bit product
-        prod = (prod >> sra) + rv
-
-      # assume the values and not too large
-      # / adding the zero point does not overflow
-      #
-      # and then clamp it to int8 range.
-      res[i, j] = torch.clamp(prod + z, -128, 127)
-  return res
-
-@impl(shir_intrinsic_lib, "requantize_channel_fixpoint", "Meta")
-def requantize_channel_fixpoint_meta(self, s, sra, z):
-  assert self.dtype == torch.int32
-  assert self.dtype == torch.int32
-  assert isinstance(sra, int) and 0 <= sra < 64
-  assert isinstance(z, int)
-
-  return torch.empty_like(self, dtype=torch.int8)
 
 @impl(shir_intrinsic_lib, "int_addmm", "CompositeExplicitAutograd")
 def int_addmm(self, lhs, rhs):

@@ -3,20 +3,13 @@ import shir_backend
 import shir_intrinsic
 
 @torch.compile(backend=shir_backend.compiler)
-def fn(data, kern, bias):
-  return torch.ops.aten.convolution(
+def fn(data, f):
+  return torch.ops.shir_intrinsic.requantize_channel(
       data,
-      kern,
-      bias,
-      [1, 1],
-      [1, 1],
-      [1, 1],
-      False,
-      [0, 0],
-      1
+      f,
+      -10
   )
 
-data = (torch.randn(1, 1, 10, 10) * 100).to(torch.int8)
-kern = (torch.randn(2, 1, 3, 3) * 100).to(torch.int8)
-bias = (torch.ones(2)).to(torch.int8)
-print(fn(data, kern, bias).shape)
+data = (torch.randn(5, 3, 10, 10) * 100).to(torch.int32)
+kern = [0.12663674354553223, 0.11184310913085938, 0.007626994047313929]
+print(fn(data, kern).shape)
