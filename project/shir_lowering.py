@@ -127,6 +127,12 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
 
   return acc(x)
 
+def to_signed(v: int, bits: int):
+  v &= (1 << bits) - 1
+  if v & (1 << (bits - 1)):
+    return -((1 << bits) - v)
+  return v
+
 def qscale_to_fixpoint(x: list[float]) -> (torch.Tensor, int, int):
   # one restriction we impose is for the number of fractional bits
   # (in other words, the rounding shift amount) to be non-negative.
@@ -250,7 +256,7 @@ class LowerRequantizeChannel:
     # XXX: keep this up-to-date with shir.requantize.default
     try:
       _, w, s = qscale_to_fixpoint(s)
-      if w > 31:
+      if w > 32:
         return False
       if s >= 32 + w + 1:
         print("shir_lowering: shir.requantize_channel.default was trying to shift out all bits")
@@ -301,8 +307,10 @@ class LowerRequantizeChannel:
       # clip it to 8 bits
       return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
 
-    sseq = ", ".join((str(x) for x in q))
-    sseq = f"algo.ConstantSeq(Seq({sseq}), Some(algo.SignedIntType({w + 1})))"
+    sseq = ", ".join((str(to_signed(x, 32)) for x in q))
+    sseq = (f"algo.Map({{ val _0 = core.ParamDef(algo.IntType({w}));"
+            f" algo.AlgoLambda(Seq(_0), algo.Signed(core.ParamUse(_0))) }},"
+            f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))")
     if len(ashape) == 2:
       w1 = emit_rescale_op("core.ParamUse(_0)")
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(algo.TupleType("
@@ -318,11 +326,14 @@ class LowerRequantizeChannel:
                 f" algo.Select(core.ParamUse(_0), 0))")
       for i in reversed(ashape[3:]):
         kernel = f"algo.Split({kernel}, {i})"
+      joinseq = "core.ParamUse(_0)"
+      if len(ashape) > 3:
+        joinseq = "algo.JoinAll(core.ParamUse(_0))"
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(algo.TupleTypeVar("
                        f"algo.AlgoDataTypeVar(), algo.SignedIntType({w + 1})));"
                        f" algo.AlgoLambda(Seq(_0), {kernel}) }},"
                        f" algo.Zip(algo.Tuple(algo.Map({{ val _0 = core.ParamDef({ty});"
-                       f" algo.AlgoLambda(Seq(_0), algo.JoinAll(core.ParamUse(_0))) }},"
+                       f" algo.AlgoLambda(Seq(_0), {joinseq}) }},"
                        f" {t}), {sseq})))")
 
     # regardless of a's shape, there is at least the first two dimensions.
