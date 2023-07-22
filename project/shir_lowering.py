@@ -182,9 +182,11 @@ class LowerRequantize:
     try:
       _, w, s = qscale_to_fixpoint([s])
       if w > 31:
-        # SHIR has some implicit assumptions about things being ints.
-        # also because the width is now unsigned, but we need to treat it
-        # as a positive signed value.
+        # if the scale is truely a float (which we always interpret it as
+        # such), then it is actually impossible for this case to happen.
+        #
+        # per-channel needs to handle it since it may arise when adjusting
+        # the shift amounts of different qscales.
         return False
       if s >= 32 + w + 1:
         # all bits of the product are fractional
@@ -1153,7 +1155,7 @@ class LowerAdaptiveAvgPoolND:
           else:
             flatseq = "algo.JoinAll(core.ParamUse(_0))"
 
-          f, w, s = qscale_to_fixpoint(1.0 / elts)
+          f, w, s = qscale_to_fixpoint([1.0 / elts])
           # multiply and round gives w + 1 + 32 - s bits
           # but then we are saturating it to 32 bits,
           # so it's that expression - 32, giving the following.
@@ -1162,7 +1164,7 @@ class LowerAdaptiveAvgPoolND:
                f" algo.AlgoLambda(Seq(_0),"
                f" algo.Sub(algo.Tuple(algo.TruncInteger(algo.Add2(algo.ConstantInteger(0,"
                f" Some(algo.SignedIntType(32))),"
-               f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f},"
+               f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f[0]},"
                f" Some(algo.SignedIntType(w + 1))),"
                f" _iredsum(algo.SignedIntType(32),"
                f" {flatseq}))), {s}, {clip_bits})), 32),"
