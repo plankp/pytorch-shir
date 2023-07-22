@@ -307,30 +307,35 @@ class LowerRequantizeChannel:
       # clip it to 8 bits
       return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
 
-    sseq = ", ".join((str(to_signed(x, 32)) for x in q))
+    # ConstantSeq is reversed in SHIR!
+    sseq = ", ".join((str(to_signed(x, 32)) for x in reversed(q)))
+    # also, since we're already using algo.Signed here, might as well insert a
+    # Repeat here to avoid issues down the road!
+    inner = "algo.Signed(core.ParamUse(_0))"
+    if len(ashape) > 2:
+      width = reduce(lambda x, y: x * y, ashape[2:])
+      inner = f"algo.Repeat({inner}, {width})"
     sseq = (f"algo.Map({{ val _0 = core.ParamDef(algo.IntType({w}));"
-            f" algo.AlgoLambda(Seq(_0), algo.Signed(core.ParamUse(_0))) }},"
+            f" algo.AlgoLambda(Seq(_0), {inner}) }},"
             f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))")
     if len(ashape) == 2:
       w1 = emit_rescale_op("core.ParamUse(_0)")
-      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(algo.TupleType("
-                       f"algo.SignedIntType(32), algo.SignedIntType({w + 1})));"
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
                        f" algo.AlgoLambda(Seq(_0), {w1}) }},"
                        f" algo.Zip(algo.Tuple({t}, {sseq})))")
     else:
       ty = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
                   reversed(ashape[2:]), "algo.SignedIntType(32)")
-      w1 = emit_rescale_op("algo.Tuple(core.ParamUse(_1), algo.Select(core.ParamUse(_0), 1))")
-      kernel = (f"algo.Map({{ val _1 = core.ParamDef(algo.SignedIntType(32));"
-                f" algo.AlgoLambda(Seq(_1), {w1}) }},"
-                f" algo.Select(core.ParamUse(_0), 0))")
+      w1 = emit_rescale_op("core.ParamUse(_0)")
+      kernel = (f"algo.Map({{ val _0 = core.ParamDef();"
+                f" algo.AlgoLambda(Seq(_0), {w1}) }},"
+                f" algo.Zip(core.ParamUse(_0)))")
       for i in reversed(ashape[3:]):
         kernel = f"algo.Split({kernel}, {i})"
       joinseq = "core.ParamUse(_0)"
       if len(ashape) > 3:
         joinseq = "algo.JoinAll(core.ParamUse(_0))"
-      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef(algo.TupleTypeVar("
-                       f"algo.AlgoDataTypeVar(), algo.SignedIntType({w + 1})));"
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
                        f" algo.AlgoLambda(Seq(_0), {kernel}) }},"
                        f" algo.Zip(algo.Tuple(algo.Map({{ val _0 = core.ParamDef({ty});"
                        f" algo.AlgoLambda(Seq(_0), {joinseq}) }},"
