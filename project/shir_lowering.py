@@ -133,7 +133,7 @@ def to_signed(v: int, bits: int):
     return -((1 << bits) - v)
   return v
 
-def qscale_to_fixpoint(x: list[float]) -> (torch.Tensor, int, int):
+def qscale_to_fixpoint(x: list[float]) -> (list[int], int, int):
   # one restriction we impose is for the number of fractional bits
   # (in other words, the rounding shift amount) to be non-negative.
 
@@ -1153,20 +1153,20 @@ class LowerAdaptiveAvgPoolND:
           else:
             flatseq = "algo.JoinAll(core.ParamUse(_0))"
 
-          f, q = qscale_to_fixpoint(1.0 / elts)
-          assert q <= 0
-          round_bits = -1
-          clip_bits = max(f.bit_length() + 1 + q, 0)
-
+          f, w, s = qscale_to_fixpoint(1.0 / elts)
+          # multiply and round gives w + 1 + 32 - s bits
+          # but then we are saturating it to 32 bits,
+          # so it's that expression - 32, giving the following.
+          clip_bits = max(w + 1 - s, 0)
           s = (f"algo.Map({{ val _0 = core.ParamDef({ty});"
-              f" algo.AlgoLambda(Seq(_0),"
-              f" algo.Sub(algo.Tuple(algo.TruncInteger(algo.Add2(algo.ConstantInteger(0,"
-              f" Some(algo.SignedIntType(32))),"
-              f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f},"
-              f" Some(algo.SignedIntType({f.bit_length() + 1}))),"
-              f" _iredsum(algo.SignedIntType(32),"
-              f" {flatseq}))), {round_bits}, {clip_bits})), 32),"
-              f" algo.ConstantInteger(0)))) }}, {s})")
+               f" algo.AlgoLambda(Seq(_0),"
+               f" algo.Sub(algo.Tuple(algo.TruncInteger(algo.Add2(algo.ConstantInteger(0,"
+               f" Some(algo.SignedIntType(32))),"
+               f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f},"
+               f" Some(algo.SignedIntType(w + 1))),"
+               f" _iredsum(algo.SignedIntType(32),"
+               f" {flatseq}))), {s}, {clip_bits})), 32),"
+               f" algo.ConstantInteger(0)))) }}, {s})")
         yield s
     return reduce(lambda x, y: f"algo.Concat({x}, {y})", gen_subparts())
 
