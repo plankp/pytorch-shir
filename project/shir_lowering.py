@@ -5,6 +5,10 @@ import shir_intrinsic
 from functools import reduce
 from itertools import chain
 
+# Some configuration flags used to affect the lowering.
+# TODO: see if we can pass this from torch.compile
+FLAG_REQUANT_PREFER_FIXPOINT_SCALE = True
+
 _ops = {}
 
 """
@@ -133,16 +137,27 @@ def to_signed(v: int, bits: int):
     return -((1 << bits) - v)
   return v
 
+def to_float_bits(x: float) -> int:
+  return struct.unpack(">l", struct.pack(">f", x))[0]
+
+def is_valid_qscale(x: float) -> bool:
+  import math
+  return x > 0 and math.isfinite(x)
+
+def unpack_qscale(x: float) -> (int, int):
+  bits = to_float_bits(x)
+  frac = (1 << 23) | (bits & ((1 << 23) - 1))
+  shamt = 127 + 23 - (bits >> 23)   # 23 comes from a (normal) mantissa
+  return frac, shamt
+
 def qscale_to_fixpoint(x: list[float]) -> (list[int], int, int):
   # one restriction we impose is for the number of fractional bits
   # (in other words, the rounding shift amount) to be non-negative.
 
   def gen_shortest_qvalue(x):
     for f in x:
-      assert f > 0, "Invalid qscale <= 0"
-      bits = struct.unpack(">l", struct.pack(">f", f))[0]
-      frac = (1 << 23) | (bits & ((1 << 23) - 1))
-      shamt = 127 + 23 - ((bits >> 23) & 0xff)   # 23 is from the mantissa
+      assert is_valid_qscale(f), "Invalid qscale"
+      frac, shamt = unpack_qscale(f)
       assert shamt >= 0, "Invalid shift amount"
 
       # normalize the representation by aggressively shifting right
@@ -178,61 +193,55 @@ class LowerRequantize:
     if shir_type.get_element_type(a) != shir_type.SI(32):
       return False
 
-    # XXX: keep this up-to-date with shir.requantize_channel.default
-    try:
-      _, w, s = qscale_to_fixpoint([s])
-      if w > 31:
-        # if the scale is truely a float (which we always interpret it as
-        # such), then it is actually impossible for this case to happen.
-        #
-        # per-channel needs to handle it since it may arise when adjusting
-        # the shift amounts of different qscales.
-        return False
-      if s >= 32 + w + 1:
-        # all bits of the product are fractional
-        #
-        # clip-bankers-round does not support this.
-        # you'd be left with no bits!
-        #
-        # assume some strange thing is happening and don't handle it for now.
-        # (it probably shouldn't happen in the first place)
-        print("shir_lowering: shir.requantize.default was trying to shift out all bits")
-        return False
-    except AssertionError:
-      return False
-
-    return True
+    # we can always fallback to the float method,
+    # provided that the qscale is "valid"
+    return is_valid_qscale(s)
 
   @classmethod
   def lower(cls, a, s, z) -> str:
-    q, w, shamt = qscale_to_fixpoint([s])
-    q = q[0]
+    # note that unlike per channel requant, we disallow u32 fractional bits.
+    # this is because unlike the per channel case, there is ever only one
+    # scale, meaning that w should really be at most 24 (the full mantissa).
+    fixpoint_method = FLAG_REQUANT_PREFER_FIXPOINT_SCALE
+    if fixpoint_method:
+      try:
+        q, w, shamt = qscale_to_fixpoint([s])
+        q = q[0]
+        fixpoint_method = w < 32 and shamt < 32 + w + 1
+      except AssertionError:
+        fixpoint_method = False
 
-    def gen_kernel(t):
-      width = 32      # we're quantizing a 32-bit integer
+    if fixpoint_method:
+      def gen_kernel(t):
+        qbits = w + 1
+        width = 32 + qbits
+        acc = (
+          f"algo.Mul(algo.Tuple({t},"
+          f" algo.ConstantInteger({q}, Some(algo.SignedIntType({qbits})))))"
+        )
 
-      qbits = w + 1   # +1 to make sure it's interpreted as signed value
-      width += qbits  # multplication saves all bits
+        if shamt:
+          width -= shamt
+          acc = (f"algo.Sub(algo.Tuple(algo.TruncInteger("
+                 f"algo.ClipBankersRound({acc}, {shamt}, 0), {width}),"
+                 f" algo.ConstantInteger(0)))")
 
-      # XXX: without the extra Id node, algo to arch lowering seems to fail...
-      acc = (f"algo.Mul(algo.Tuple(algo.Id({t}),"
-             f" algo.ConstantInteger({q}, Some(algo.SignedIntType({qbits})))))")
+        if z != 0:
+          width = max(width, 32) if width != 32 else 33
+          acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
 
-      # as usual, ClipBankersRound (both algo and arch versions) need exact
-      # width information. we're already tracking it, so just insert
-      # TruncIntegers type checking for sanity.
-      if shamt:
-        width -= shamt  # due to rounding
-        acc = (f"algo.Sub(algo.Tuple(algo.TruncInteger("
-               f"algo.ClipBankersRound({acc}, {shamt}, 0), {width}),"
-               f" algo.ConstantInteger(0)))")
-      if z != 0:
-        # algo.Add will sneak in an extra bit if both are 32 bits (unlikely)
-        width = max(width, 32) if width != 32 else 33
-        acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
-
-      # and then at the end, we clip it so the result is s8
-      return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
+        return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
+    else:
+      def gen_kernel(t):
+        return (
+          f"algo.ClipBankersRound(algo.Add2("
+          f"algo.Sub(algo.Tuple(algo.TruncInteger("
+          f"algo.QScale(algo.Tuple({t},"
+          f" algo.ConstantInteger({to_signed(to_float_bits(s), 32)},"
+          f" Some(algo.IntType(32))))), 57), algo.ConstantInteger(0))),"
+          f" algo.ConstantInteger({z}, Some(algo.SignedIntType(32)))),"
+          f" 0, 49)"
+        )
 
     ashape = a.meta.get("val").shape
     if not ashape:
@@ -255,18 +264,13 @@ class LowerRequantizeChannel:
     if shir_type.get_element_type(a) != shir_type.SI(32):
       return False
 
-    # XXX: keep this up-to-date with shir.requantize.default
-    try:
-      _, w, s = qscale_to_fixpoint(s)
-      if w > 32:
-        return False
-      if s >= 32 + w + 1:
-        print("shir_lowering: shir.requantize_channel.default was trying to shift out all bits")
-        return False
-    except AssertionError:
-      return False
-
-    return True
+    # in the end of the day,
+    # provided that the scales are normal,
+    # and they are always positive by nature,
+    #
+    # the float point method always works.
+    # but the fixpoint method may be better for performance.
+    return all((is_valid_qscale(x) for x in s))
 
   @staticmethod
   def lower(a, s, z) -> str:
@@ -279,58 +283,78 @@ class LowerRequantizeChannel:
     #
     # Of course, we generally need to JoinAll c before zipping and later
     # SplitAll the result.
-
     ashape = a.meta.get("val").shape
-    q, w, shamt = qscale_to_fixpoint(s)
 
-    # we will be emitting the outer map last (as usual), so here we start with
-    # the C dimension, for which we zip it with the scales.
+    # decide if we can actually use the fixpoint method:
+    # aside from assertions, we add the following restrictions:
+    # *  converted values cannot exceed 32 bits (due to SHIR's evalInt)
+    # *  the saturating shift cannot shift everything out
+    fixpoint_method = FLAG_REQUANT_PREFER_FIXPOINT_SCALE
+    if fixpoint_method:
+      try:
+        q, w, shamt = qscale_to_fixpoint(s)
+        fixpoint_method = w <= 32 and shamt < 32 + w + 1
+      except AssertionError:
+        fixpoint_method = False
+
+    # both methods require emitting the scales (as some format) as a constant
+    # sequence.
     #
-    # just like in the shir.requantize case, we need to account for the bits
-    # when adjusting by the zero point.
+    # ConstantSeq is reversed!
+    if fixpoint_method:
+      # the loaded values are unsigned, but multiplication needs both to be
+      # signed, so we use algo.Signed to perform the conversion.
+      sseq = ", ".join((str(to_signed(x, 32)) for x in reversed(q)))
+      smap = "algo.Signed(core.ParamUse(_0))"
 
-    def emit_rescale_op(packed_i_s: str) -> str:
-      width = 32      # we're quantizing a 32-bit integer
-      qbits = w + 1   # +1 to make sure it's interpreted as signed value
-      width += qbits  # multiplication saves all bits
-      acc = f"algo.Mul({packed_i_s})"
+      qbits = w + 1
+      width = 32 + qbits
+      acc = f"algo.Mul(core.ParamUse(_0))"
 
       if shamt:
-        width -= shamt  # due to rounding
+        width -= shamt
         acc = (f"algo.Sub(algo.Tuple(algo.TruncInteger("
                f"algo.ClipBankersRound({acc}, {shamt}, 0), {width}),"
                f" algo.ConstantInteger(0)))")
-
       if z != 0:
         # adding the zero point
         width = max(width, 32) if width != 32 else 33
         acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
 
       # clip it to 8 bits
-      return f"algo.ClipBankersRound({acc}, 0, {width - 8})"
+      emit_rescale_op = f"algo.ClipBankersRound({acc}, 0, {width - 8})"
+    else:
+      w = 32
+      sseq = ", ".join((str(to_signed(to_float_bits(x), 32)) for x in reversed(s)))
+      smap = "core.ParamUse(_0)"
 
-    # ConstantSeq is reversed in SHIR!
-    sseq = ", ".join((str(to_signed(x, 32)) for x in reversed(q)))
-    # also, since we're already using algo.Signed here, might as well insert a
-    # Repeat here to avoid issues down the road!
-    inner = "algo.Signed(core.ParamUse(_0))"
+      emit_rescale_op = (
+        f"algo.ClipBankersRound(algo.Add2("
+        f"algo.Sub(algo.Tuple(algo.TruncInteger("
+        f"algo.QScale(core.ParamUse(_0)), 57),"
+        f" algo.ConstantInteger(0))),"
+        f" algo.ConstantInteger({z}, Some(algo.SignedIntType(32)))),"
+        f" 0, 49)"
+      )
+
+    # in addition to whatever processing is needed, we also repeat it as
+    # needed (avoids issues when zipping with the input later)
     if len(ashape) > 2:
       width = reduce(lambda x, y: x * y, ashape[2:])
-      inner = f"algo.Repeat({inner}, {width})"
-    sseq = (f"algo.Map({{ val _0 = core.ParamDef(algo.IntType({w}));"
-            f" algo.AlgoLambda(Seq(_0), {inner}) }},"
-            f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))")
+      smap = f"algo.Repeat({smap}, {width})"
+    sseq = (f"algo.Map({{ val _0 = core.ParamDef();"
+            f" algo.AlgoLambda(Seq(_0), {smap}) }},"
+            f" algo.ConstantSeq(Seq({sseq}), Some(IntType({w}))))")
+
     if len(ashape) == 2:
-      w1 = emit_rescale_op("core.ParamUse(_0)")
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
-                       f" algo.AlgoLambda(Seq(_0), {w1}) }},"
+                       f" algo.AlgoLambda(Seq(_0), {emit_rescale_op}) }},"
                        f" algo.Zip(algo.Tuple({t}, {sseq})))")
     else:
       ty = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
                   reversed(ashape[2:]), "algo.SignedIntType(32)")
-      w1 = emit_rescale_op("core.ParamUse(_0)")
       kernel = (f"algo.Map({{ val _0 = core.ParamDef();"
-                f" algo.AlgoLambda(Seq(_0), {w1}) }},"
+                f" algo.AlgoLambda(Seq(_0), {emit_rescale_op}) }},"
                 f" algo.Zip(core.ParamUse(_0)))")
       for i in reversed(ashape[3:]):
         kernel = f"algo.Split({kernel}, {i})"
@@ -339,7 +363,8 @@ class LowerRequantizeChannel:
         joinseq = "algo.JoinAll(core.ParamUse(_0))"
       acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
                        f" algo.AlgoLambda(Seq(_0), {kernel}) }},"
-                       f" algo.Zip(algo.Tuple(algo.Map({{ val _0 = core.ParamDef({ty});"
+                       f" algo.Zip(algo.Tuple(algo.Map({{"
+                       f" val _0 = core.ParamDef({ty});"
                        f" algo.AlgoLambda(Seq(_0), {joinseq}) }},"
                        f" {t}), {sseq})))")
 
