@@ -6,6 +6,7 @@
 import operator
 import itertools
 from typing import Dict, List, Optional, Callable
+import shir_intrinsic
 
 import torch
 from torch.nn.utils.fusion import fuse_linear_bn_weights
@@ -175,6 +176,7 @@ class BackendQuantizer(Quantizer):
     # these ones use the annotations we added just before
     self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm)
     self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm)
+    self._annotate_in_out_shared_qspec(torch.ops.shir_intrinsic.flatten, gm)
 
   # validate the annotated graph is supported by the backend
   def validate(self, gm: torch.fx.GraphModule) -> None:
