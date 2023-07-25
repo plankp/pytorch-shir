@@ -36,6 +36,8 @@ class QuantOpRewrite:
       return True
     if self._rewrite_flatten(n):
       return True
+    if self._rewrite_hardtanh(n):
+      return True
 
     return False
 
@@ -593,6 +595,57 @@ class QuantOpRewrite:
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.call_function(shir.flatten, (x, start, end))
+
+    anchor.replace_all_uses_with(n1)
+    return True
+
+  """
+  q(HARDTANH(dq(X), min, max))
+    = q(CLAMP(dq(X), min, max))
+    = CLAMP(X, q(min), q(max))
+
+  ReLU6 is a special case where the clamping range is 0 to 6
+  """
+
+  def _match_hardtanh(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_hardtanh = node_q_output.args[0]
+    if node_hardtanh.op != "call_function":
+      return None
+    if node_hardtanh.target not in {aten.hardtanh_.default, aten.hardtanh.default}:
+      return None
+
+    node_dq_input = node_hardtanh.args[0]
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    # make sure qinput and qoutput are shared
+    if qparam_out != qparam_input:
+      return None
+
+    return (
+      node_hardtanh.args[1],
+      node_hardtanh.args[2],
+      node_dq_input.args[0],
+      qparam_input
+    )
+
+  def _rewrite_hardtanh(self, anchor: Node) -> bool:
+    node_map = self._match_hardtanh(anchor)
+    if node_map is None:
+      return False
+
+    [fmin, fmax, x_node, (s_x, z_x)] = node_map
+    qmin = qd.quantize_per_tensor(torch.Tensor([fmin]), s_x, z_x, -128, 127, torch.int8).item()
+    qmax = qd.quantize_per_tensor(torch.Tensor([fmax]), s_x, z_x, -128, 127, torch.int8).item()
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_function(aten.clamp, (x_node, qmin, qmax))
 
     anchor.replace_all_uses_with(n1)
     return True

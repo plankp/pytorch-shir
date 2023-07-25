@@ -174,6 +174,9 @@ class BackendQuantizer(Quantizer):
     self._annotate_linear(gm, qconfig)
 
     # these ones use the annotations we added just before
+    # XXX: PyTorch's builtin targets mark ReLU6 and Hardtanh as qspec sharing
+    self._annotate_in_out_shared_qspec(torch.nn.ReLU6, gm)
+    self._annotate_in_out_shared_qspec(torch.nn.Hardtanh, gm)
     self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm)
     self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm)
     self._annotate_in_out_shared_qspec(torch.ops.shir_intrinsic.flatten, gm)

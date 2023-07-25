@@ -677,6 +677,43 @@ class LowerRelu:
     b = lift_to_elt_type(0, ty)
     return lower_pairwise_binop("algo.Max.asFunction()", *a, *b)
 
+@register_operator(aten.clamp.default)
+class LowerClamp:
+  @staticmethod
+  def supports(a, clmin=None, clmax=None) -> bool:
+    # since SHIR uses evalInt, disallow values that go beyond s32 range
+    # this is good enough for most purposes
+    s32 = shir_type.SI(32)
+    ty = shir_type.get_element_type(a)
+    tmin = max(s32.minval(), ty.minval())
+    tmax = min(s32.maxval(), ty.maxval())
+    return (
+      (clmin is None or tmin <= clmin <= tmax) and
+      (clmax is None or tmin <= clmax <= tmax)
+    )
+
+  @staticmethod
+  def lower(a, min=None, max=None) -> str:
+    tname = shir_type.get_element_type(a).name()
+    def emit_cmp_op(value):
+      if min is not None:
+        value = f"algo.Max2({value}, algo.ConstantInteger({min}, Some({tname})))"
+      if max is not None:
+        value = f"algo.Min2({value}, algo.ConstantInteger({max}, Some({tname})))"
+      return value
+
+    ashape = a.meta.get("val").shape
+    if not ashape:
+      return emit_cmp_op(a.name)
+
+    acc = emit_cmp_op
+    for _ in ashape:
+      w = acc("core.ParamUse(_0)")
+      acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef();"
+                       f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
+
+    return acc(a.name)
+
 @register_operator(prims.maximum.default)
 class LowerMaximum:
   def supports(lhs, rhs) -> bool:
