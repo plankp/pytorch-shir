@@ -34,6 +34,8 @@ class QuantOpRewrite:
       return True
     if self._rewrite_qavgpool(n):
       return True
+    if self._rewrite_flatten(n):
+      return True
 
     return False
 
@@ -551,6 +553,48 @@ class QuantOpRewrite:
       n3 = graph.call_method("to", (n2, torch.int8))
 
     anchor.replace_all_uses_with(n3)
+    return True
+
+  """
+  FLATTEN(sx (X - zx)) = sx FLATTEN(X - zx)
+  """
+
+  def _match_flatten(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_flatten = node_q_output.args[0]
+    if node_flatten.op != "call_function" or node_flatten.target != shir.flatten.default:
+      return None
+
+    node_dq_input = node_flatten.args[0]
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    # make sure qinput and qoutput are shared
+    if qparam_out != qparam_input:
+      return None
+
+    return (
+      node_flatten.args[1],
+      node_flatten.args[2],
+      node_dq_input.args[0],
+    )
+
+  def _rewrite_flatten(self, anchor: Node) -> bool:
+    node_map = self._match_flatten(anchor)
+    if node_map is None:
+      return False
+
+    [start, end, x] = node_map
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_function(shir.flatten, (x, start, end))
+
+    anchor.replace_all_uses_with(n1)
     return True
 
 def rewrite_quantized_ops(gm: GraphModule):

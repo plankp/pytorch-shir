@@ -375,6 +375,37 @@ class LowerRequantizeChannel:
     return (f"algo.Map({{ val _0 = core.ParamDef();"
             f" algo.AlgoLambda(Seq(_0), {w}) }}, {a.name})")
 
+@register_operator(shir.flatten.default)
+class LowerFlatten:
+  @staticmethod
+  def supports(a, start, end) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a, start, end) -> str:
+    # a flatten is not much different from view.
+    # so we rewrite it into an equivalent view.
+    ashape = a.meta.get("val").shape
+    if not ashape:
+      # flattening a scalar always results in a tensor
+      ashape = [1]
+
+    # start and end may be negative, in which case, it is reverse indexed.
+    if start < 0:
+      start = len(ashape) + start
+    if end < 0:
+      end = len(ashape) + end
+
+    # axes [start, end] are squished together.
+    new_shape = [
+      *ashape[:start],
+      reduce(lambda x, y: x * y, ashape[start:end + 1]),
+      *ashape[end + 1:]
+    ]
+
+    # then we just piggy-back on the lowering for aten.view.
+    return LowerView.lower(a, new_shape)
+
 @register_operator(aten.view.default)
 class LowerView:
   def supports(a, shape) -> bool:
