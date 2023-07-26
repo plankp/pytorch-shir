@@ -127,5 +127,6 @@ shir_intrinsic_lib.define(
 
 @impl(shir_intrinsic_lib, "int_mean", "CompositeExplicitAutograd")
 def int_mean(self, dim, keepDim):
+  # we sneak a round it to get an answer that is "closer" to SHIR
   assert self.dtype == torch.int32
-  return aten.mean.dim(self.float(), dim, keepDim).to(self.dtype)
+  return torch.round(aten.mean.dim(self.float(), dim, keepDim)).to(self.dtype)
