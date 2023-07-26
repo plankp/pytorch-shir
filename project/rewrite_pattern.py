@@ -34,9 +34,13 @@ class QuantOpRewrite:
       return True
     if self._rewrite_qavgpool(n):
       return True
+    if self._rewrite_qmean(n):
+      return True
     if self._rewrite_flatten(n):
       return True
     if self._rewrite_hardtanh(n):
+      return True
+    if self._rewrite_add(n):
       return True
 
     return False
@@ -515,6 +519,56 @@ class QuantOpRewrite:
     return True
 
   """
+  q(MEAN(dq(X)) = MEAN(X)
+  """
+
+  def _match_qmean(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_mean = node_q_output.args[0]
+    if node_mean.op != "call_function" or node_mean.target != aten.mean.dim:
+      return None
+
+    node_dq_input = node_mean.args[0]
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    # make sure qinput and qoutput are shared
+    if qparam_out != qparam_input:
+      return None
+
+    # make sure explicit dtype is not supported
+    mean_args = _get_all_arguments(
+      node_mean.args, node_mean.kwargs, node_mean.target._schema.arguments
+    )
+    if mean_args[-1]:
+      return None
+
+    return (
+      mean_args[1:-1],
+      node_dq_input.args[0],
+    )
+
+  def _rewrite_qmean(self, anchor: Node) -> bool:
+    node_map = self._match_qmean(anchor)
+    if node_map is None:
+      return False
+
+    [mean_args, x] = node_map
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (x,))
+      n2 = graph.call_function(shir.int_mean, (n1, *mean_args))
+      n3 = graph.call_method("to", (n2, torch.int8))
+
+    anchor.replace_all_uses_with(n3)
+    return True
+
+  """
   AVGPOOL2D(sx (X - zx)) = sx AVGPOOL2D(X - zx)
   """
 
@@ -648,6 +702,63 @@ class QuantOpRewrite:
       n1 = graph.call_function(aten.clamp, (x_node, qmin, qmax))
 
     anchor.replace_all_uses_with(n1)
+    return True
+
+  """
+  s (X - z) + s (Y - z)     <-- both inputs have the same qparams
+    = s (X + Y - 2z)
+  """
+
+  def _match_add(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_add = node_q_output.args[0]
+    if node_add.op != "call_function" or node_add.target != aten.add.Tensor:
+      return None
+
+    node_dq_lhs = node_add.args[0]
+    node_dq_rhs = node_add.args[1]
+
+    qparam_lhs = self.fetch_dequant_per_tensor(node_dq_lhs, -128, 127, torch.int8)
+    qparam_rhs = self.fetch_dequant_per_tensor(node_dq_rhs, -128, 127, torch.int8)
+
+    if not qparam_lhs:
+      return None
+    if qparam_lhs != qparam_rhs:
+      print("FOUND ADD NODE WITH MISMATCHED QSPEC")
+      print("  ", node_add.name, node_add.args[0], node_add.args[1])
+      print("  ", node_dq_lhs, qparam_lhs)
+      print("  ", node_dq_rhs, qparam_rhs)
+      exit()
+
+      return None
+
+    return (
+      node_dq_lhs.args[0],
+      node_dq_rhs.args[0],
+      qparam_lhs,
+      qparam_out,
+    )
+
+  def _rewrite_add(self, anchor: Node) -> bool:
+    node_map = self._match_add(anchor)
+    if node_map is None:
+      return False
+
+    [lhs_node, rhs_node, (s_x, z_x), (s_out, z_out)] = node_map
+    assert (-1<<31) <= 2 * z_x < (1<<31), "Qadd: adjusted zero point overflows s32 range"
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (lhs_node,))
+      n2 = graph.call_method("int", (rhs_node,))
+      n3 = graph.call_function(aten.add, (n1, n2))
+      n4 = graph.call_function(aten.sub, (n3, 2 * z_x))
+      n5 = graph.call_function(shir.requantize, (n4, s_x / s_out, z_out))
+
+    anchor.replace_all_uses_with(n5)
     return True
 
 def rewrite_quantized_ops(gm: GraphModule):

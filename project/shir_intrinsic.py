@@ -120,3 +120,12 @@ shir_intrinsic_lib.define(
 def int_adaptive_avg_pool2d(self, output_size):
   assert self.dtype == torch.int32
   return aten._adaptive_avg_pool2d(self.float(), output_size).to(self.dtype)
+
+shir_intrinsic_lib.define(
+  "int_mean(Tensor self, int[]? dim, bool keepDim) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "int_mean", "CompositeExplicitAutograd")
+def int_mean(self, dim, keepDim):
+  assert self.dtype == torch.int32
+  return aten.mean.dim(self.float(), dim, keepDim).to(self.dtype)

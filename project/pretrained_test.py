@@ -1,19 +1,7 @@
 # adopted from https://pytorch.org/vision/main/models.html
 
-"""
-from torchvision.models.quantization import resnet50, ResNet50_QuantizedWeights
-
-weights = ResNet50_QuantizedWeights.DEFAULT
-model = resnet50(weights=weights, quantize=True)
-model.eval()
-
-print(model)
-"""
-
 import copy
 import torch
-from torchvision.models import vgg11
-
 import torch._dynamo as torchdynamo
 from torch.ao.quantization._quantize_pt2e import (
   convert_pt2e,
@@ -22,10 +10,19 @@ from torch.ao.quantization._quantize_pt2e import (
 
 import shir_backend
 import shir_quantizer
+import shir_intrinsic
 
-model = vgg11(weights='DEFAULT')
+## uncomment out one of the following set of lines
+# from torchvision.models import vgg11
+# model = vgg11(weights='DEFAULT')
+# from torchvision.models import resnet50
+# model = resnet50(weights='DEFAULT')
+from torchvision.models import mobilenet_v2
+model = mobilenet_v2(weights='DEFAULT')
+
 model.eval()
-example_inputs = (torch.randn(10, 3, 32, 32),)
+
+example_inputs = (torch.randn(10, 3, 224, 224),)
 
 # program capture
 model, guards = torchdynamo.export(
@@ -36,8 +33,17 @@ model, guards = torchdynamo.export(
 quantizer = shir_quantizer.BackendQuantizer()
 
 model = prepare_pt2e_quantizer(model, quantizer)
-model = convert_pt2e(model)
-
-torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
 model(*example_inputs)
+print(model)
+
+from torch.fx.passes.graph_drawer import FxGraphDrawer
+g = FxGraphDrawer(model, "dummy")
+g.get_dot_graph().write_svg("prepare_dummy_graph.svg")
+
+# model = convert_pt2e(model)
+
+# # model.print_readable()
+
+# torchdynamo.reset()
+# model = torch.compile(backend=shir_backend.compiler)(model)
+# model(*example_inputs)

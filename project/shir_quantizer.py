@@ -172,6 +172,7 @@ class BackendQuantizer(Quantizer):
     qconfig = _qconfig_per_tensor
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
+    self._annotate_add(gm, qconfig)
 
     # these ones use the annotations we added just before
     # XXX: PyTorch's builtin targets mark ReLU6 and Hardtanh as qspec sharing
@@ -380,6 +381,34 @@ class BackendQuantizer(Quantizer):
         _annotate_input_qspec_map(conv_node, bias, bias_qspec)
 
       _annotate_output_qspec(conv_node, output_qspec)
+      _mark_nodes_as_annotated([*p.nodes])
+
+  def _annotate_add(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    input_qspec = get_input_act_qspec(qconfig)
+    output_qspec = get_output_act_qspec(qconfig)
+
+    all_partitions = get_source_partitions(gm.graph, [operator.add, torch.add])
+    partitions = list(itertools.chain(*all_partitions.values()))
+    for p in partitions:
+      add_node = p.output_nodes[0]
+      if _is_annotated([add_node]):
+        continue
+
+      lhs = add_node.args[0]
+      rhs = add_node.args[1]
+
+      # output clearly has a different qparam,
+      # but for the time being,
+      # we have both inputs share qparams.
+
+      # XXX: the docs and examples are a bit confusing in terms of how the
+      # SharedQuantizationSpec is supposed to be used. My interpretation is
+      # that since we're placing it on the input, it is an input edge.
+      shared_qspec = SharedQuantizationSpec((lhs, add_node))
+
+      _annotate_input_qspec_map(add_node, lhs, input_qspec)
+      _annotate_input_qspec_map(add_node, rhs, input_qspec)
+      _annotate_output_qspec(add_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
   def _annotate_in_out_shared_qspec(self, op: Callable, gm: torch.fx.GraphModule):
