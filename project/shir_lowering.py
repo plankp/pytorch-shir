@@ -92,12 +92,24 @@ def lower_reduction(x: torch.fx.Node, dims: list[int], reducer) -> str:
 
   if unpeel_layers > 0:
     prefix = [i for i in range(N) if i not in dims]
-    if any((i != j for (i, j) in zip(prefix, range(N)))):
+    if all((i == j for (i, j) in zip(prefix, range(N)))):
+      # we don't need to transposed anything since we're already going to
+      # reduce the inner parts.
+      #
+      # like the latter case, we compute the type of the innermost map,
+      # but we cannot rely on dims since it might be out of order.
+      shape = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
+                     reversed(xshape[unpeel_layers:]),
+                     elt_ty.name())
+    else:
       # we have a gap in the reduction axes: need to transpose
       # using tuple splat here is also safe because the axes will have at
       # least two elements
-      axes = [*prefix, *dim]
+      axes = [*prefix, *dims]
       x = f"algo.TransposeND({x}, Seq{(*(N - i - 1 for i in reversed(axes)),)})"
+      shape = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
+                     (xshape[d] for d in reversed(dims)),
+                     elt_ty.name())
 
   # for sanity reasons, we avoid using algo.JoinAll here
   hd = (join_layers - 1) * "algo.Join("
@@ -107,11 +119,6 @@ def lower_reduction(x: torch.fx.Node, dims: list[int], reducer) -> str:
   acc = lambda t: reducer(f"{hd}{t}{tl}", inner_size)
 
   if unpeel_layers > 0:
-    # the inner-most map needs a type annotation :shrug:
-    shape = reduce(lambda x, y: f"algo.SeqType({x}, {y})",
-                   (xshape[d] for d in reversed(dims)),
-                   elt_ty.name())
-
     w = acc("core.ParamUse(_0)")
     acc = lambda t: (f"algo.Map({{ val _0 = core.ParamDef({shape});"
                      f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})")
