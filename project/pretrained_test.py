@@ -3,9 +3,9 @@
 import copy
 import torch
 import torch._dynamo as torchdynamo
-from torch.ao.quantization._quantize_pt2e import (
+from torch.ao.quantization.quantize_pt2e import (
   convert_pt2e,
-  prepare_pt2e_quantizer,
+  prepare_pt2e,
 )
 
 import shir_backend
@@ -32,7 +32,7 @@ model, guards = torchdynamo.export(
 )
 quantizer = shir_quantizer.BackendQuantizer()
 
-model = prepare_pt2e_quantizer(model, quantizer)
+model = prepare_pt2e(model, quantizer)
 model(*example_inputs)
 print(model)
 

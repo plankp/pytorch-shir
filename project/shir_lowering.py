@@ -80,17 +80,7 @@ def lower_pairwise_tensor_binop(op: str, x: torch.fx.Node, y: torch.fx.Node) -> 
   return lower_pairwise_binop(op, x.name, x.meta.get("val").shape,
                               y.name, y.meta.get("val").shape)
 
-def lower_reduction(x: torch.fx.Node, dims: list[int],
-                    reducer: str, castf=lambda x: x) -> str:
-  """
-  reducer has type T -> T -> U where U and T are compatible*
-  castf converts U -> R
-  the result will operate on x: T[S] and reduce on dims only to give R[...]
-
-  this is a handwave-y description of what happens.
-  casting happens after the Fold step.
-  """
-
+def lower_reduction(x: torch.fx.Node, dims: list[int], reducer) -> str:
   assert dims != []
 
   elt_ty = shir_type.get_element_type(x)
@@ -112,7 +102,9 @@ def lower_reduction(x: torch.fx.Node, dims: list[int],
   # for sanity reasons, we avoid using algo.JoinAll here
   hd = (join_layers - 1) * "algo.Join("
   tl = (join_layers - 1) * ")"
-  acc = lambda t: castf(f"algo.Fold({reducer}, {hd}{t}{tl})")
+  # compute the flattened size, useful for computing the mean
+  inner_size = reduce(lambda x, y: x * y, (xshape[i] for i in dims))
+  acc = lambda t: reducer(f"{hd}{t}{tl}", inner_size)
 
   if unpeel_layers > 0:
     # the inner-most map needs a type annotation :shrug:
@@ -629,19 +621,57 @@ class LowerSum:
         return False
 
   def lower(inp, dims) -> str:
-    ty = shir_type.get_element_type(inp)
-    match ty:
-      case shir_type.UI(bits):
-        f = lambda t: f"algo.TruncInteger({t}, {bits})"
-      case shir_type.SI(bits):
-        f = lambda t: f"algo.Sub(algo.Tuple(algo.TruncInteger({t}, {bits}), algo.ConstantInteger(0)))"
+    def reducer(seq, _):
+      ty = shir_type.get_element_type(inp)
+      return f"_iredsum({ty.name()}, {seq})"
 
-    # due to how Fold works, we need to perform the Add2 as unsigned!
-    op = (f"{{ val _0 = core.ParamDef(); val _1 = core.ParamDef();"
-          f" algo.AlgoLambda(Seq(_0, _1),"
-          f" algo.Add2(algo.TruncInteger(core.ParamUse(_0), {bits}),"
-          f" algo.TruncInteger(core.ParamUse(_1), {bits}))) }}")
-    return lower_reduction(inp, dims, op, f)
+    return lower_reduction(inp, dims, reducer)
+
+@register_operator(shir.int_mean.default)
+class LowerMean:
+  @staticmethod
+  def supports(a, dims, keepDim) -> bool:
+    if shir_type.get_element_type(a) != shir_type.SI(32):
+      return False
+
+    return True
+
+  @staticmethod
+  def lower(x, dims, keepDim) -> str:
+    # TODO: keepDim = True...
+    def reducer(seq, elts):
+      f, w, s = qscale_to_fixpoint([1.0 / elts])
+      clip_bits = max(w + 1 - s, 0)
+      return (
+        f"algo.Sub(algo.Tuple("
+        f"algo.Add2(algo.ConstantInteger(0, Some(algo.SignedIntType(32))),"
+        f" algo.ClipBankersRound("
+        f"algo.Mul(algo.Tuple(algo.ConstantInteger({f[0]},"
+        f" Some(algo.SignedIntType({w + 1}))),"
+        f" _iredsum(algo.SignedIntType(32), {seq}))),"
+        f" {s}, {clip_bits})), algo.ConstantInteger(0)))"
+      )
+
+    # dims may contain negative indices. normalize them first
+    xshape = x.meta.get("val").shape
+    N = len(xshape)
+    dims = [x if x >= 0 else N + x for x in dims]
+
+    reduced = lower_reduction(x, dims, reducer)
+    if not keepDim:
+      return reduced
+
+    if N == len(dims):
+      # promote the full reduction (a scalar) into a tensor
+      reduced = f"algo.Repeat({reduced}, 1)"
+    else:
+      reduced = f"algo.JoinAll({reduced})"
+
+    # every dimension being reduced has now length 1
+    w = ", ".join(
+      ("1" if i in dims else str(d) for i, d in enumerate(xshape))
+    )
+    return f"algo.Join(algo.SplitAll({reduced}, Seq({w})))"
 
 def get_same_elt_type(lhs, rhs):
   def extract(value):
@@ -1258,7 +1288,7 @@ class LowerAdaptiveAvgPoolND:
                f" algo.Sub(algo.Tuple(algo.TruncInteger(algo.Add2(algo.ConstantInteger(0,"
                f" Some(algo.SignedIntType(32))),"
                f" algo.ClipBankersRound(algo.Mul(algo.Tuple(algo.ConstantInteger({f[0]},"
-               f" Some(algo.SignedIntType(w + 1))),"
+               f" Some(algo.SignedIntType({w + 1}))),"
                f" _iredsum(algo.SignedIntType(32),"
                f" {flatseq}))), {s}, {clip_bits})), 32),"
                f" algo.ConstantInteger(0)))) }}, {s})")

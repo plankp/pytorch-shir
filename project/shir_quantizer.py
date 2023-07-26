@@ -10,12 +10,12 @@ import shir_intrinsic
 
 import torch
 from torch.nn.utils.fusion import fuse_linear_bn_weights
-from torch.ao.quantization._pt2e.utils import (
+from torch.ao.quantization.pt2e.utils import (
   _get_tensor_constant_from_node,
   _get_all_arguments,
 )
 
-from torch.ao.quantization._pt2e.quantizer.utils import (
+from torch.ao.quantization.pt2e.quantizer.utils import (
   _annotate_input_qspec_map,
   _annotate_output_qspec,
   get_input_act_qspec,
@@ -28,8 +28,8 @@ from torch.fx.passes.utils.source_matcher_utils import (
   get_source_partitions,
   SourcePartition
 )
-from torch.ao.quantization._pt2e.graph_utils import find_sequential_partitions
-from torch.ao.quantization._pt2e.quantizer.quantizer import (
+from torch.ao.quantization.pt2e.graph_utils import find_sequential_partitions
+from torch.ao.quantization.pt2e.quantizer.quantizer import (
   OperatorConfig,
   QuantizationConfig,
   QuantizationSpec,
@@ -407,7 +407,7 @@ class BackendQuantizer(Quantizer):
       shared_qspec = SharedQuantizationSpec((lhs, add_node))
 
       _annotate_input_qspec_map(add_node, lhs, input_qspec)
-      _annotate_input_qspec_map(add_node, rhs, input_qspec)
+      _annotate_input_qspec_map(add_node, rhs, shared_qspec)
       _annotate_output_qspec(add_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 

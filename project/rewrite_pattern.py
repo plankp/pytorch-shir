@@ -4,7 +4,7 @@ from torch.fx import subgraph_rewriter, Node
 import torch
 import shir_intrinsic   # make sure these are loaded
 import operator
-from torch.ao.quantization._pt2e.utils import (
+from torch.ao.quantization.pt2e.utils import (
   _get_all_arguments,
 )
 from torch._dynamo.source import (
