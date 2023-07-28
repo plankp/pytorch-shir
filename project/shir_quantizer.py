@@ -153,6 +153,16 @@ def _extract_linear_fields(gm: torch.fx.GraphModule, p: SourcePartition):
 The actual magic behind deciding where each qspec goes
 """
 
+# list of single-input nodes where the input and output should share
+# quantization parameters
+_OPS_IN_OUT_SHARING = [
+  torch.nn.ReLU6,
+  torch.nn.Hardtanh,
+  torch.nn.MaxPool2d,
+  torch.nn.AdaptiveAvgPool2d,
+  torch.ops.shir_intrinsic.flatten,
+]
+
 class BackendQuantizer(Quantizer):
 
   def __init__(self, allow_per_channel=True):
@@ -175,12 +185,8 @@ class BackendQuantizer(Quantizer):
     self._annotate_add(gm, qconfig)
 
     # these ones use the annotations we added just before
-    # XXX: PyTorch's builtin targets mark ReLU6 and Hardtanh as qspec sharing
-    self._annotate_in_out_shared_qspec(torch.nn.ReLU6, gm)
-    self._annotate_in_out_shared_qspec(torch.nn.Hardtanh, gm)
-    self._annotate_in_out_shared_qspec(torch.nn.MaxPool2d, gm)
-    self._annotate_in_out_shared_qspec(torch.nn.AdaptiveAvgPool2d, gm)
-    self._annotate_in_out_shared_qspec(torch.ops.shir_intrinsic.flatten, gm)
+    self._annotate_in_out_shared_qspec(_OPS_IN_OUT_SHARING, gm)
+    return gm
 
   # validate the annotated graph is supported by the backend
   def validate(self, gm: torch.fx.GraphModule) -> None:
@@ -411,8 +417,8 @@ class BackendQuantizer(Quantizer):
       _annotate_output_qspec(add_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
-  def _annotate_in_out_shared_qspec(self, op: Callable, gm: torch.fx.GraphModule):
-    all_partitions = get_source_partitions(gm.graph, [op])
+  def _annotate_in_out_shared_qspec(self, ops: List[Callable], gm: torch.fx.GraphModule):
+    all_partitions = get_source_partitions(gm.graph, ops)
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:
       out = p.output_nodes[0]
