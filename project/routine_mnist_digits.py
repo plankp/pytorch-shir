@@ -71,14 +71,14 @@ loss_fn = nn.CrossEntropyLoss()
 train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
 test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
 
-def reload_cached(file_saved_weights: str, model_ctor):
+def reload_cached(
+  file_saved_weights: str, model_ctor,
+  learning_rate=1e-3, epochs=10
+):
   if Path(file_saved_weights).is_file():
     print("Loading saved model")
   else:
     print("Model does not exist, training!")
-
-    learning_rate = 1e-3
-    epochs = 10
 
     model = model_ctor()
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)

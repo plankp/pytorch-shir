@@ -705,8 +705,17 @@ class QuantOpRewrite:
     return True
 
   """
-  s (X - z) + s (Y - z)     <-- both inputs have the same qparams
-    = s (X + Y - 2z)
+  IF X and Y have the same qparams:
+  q(dq(X) + dq(Y))
+    = q(s (X + Y - 2z))   <-- provided 2z does not overflow (unlikely)
+
+  OTHERWISE:
+  requantize consists of multiple smaller steps: rescale, round, adjust zeros,
+  clamp, truncate. the idea is we want to perform the add operation between
+  rescale and round.
+
+  of course, much of this is codegen / bitwidth dependent, so we lower it into
+  an intrinsic node. (and see you in shir-lowering)
   """
 
   def _match_add(self, node_q_output: Node):
@@ -722,23 +731,19 @@ class QuantOpRewrite:
     node_dq_rhs = node_add.args[1]
 
     qparam_lhs = self.fetch_dequant_per_tensor(node_dq_lhs, -128, 127, torch.int8)
-    qparam_rhs = self.fetch_dequant_per_tensor(node_dq_rhs, -128, 127, torch.int8)
-
     if not qparam_lhs:
       return None
-    if qparam_lhs != qparam_rhs:
-      print("FOUND ADD NODE WITH MISMATCHED QSPEC")
-      print("  ", node_add.name, node_add.args[0], node_add.args[1])
-      print("  ", node_dq_lhs, qparam_lhs)
-      print("  ", node_dq_rhs, qparam_rhs)
-      exit()
 
+    qparam_rhs = self.fetch_dequant_per_tensor(node_dq_rhs, -128, 127, torch.int8)
+    if not qparam_rhs:
       return None
+
 
     return (
       node_dq_lhs.args[0],
       node_dq_rhs.args[0],
       qparam_lhs,
+      qparam_rhs,
       qparam_out,
     )
 
@@ -747,16 +752,32 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [lhs_node, rhs_node, (s_x, z_x), (s_out, z_out)] = node_map
-    assert (-1<<31) <= 2 * z_x < (1<<31), "Qadd: adjusted zero point overflows s32 range"
+    [lhs_node, rhs_node, (s_x, z_x), (s_y, z_y), (s_out, z_out)] = node_map
 
+    # case when both inputs share qparams
+    if s_x == s_y and z_x == z_y and (
+      (-1<<31) <= 2 * z_x < (1<<31)   # sanity check
+    ):
+      graph = self.gm.graph
+      with graph.inserting_before(anchor):
+        n1 = graph.call_method("int", (lhs_node,))
+        n2 = graph.call_method("int", (rhs_node,))
+        n3 = graph.call_function(aten.add, (n1, n2))
+        n4 = graph.call_function(aten.sub, (n3, 2 * z_x))
+        n5 = graph.call_function(shir.requantize, (n4, s_x / s_out, z_out))
+
+      anchor.replace_all_uses_with(n5)
+      return True
+
+    # fallback case
     graph = self.gm.graph
     with graph.inserting_before(anchor):
+      # adjust the input zero points before handing it off to qadd
       n1 = graph.call_method("int", (lhs_node,))
-      n2 = graph.call_method("int", (rhs_node,))
-      n3 = graph.call_function(aten.add, (n1, n2))
-      n4 = graph.call_function(aten.sub, (n3, 2 * z_x))
-      n5 = graph.call_function(shir.requantize, (n4, s_x / s_out, z_out))
+      n2 = graph.call_function(aten.sub, (n1, z_x))
+      n3 = graph.call_method("int", (rhs_node,))
+      n4 = graph.call_function(aten.sub, (n3, z_y))
+      n5 = graph.call_function(shir_intrinsic.qadd_broadcast, (n2, s_x / s_out, n4, s_y / s_out, z_out))
 
     anchor.replace_all_uses_with(n5)
     return True
