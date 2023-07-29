@@ -83,6 +83,34 @@ def requantize_channel_meta(self, s, z):
 
   return torch.empty_like(self, dtype=torch.int8)
 
+def qadd_broadcast(self, s1, rhs, s2, z):
+  """
+  Identical to the intrinsics version, except the shapes for self and rhs may
+  be different, provided that they obey broadcasting rules.
+  """
+
+  lhs, rhs = torch.broadcast_tensors(self, rhs)
+  return torch.ops.shir_intrinsic.qadd(self, s1, rhs, s2, z)
+
+shir_intrinsic_lib.define(
+  "qadd(Tensor self, float s1, Tensor rhs, float s2, int z) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "qadd", "CompositeExplicitAutograd")
+def qadd(self, s1, rhs, s2, z):
+  # do the requantization step ourselves
+  return torch.clamp(torch.round(self * s1 + rhs * s2) + z, -128, 127).to(torch.int8)
+
+@impl(shir_intrinsic_lib, "qadd", "Meta")
+def qadd_meta(self, s1, rhs, s2, z):
+  # disallow implicit broadcasting because prims can't help us here
+  assert self.shape == rhs.shape
+  assert self.dtype == rhs.dtype == torch.int32
+  assert isinstance(s1, float) and isinstance(s2, float)
+  assert isinstance(z, int)
+
+  return torch.empty_like(self, dtype=torch.int8)
+
 shir_intrinsic_lib.define(
   "int_addmm(Tensor self, Tensor lhs, Tensor rhs) -> Tensor"
 )

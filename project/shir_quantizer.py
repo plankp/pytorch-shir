@@ -184,7 +184,7 @@ class BackendQuantizer(Quantizer):
     self._annotate_linear(gm, qconfig)
     self._annotate_add(gm, qconfig)
 
-    # these ones use the annotations we added just before
+    # ops that may depend (and even override) earlier annotations
     self._annotate_in_out_shared_qspec(_OPS_IN_OUT_SHARING, gm)
     return gm
 
@@ -403,17 +403,18 @@ class BackendQuantizer(Quantizer):
       lhs = add_node.args[0]
       rhs = add_node.args[1]
 
-      # output clearly has a different qparam,
-      # but for the time being,
-      # we have both inputs share qparams.
-
-      # XXX: the docs and examples are a bit confusing in terms of how the
-      # SharedQuantizationSpec is supposed to be used. My interpretation is
-      # that since we're placing it on the input, it is an input edge.
-      shared_qspec = SharedQuantizationSpec((lhs, add_node))
+      # if we do want both inputs to have the same qparam,
+      # see https://discuss.pytorch.org/t/share-qparams-in-pt2e/185266
+      #
+      # alas, the solution is tricky once we start using different qspecs,
+      # which is not great.
+      #
+      # but thankfully, we can implement the general case using fixed point
+      # arithmetic provided that the fractional scaling factor can be
+      # arbitrary large! (see reasoning in shir-lowering)
 
       _annotate_input_qspec_map(add_node, lhs, input_qspec)
-      _annotate_input_qspec_map(add_node, rhs, shared_qspec)
+      _annotate_input_qspec_map(add_node, rhs, input_qspec)
       _annotate_output_qspec(add_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
@@ -432,7 +433,9 @@ class BackendQuantizer(Quantizer):
       if inp.meta["quantization_annotation"].output_qspec is None:
         continue
 
+      # following the discussion on sharing qparams, we not only share with
+      # the output, we also share with the current input!
       shared_qspec = SharedQuantizationSpec(inp)
-
+      _annotate_input_qspec_map(out, inp, shared_qspec)
       _annotate_output_qspec(out, shared_qspec)
       _mark_nodes_as_annotated([*p.nodes])

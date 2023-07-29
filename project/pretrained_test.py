@@ -19,6 +19,8 @@ import shir_intrinsic
 # model = resnet50(weights='DEFAULT')
 from torchvision.models import mobilenet_v2
 model = mobilenet_v2(weights='DEFAULT')
+# from torchvision.models import mobilenet_v3_large
+# model = mobilenet_v3_large(weights='DEFAULT')
 
 model.eval()
 
@@ -34,16 +36,8 @@ quantizer = shir_quantizer.BackendQuantizer()
 
 model = prepare_pt2e(model, quantizer)
 model(*example_inputs)
-print(model)
+model = convert_pt2e(model)
 
-from torch.fx.passes.graph_drawer import FxGraphDrawer
-g = FxGraphDrawer(model, "dummy")
-g.get_dot_graph().write_svg("prepare_dummy_graph.svg")
-
-# model = convert_pt2e(model)
-
-# # model.print_readable()
-
-# torchdynamo.reset()
-# model = torch.compile(backend=shir_backend.compiler)(model)
-# model(*example_inputs)
+torchdynamo.reset()
+model = torch.compile(backend=shir_backend.compiler)(model)
+model(*example_inputs)

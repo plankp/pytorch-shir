@@ -374,6 +374,77 @@ class LowerRequantizeChannel:
     return (f"algo.Map({{ val _0 = core.ParamDef();"
             f" algo.AlgoLambda(Seq(_0), {w}) }}, {a.name})")
 
+@register_operator(shir.qadd.default)
+class LowerQadd:
+  @staticmethod
+  def supports(a, sa, b, sb, z) -> bool:
+    # due to limitations of SHIR, we cannot support all scales.
+    # unlike the per channel requant case, we really need both scales to be
+    # fixed points, so the float point QScale workaround doesn't apply here.
+    try:
+      # the multiplication gives 32 + w + 1 bits.
+      # addition gives 32 + w + 1 + 1 bits.
+      _, w, shamt = qscale_to_fixpoint([sa, sb])
+      if w > 32 or shamt >= 32 + w + 2:
+        return False
+    except AssertionError:
+      return False
+
+    return True
+
+  @staticmethod
+  def lower(a, sa, b, sb, z) -> str:
+    # recall the per channel requant case: we have multiple integer
+    # multiplicands that share the same shift. we would multiply each channel
+    # with the relevant multiplicand and then do a rounding shift (and zero
+    # point adjustment of course).
+    #
+    # in this case, we want to add both tensors after multiplying and only
+    # perform the rounding shift after that step. to illustrate:
+    #   round(a * sa + b * sb)
+    #     = round(a * ia, s) + round(b * ib, s)   <-- (1)
+    #     = round(a * ia + b * ib, s)             <-- (2)
+    #
+    # while (1) is a reasonable approximation, (2) is better since the
+    # fractional bits are included in the addition.
+
+    def gen_kernel(lhs, rhs):
+      [sa, sb], w, shamt = qscale_to_fixpoint([sa, sb])
+      sa = f"algo.Signed(algo.ConstantInteger({sa}, Some(IntType({w}))))"
+      sb = f"algo.Signed(algo.ConstantInteger({sb}, Some(IntType({w}))))"
+      lhs = f"algo.Mul(algo.Tuple({lhs}, {sa}))"
+      rhs = f"algo.Mul(algo.Tuple({rhs}, {sb}))"
+      acc = f"algo.Add2({lhs}, {rhs})"
+
+      # because both lhs rhs are 32 + w + 1 bits, add would sneak in one extra
+      # bit, then ClipBankersRound will drop off shamt bits.
+      bits = 32 + w + 2 - shamt
+      acc = f"algo.ClipBankersRound({acc}, {shamt}, 0)"
+
+      bits = max(bits, 32) if bits != 32 else 33
+      acc = f"algo.Add2({bits}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
+
+      return f"algo.ClipBankersRound({acc}, 0, {bits - 8})"
+
+    ashape = a.meta.get("val").shape
+    if not ashape:
+      return gen_kernel(a.name, b.name)
+
+    w = gen_kernel("algo.Select(core.ParamUse(_0), 0)", "algo.Select(core.ParamUse(_1), 1)")
+    acc = lambda t: (
+      f"algo.Map({{ val _0 = core.ParamDef(algo.TupleType(algo.SignedIntType(32), algo.SignedIntType(32)))"
+      f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})"
+    )
+
+    for _ in ashape[1:]:
+      w = acc("core.ParamUse(_0)")
+      acc = lambda t: (
+        f"algo.Map({{ val _0 = core.ParamDef();"
+        f" algo.AlgoLambda(Seq(_0), {w}) }}, algo.Zip({t}))"
+      )
+
+    return acc(f"algo.Zip(algo.Tuple({a.name}, {b.name}))")
+
 @register_operator(shir.flatten.default)
 class LowerFlatten:
   @staticmethod
