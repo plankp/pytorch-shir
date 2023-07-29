@@ -441,10 +441,10 @@ class LowerQadd:
     )
 
     for _ in ashape[1:]:
-      w = acc("core.ParamUse(_0)")
+      w = acc("algo.Zip(core.ParamUse(_0))")
       acc = lambda t: (
         f"algo.Map({{ val _0 = core.ParamDef();"
-        f" algo.AlgoLambda(Seq(_0), {w}) }}, algo.Zip({t}))"
+        f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})"
       )
 
     return acc(f"algo.Zip(algo.Tuple({a.name}, {b.name}))")
