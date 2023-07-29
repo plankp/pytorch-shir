@@ -409,20 +409,24 @@ class LowerQadd:
     # fractional bits are included in the addition.
 
     def gen_kernel(lhs, rhs):
-      [sa, sb], w, shamt = qscale_to_fixpoint([sa, sb])
-      sa = f"algo.Signed(algo.ConstantInteger({sa}, Some(IntType({w}))))"
-      sb = f"algo.Signed(algo.ConstantInteger({sb}, Some(IntType({w}))))"
-      lhs = f"algo.Mul(algo.Tuple({lhs}, {sa}))"
-      rhs = f"algo.Mul(algo.Tuple({rhs}, {sb}))"
+      [ia, ib], w, shamt = qscale_to_fixpoint([sa, sb])
+      ia = f"algo.Signed(algo.ConstantInteger({ia}, Some(IntType({w}))))"
+      ib = f"algo.Signed(algo.ConstantInteger({ib}, Some(IntType({w}))))"
+      lhs = f"algo.Mul(algo.Tuple({lhs}, {ia}))"
+      rhs = f"algo.Mul(algo.Tuple({rhs}, {ib}))"
       acc = f"algo.Add2({lhs}, {rhs})"
 
       # because both lhs rhs are 32 + w + 1 bits, add would sneak in one extra
       # bit, then ClipBankersRound will drop off shamt bits.
       bits = 32 + w + 2 - shamt
-      acc = f"algo.ClipBankersRound({acc}, {shamt}, 0)"
+      acc = (
+        f"algo.Sub(algo.Tuple(algo.TruncInteger("
+        f"algo.ClipBankersRound({acc}, {shamt}, 0),"
+        f" {bits}), algo.ConstantInteger(0)))"
+      )
 
       bits = max(bits, 32) if bits != 32 else 33
-      acc = f"algo.Add2({bits}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
+      acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
 
       return f"algo.ClipBankersRound({acc}, 0, {bits - 8})"
 
@@ -430,9 +434,9 @@ class LowerQadd:
     if not ashape:
       return gen_kernel(a.name, b.name)
 
-    w = gen_kernel("algo.Select(core.ParamUse(_0), 0)", "algo.Select(core.ParamUse(_1), 1)")
+    w = gen_kernel("algo.Select(core.ParamUse(_0), 0)", "algo.Select(core.ParamUse(_0), 1)")
     acc = lambda t: (
-      f"algo.Map({{ val _0 = core.ParamDef(algo.TupleType(algo.SignedIntType(32), algo.SignedIntType(32)))"
+      f"algo.Map({{ val _0 = core.ParamDef(algo.TupleType(algo.SignedIntType(32), algo.SignedIntType(32)));"
       f" algo.AlgoLambda(Seq(_0), {w}) }}, {t})"
     )
 
