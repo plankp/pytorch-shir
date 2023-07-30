@@ -428,7 +428,11 @@ class LowerQadd:
       bits = max(bits, 32) if bits != 32 else 33
       acc = f"algo.Add2({acc}, algo.ConstantInteger({z}, Some(algo.SignedIntType(32))))"
 
-      return f"algo.ClipBankersRound({acc}, 0, {bits - 8})"
+      return (
+        f"algo.Sub(algo.Tuple(algo.TruncInteger("
+        f"algo.ClipBankersRound({acc}, 0, {bits - 8}),"
+        f" 8), algo.ConstantInteger(0)))"
+      )
 
     ashape = a.meta.get("val").shape
     if not ashape:
