@@ -24,6 +24,7 @@ import shir_intrinsic
 
 # prepare to monkey patch this call to flatten
 _old_torch_flatten_impl = torch.flatten
+torch.flatten = shir_intrinsic.flatten_bridge
 
 # this model has 90.5% accuracy for what it's worth
 # (since we don't know if we are mixing training data)
@@ -35,7 +36,7 @@ model = torch.hub.load(
   trust_repo=True
 )
 model.eval()
-# test_loop(test_dataloader, model, loss_fn)
+test_loop(test_dataloader, model, loss_fn)
 
 example_inputs = (get_example_input(),)
 
@@ -55,4 +56,4 @@ torchdynamo.reset()
 model = torch.compile(backend=shir_backend.compiler)(model)
 model(*example_inputs)
 
-test_loop(test_dataloader, model, loss_fn)
+# test_loop(test_dataloader, model, loss_fn)
