@@ -17,6 +17,9 @@ shir_intrinsic_lib.define(
   "flatten(Tensor self, int start, int end) -> Tensor"
 )
 
+def flatten_bridge(tensor, start=1, end=-1):
+  return torch.ops.shir_intrinsic(tensor, start, end)
+
 @impl(shir_intrinsic_lib, "flatten", "CompositeExplicitAutograd")
 def flatten(self, start, end):
   # XXX: we DON'T want to use torch.flatten in case someone (we) monkey
