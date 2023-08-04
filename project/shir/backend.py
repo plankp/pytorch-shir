@@ -146,11 +146,11 @@ class SHIRGraphModule(torch.nn.Module):
       print("  }", file=f)
       print(file=f)
 
-      print("  def _read_inputs(folder: String): Predef.Map[String, Seq[Seq[Int]]] = {", file=f)
+      print("  def _read_inputs(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
       for i, arg in enumerate(self._placeholders):
         print("    \"", arg, "\" -> _read_csv(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
       print("    \"result\" -> _read_csv(Paths.get(folder, \"result.csv\").toFile())", file=f)
-      print("  }", file=f)
+      print("  )", file=f)
       print(file=f)
 
       print("  def _read_csv(fname: File): Seq[Seq[Int]] = {", file=f)
