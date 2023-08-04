@@ -5,6 +5,7 @@ Where the lowering of each supported operator actually happens
 import torch
 from functools import reduce
 from itertools import chain
+from . import bit_utils, types
 
 """
 Registration magic
@@ -51,7 +52,7 @@ class LowerShirRequantize:
         f"{w}, algo.ConstantInteger({q}, Some(algo.IntType({w}))), {shamt}, {z})"
       )
     else:
-      fbits32 = bit_utils.to_signed(bit_utils.to_float_bits(s), 32)
+      fbits32 = bit_utils.to_signed(bit_utils.f32_to_bits(s), 32)
       requant_kernel = (
         f"algo.torch.SIRequantFloat32.asFunction("
         f"algo.ConstantInteger({fbits32}, Some(algo.IntType(32))), {z})"
@@ -74,6 +75,7 @@ class LowerShirRequantizeChannel:
     except AssertionError:
       fixpoint_method = False
 
+    fixpoint_method = False
     # synthesize the requant function and the stream of scales
     #
     # the main takeaway is that ConstantSeq has last element first,
@@ -84,13 +86,13 @@ class LowerShirRequantizeChannel:
 
     else:
       w = 32
-      sseq = (bit_utils.to_float_bits(x) for x in reversed(s))
+      sseq = (bit_utils.f32_to_bits(x) for x in reversed(s))
       requant_kernel = f"algo.torch.SIRequantFloat32.asFunction({z})"
 
     sseq = ", ".join((str(bit_utils.to_signed(x, 32)) for x in sseq))
     return (
       f"algo.torch.TZipChannel({requant_kernel}, {a.name},"
-      f" algo.ConstantSeq({sseq}, Some(algo.IntType({w}))))"
+      f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))"
     )
 
 @register_lowering(shin.int_addmm.default)
@@ -126,12 +128,11 @@ class LowerConvolution:
 
   @staticmethod
   def lower(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> str:
-    rank = len(input.meta.get("val").shape)
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     return (
-      f"algo.torch.TConvolution({rank}, {types.get_element_type(input).name()},"
+      f"algo.torch.TConvolution({types.get_element_type(input).name()},"
       f" {input.name}, {weight.name},"
       f" Seq({stride}), Seq({padding}), Seq({dilation}),"
       f" {groups})"
