@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-import shir_quantizer
-import shir_backend
-import shir_intrinsic
+import shir
 
-@torch.compile(backend=shir_backend.compiler)
+@torch.compile(backend=shir.compiler)
 def fn(data):
   return torch.ops.shir_intrinsic.int_mean(data, [-1, -2], True)
 

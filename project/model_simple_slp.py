@@ -1,5 +1,4 @@
-# based on the PyTorch tutorial:
-# https://pytorch.org/tutorials/beginner/basics/intro.html
+# about the simplest model you can ever make...
 
 from routine_mnist_digits import (
   reload_cached,
@@ -13,13 +12,11 @@ import torch
 from torch import nn
 
 import torch._dynamo as torchdynamo
-from torch.ao.quantization._quantize_pt2e import (
+from torch.ao.quantization.quantize_pt2e import (
   convert_pt2e,
-  prepare_pt2e_quantizer,
+  prepare_pt2e,
 )
-
-import shir_backend
-import shir_quantizer
+import shir
 
 class Net(nn.Module):
   def __init__(self):
@@ -48,14 +45,14 @@ model, guards = torchdynamo.export(
   aten_graph=True,
 )
 
-quantizer = shir_quantizer.BackendQuantizer()
+quantizer = shir.BackendQuantizer()
 
-model = prepare_pt2e_quantizer(model, quantizer)
+model = prepare_pt2e(model, quantizer)
 model(*example_inputs)  # calibration
 model = convert_pt2e(model)
 
 torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
+model = torch.compile(backend=shir.compiler)(model)
 model(*example_inputs)
 
-test_loop(test_dataloader, model, loss_fn)
+# test_loop(test_dataloader, model, loss_fn)

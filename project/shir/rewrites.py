@@ -1,8 +1,7 @@
 from typing import Optional, Tuple
 from torch.fx.graph_module import GraphModule
-from torch.fx import subgraph_rewriter, Node
+from torch.fx import Node
 import torch
-import shir_intrinsic   # make sure these are loaded
 import operator
 from torch.ao.quantization.pt2e.utils import (
   _get_all_arguments,
@@ -12,10 +11,11 @@ from torch._dynamo.source import (
   LocalSource,
   AttrSource,
 )
+from . import functional
 
 # don't match or emit prims ops at this level!
 aten = torch.ops.aten
-shir = torch.ops.shir_intrinsic
+shin = torch.ops.shir_intrinsic
 qd = torch.ops.quantized_decomposed
 
 class QuantOpRewrite:
@@ -250,10 +250,10 @@ class QuantOpRewrite:
     with graph.inserting_before(anchor):
       n1 = graph.get_attr(weight_attr)
       n2 = graph.get_attr(bias_attr)
-      n3 = graph.call_function(shir.int_addmm, (n2, x_node, n1))
+      n3 = graph.call_function(shin.int_addmm, (n2, x_node, n1))
       if needs_relu:
         n3 = graph.call_function(aten.relu, (n3,))
-      n4 = graph.call_function(shir.requantize, (n3, k / s_out, z_out))
+      n4 = graph.call_function(shin.requantize, (n3, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n4)
     return True
@@ -353,7 +353,7 @@ class QuantOpRewrite:
       n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
       if needs_relu:
         n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shir.requantize, (n6, k / s_out, z_out))
+      n7 = graph.call_function(shin.requantize, (n6, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n7)
     return True
@@ -456,7 +456,7 @@ class QuantOpRewrite:
       n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
       if needs_relu:
         n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shir.requantize_channel, (n6, scales, z_out))
+      n7 = graph.call_function(shin.requantize_channel, (n6, scales, z_out))
 
     anchor.replace_all_uses_with(n7)
     return True
@@ -513,7 +513,7 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_function(shir.int_max_pool2d, (x, *pool_args))
+      n1 = graph.call_function(shin.int_max_pool2d, (x, *pool_args))
 
     anchor.replace_all_uses_with(n1)
     return True
@@ -562,7 +562,7 @@ class QuantOpRewrite:
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(shir.int_mean, (n1, *mean_args))
+      n2 = graph.call_function(shin.int_mean, (n1, *mean_args))
       n3 = graph.call_method("to", (n2, torch.int8))
 
     anchor.replace_all_uses_with(n3)
@@ -605,7 +605,7 @@ class QuantOpRewrite:
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(shir.int_adaptive_avg_pool2d, (n1, output_size))
+      n2 = graph.call_function(shin.int_adaptive_avg_pool2d, (n1, output_size))
       n3 = graph.call_method("to", (n2, torch.int8))
 
     anchor.replace_all_uses_with(n3)
@@ -621,7 +621,7 @@ class QuantOpRewrite:
       return None
 
     node_flatten = node_q_output.args[0]
-    if node_flatten.op != "call_function" or node_flatten.target != shir.flatten.default:
+    if node_flatten.op != "call_function" or node_flatten.target != shin.flatten.default:
       return None
 
     node_dq_input = node_flatten.args[0]
@@ -648,7 +648,7 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_function(shir.flatten, (x, start, end))
+      n1 = graph.call_function(shin.flatten, (x, start, end))
 
     anchor.replace_all_uses_with(n1)
     return True
@@ -764,7 +764,7 @@ class QuantOpRewrite:
         n2 = graph.call_method("int", (rhs_node,))
         n3 = graph.call_function(aten.add, (n1, n2))
         n4 = graph.call_function(aten.sub, (n3, 2 * z_x))
-        n5 = graph.call_function(shir.requantize, (n4, s_x / s_out, z_out))
+        n5 = graph.call_function(shin.requantize, (n4, s_x / s_out, z_out))
 
       anchor.replace_all_uses_with(n5)
       return True
@@ -777,7 +777,7 @@ class QuantOpRewrite:
       n2 = graph.call_function(aten.sub, (n1, z_x))
       n3 = graph.call_method("int", (rhs_node,))
       n4 = graph.call_function(aten.sub, (n3, z_y))
-      n5 = graph.call_function(shir_intrinsic.qadd_broadcast, (n2, s_x / s_out, n4, s_y / s_out, z_out))
+      n5 = graph.call_function(functional.qadd, (n2, s_x / s_out, n4, s_y / s_out, z_out))
 
     anchor.replace_all_uses_with(n5)
     return True

@@ -1,12 +1,14 @@
-# based on the following:
-# *   https://pytorch.org/tutorials/prototype/quantization_in_pytorch_2_0_export_tutorial.html
-# *   Gist linked near the end of the wikipage^
-# *   existing quantizer implementations
+"""
+Things needed to "teach" PyTorch how to quantize your model.
+
+For more information, check the following:
+*   https://pytorch.org/tutorials/prototype/quantization_in_pytorch_2_0_export_tutorial.html
+*   existing PyTorch quantizers located around torch.ao.quantization (both legacy and pt2e)
+"""
 
 import operator
 import itertools
 from typing import Dict, List, Optional, Callable
-import shir_intrinsic
 
 import torch
 from torch.nn.utils.fusion import fuse_linear_bn_weights
@@ -14,7 +16,6 @@ from torch.ao.quantization.pt2e.utils import (
   _get_tensor_constant_from_node,
   _get_all_arguments,
 )
-
 from torch.ao.quantization.pt2e.quantizer.utils import (
   _annotate_input_qspec_map,
   _annotate_output_qspec,
@@ -23,7 +24,6 @@ from torch.ao.quantization.pt2e.quantizer.utils import (
   get_bias_qspec,
   get_weight_qspec,
 )
-
 from torch.fx.passes.utils.source_matcher_utils import (
   get_source_partitions,
   SourcePartition
@@ -45,7 +45,7 @@ from torch.ao.quantization.observer import (
 )
 
 """
-Quantization specs that are used by SHIR.
+Quantization specs that are used by SHIR
 """
 
 # the quantization spec for activations must be signed and the min and max
@@ -75,6 +75,7 @@ _weight_qspec_per_tensor = QuantizationSpec(
 )
 
 # sometimes it makes sense to use per channel quantization for weights
+# (convolution weights can certainly make use of this)
 _weight_qspec_per_channel = QuantizationSpec(
   dtype=torch.int8,
   quant_min=-127,
@@ -93,7 +94,8 @@ _bias_qspec = QuantizationSpec(
 )
 
 """
-Quantization configs (since it's easier to pass these around than qspecs)
+Quantization configs
+(since it's easier to pass these around than individual qspecs)
 """
 
 _qconfig_per_tensor = QuantizationConfig(
@@ -112,6 +114,7 @@ _qconfig_per_channel = QuantizationConfig(
 
 """
 Utility functions
+(they come from the in-tree XNNPACK)
 """
 
 def _mark_nodes_as_annotated(nodes: List[torch.fx.Node]):
@@ -155,6 +158,11 @@ The actual magic behind deciding where each qspec goes
 
 # list of single-input nodes where the input and output should share
 # quantization parameters
+#
+# XXX:
+# some are already covered by PyTorch's late annotation propagate phase.
+# also, since these require inputs to be annotated, we might want to
+# match individual fx nodes (as in the rewrite phase) instead.
 _OPS_IN_OUT_SHARING = [
   torch.nn.ReLU6,
   torch.nn.Hardtanh,
@@ -199,7 +207,8 @@ class BackendQuantizer(Quantizer):
   # it looks like this is more like documentation than actually being useful
   @classmethod
   def get_supported_operators(cls) -> List[OperatorConfig]:
-    # bare minimum, per-tensor variants are supported
+    # XXX: this is out of date, but no one seems to use it
+    # TODO: update it :sweatsmile:
     return [
       OperatorConfig(_qconfig_per_tensor, [[torch.nn.Linear, torch.nn.ReLU]]),
       OperatorConfig(_qconfig_per_tensor, [[torch.nn.Linear]]),

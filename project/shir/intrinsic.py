@@ -17,9 +17,6 @@ shir_intrinsic_lib.define(
   "flatten(Tensor self, int start, int end) -> Tensor"
 )
 
-def flatten_bridge(tensor, start=1, end=-1):
-  return torch.ops.shir_intrinsic.flatten(tensor, start, end)
-
 @impl(shir_intrinsic_lib, "flatten", "CompositeExplicitAutograd")
 def flatten(self, start, end):
   # XXX: we DON'T want to use torch.flatten in case someone (we) monkey
@@ -85,15 +82,6 @@ def requantize_channel_meta(self, s, z):
   assert self.ndim > 1 and self.size(1) == len(s)
 
   return torch.empty_like(self, dtype=torch.int8)
-
-def qadd_broadcast(self, s1, rhs, s2, z):
-  """
-  Identical to the intrinsics version, except the shapes for self and rhs may
-  be different, provided that they obey broadcasting rules.
-  """
-
-  lhs, rhs = torch.broadcast_tensors(self, rhs)
-  return torch.ops.shir_intrinsic.qadd(self, s1, rhs, s2, z)
 
 shir_intrinsic_lib.define(
   "qadd(Tensor self, float s1, Tensor rhs, float s2, int z) -> Tensor"
