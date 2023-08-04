@@ -1,7 +1,7 @@
 import torch
 from . import intrinsic
 
-def flatten(tensor: torch.Tensor, start=1, end=-1) -> torch.Tensor:
+def flatten(tensor: torch.Tensor, start=0, end=-1) -> torch.Tensor:
   """
   Our torch.flatten that does not trigger symbolic shape usage and therefore
   is safe on a platform that doesn't support dynamic shapes.

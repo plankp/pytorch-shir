@@ -1,4 +1,5 @@
 import torch
+from typing import Tuple, Optional
 from dataclasses import dataclass
 
 """
@@ -31,6 +32,15 @@ class UI:
 
   def maxval(self) -> int:
     return (1 << self.bits) - 1
+
+def unpack_int_type(ty) -> Tuple[bool, int]:
+  match ty:
+    case SI(bits):
+      return (True, bits)
+    case UI(bits):
+      return (False, bits)
+    case _:
+      return None
 
 @dataclass(frozen=True)
 class Seq:

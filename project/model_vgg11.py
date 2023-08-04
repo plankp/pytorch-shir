@@ -18,13 +18,11 @@ from torch.ao.quantization.quantize_pt2e import (
   prepare_pt2e,
 )
 
-import shir_backend
-import shir_quantizer
-import shir_intrinsic
+import shir
 
 # prepare to monkey patch this call to flatten
 _old_torch_flatten_impl = torch.flatten
-torch.flatten = shir_intrinsic.flatten_bridge
+torch.flatten = shir.functional.flatten
 
 # this model has 90.5% accuracy for what it's worth
 # (since we don't know if we are mixing training data)
@@ -36,7 +34,7 @@ model = torch.hub.load(
   trust_repo=True
 )
 model.eval()
-test_loop(test_dataloader, model, loss_fn)
+# test_loop(test_dataloader, model, loss_fn)
 
 example_inputs = (get_example_input(),)
 
@@ -47,13 +45,13 @@ model, guards = torchdynamo.export(
 )
 torch.flatten = _old_torch_flatten_impl
 
-quantizer = shir_quantizer.BackendQuantizer()
+quantizer = shir.BackendQuantizer()
 model = prepare_pt2e(model, quantizer)
 model(*example_inputs)
 model = convert_pt2e(model)
 
 torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
+model = torch.compile(backend=shir.compiler)(model)
 model(*example_inputs)
 
 # test_loop(test_dataloader, model, loss_fn)
