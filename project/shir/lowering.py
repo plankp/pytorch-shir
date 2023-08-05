@@ -332,7 +332,7 @@ class LowerQadd:
     try:
       # both multiplications give 32 + w + 1 bits,
       # addition gives an extra bit, so 32 + w + 1 + 1 bits.
-      _, w, shamt = qscale_to_fixpoint([sa, sb])
+      _, w, shamt = bit_utils.qscale_to_fixpoint([sa, sb])
       if w > 32 or shamt >= 32 + w + 2:
         return False
     except AssertionError:
@@ -346,7 +346,7 @@ class LowerQadd:
     #   = round(2^-k (a * ia + b * ib)) + z
     #   = round(a * ia + b * ib, k) + z
 
-    [ia, ib], w, shamt = qscale_to_fixpoint([sa, sb])
+    [ia, ib], w, shamt = bit_utils.qscale_to_fixpoint([sa, sb])
     ia = f"algo.ConstantInteger({ia}, Some(algo.IntType({w})))"
     ib = f"algo.ConstantInteger({ib}, Some(algo.IntType({w})))"
 
@@ -466,6 +466,25 @@ class LowerMaxPool2D:
       f"algo.torch.TPool.imax({types.get_element_type(input).name()},"
       f" {has_channel}, {input.name}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq({dilation}))"
+    )
+
+@register_lowering(shin.int_mean.default)
+class LowerMean:
+  @staticmethod
+  def supports(a, dims, keepDim) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a, dims, keepDim) -> str:
+    rank = len(a.meta.get("val").shape)
+
+    # normalize the negative reduction dimensions
+    # (which PyTorch allows but we don't)
+    dims = ", ".join((str(d if d >= 0 else rank + d) for d in dims))
+    keepDim = "true" if keepDim else "false"
+    return (
+      f"algo.torch.TReduce.iavg({types.get_element_type(a).name()},"
+      f" {a.name}, {dims}, {keepDim})"
     )
 
 @register_lowering(shin.int_adaptive_avg_pool2d.default)

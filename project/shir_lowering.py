@@ -160,51 +160,6 @@ class LowerSum:
 
     return lower_reduction(inp, dims, reducer)
 
-@register_operator(shir.int_mean.default)
-class LowerMean:
-  @staticmethod
-  def supports(a, dims, keepDim) -> bool:
-    if shir_type.get_element_type(a) != shir_type.SI(32):
-      return False
-
-    return True
-
-  @staticmethod
-  def lower(x, dims, keepDim) -> str:
-    def reducer(seq, elts):
-      f, w, s = qscale_to_fixpoint([1.0 / elts])
-      clip_bits = max(w + 1 - s, 0)
-      return (
-        f"algo.Sub(algo.Tuple("
-        f"algo.Add2(algo.ConstantInteger(0, Some(algo.SignedIntType(32))),"
-        f" algo.ClipBankersRound("
-        f"algo.Mul(algo.Tuple(algo.ConstantInteger({f[0]},"
-        f" Some(algo.SignedIntType({w + 1}))),"
-        f" _iredsum(algo.SignedIntType(32), {seq}))),"
-        f" {s}, {clip_bits})), algo.ConstantInteger(0)))"
-      )
-
-    # dims may contain negative indices. normalize them first
-    xshape = x.meta.get("val").shape
-    N = len(xshape)
-    dims = [x if x >= 0 else N + x for x in dims]
-
-    reduced = lower_reduction(x, dims, reducer)
-    if not keepDim:
-      return reduced
-
-    if N == len(dims):
-      # promote the full reduction (a scalar) into a tensor
-      reduced = f"algo.Repeat({reduced}, 1)"
-    else:
-      reduced = f"algo.JoinAll({reduced})"
-
-    # every dimension being reduced has now length 1
-    w = ", ".join(
-      ("1" if i in dims else str(d) for i, d in enumerate(xshape))
-    )
-    return f"algo.Join(algo.SplitAll({reduced}, Seq({w})))"
-
 @register_operator(aten.mm.default)
 class LowerMM:
   def supports(lhs, rhs) -> bool:
