@@ -8,9 +8,7 @@ from torch.ao.quantization.quantize_pt2e import (
   prepare_pt2e,
 )
 
-import shir_backend
-import shir_quantizer
-import shir_intrinsic
+import shir
 
 ## uncomment out one of the following set of lines
 # from torchvision.models import vgg11
@@ -32,12 +30,12 @@ model, guards = torchdynamo.export(
   *copy.deepcopy(example_inputs),
   aten_graph=True,
 )
-quantizer = shir_quantizer.BackendQuantizer()
+quantizer = shir.BackendQuantizer()
 
 model = prepare_pt2e(model, quantizer)
 model(*example_inputs)
 model = convert_pt2e(model)
 
 torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
+model = torch.compile(backend=shir.compiler)(model)
 model(*example_inputs)

@@ -3,7 +3,7 @@ Where the lowering of each supported operator actually happens
 """
 
 import torch
-from typing import Tuple
+from typing import Tuple, Optional
 from functools import reduce
 from itertools import chain
 from . import bit_utils, types
@@ -319,6 +319,50 @@ class LowerMin(LowerArithBinaryOperatorTemplate):
   def apply_op(ty, pair):
     return f"algo.Min({pair})"
 
+@register_lowering(shin.qadd.default)
+class LowerQadd:
+  @staticmethod
+  def supports(a, sa, b, sb, z) -> bool:
+    # just like per channel fixed point requant, we can adjust both scales to
+    # the same decimal point, perform the multiplication, add and round, and
+    # do zero point adjustment.
+    #
+    # in theory, we can support any scale. in practice, SHIR does not play
+    # nicely with values beyond 32 bits. (float point hack doesn't work here)
+    try:
+      # both multiplications give 32 + w + 1 bits,
+      # addition gives an extra bit, so 32 + w + 1 + 1 bits.
+      _, w, shamt = qscale_to_fixpoint([sa, sb])
+      if w > 32 or shamt >= 32 + w + 2:
+        return False
+    except AssertionError:
+      return False
+
+    return True
+
+  @staticmethod
+  def lower(a, sa, b, sb, z) -> str:
+    # round(a * sa + b * sb) + z
+    #   = round(2^-k (a * ia + b * ib)) + z
+    #   = round(a * ia + b * ib, k) + z
+
+    [ia, ib], w, shamt = qscale_to_fixpoint([sa, sb])
+    ia = f"algo.ConstantInteger({ia}, Some(algo.IntType({w})))"
+    ib = f"algo.ConstantInteger({ib}, Some(algo.IntType({w})))"
+
+    # shape of a and b are the same
+    rank = len(a.meta.get("val").shape)
+    if rank == 0:
+      return (
+        f"algo.torch.SIRequantAdd32({a.name}, {b.name},"
+        f" {w}, {ia}, {ib}, {shamt}, {z})"
+      )
+
+    return (
+      f"algo.torch.TZipAll(algo.torch.SIRequantAdd32.asFunction("
+      f"{w}, {ia}, {ib}, {shamt}, {z}), {a.name}, {b.name})"
+    )
+
 @register_lowering(aten.relu.default)
 class LowerRelu:
   @staticmethod
@@ -419,7 +463,75 @@ class LowerMaxPool2D:
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     return (
-      f"algo.torch.TMaxPool({types.get_element_type(input).name()},"
+      f"algo.torch.TPool.imax({types.get_element_type(input).name()},"
       f" {has_channel}, {input.name}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq({dilation}))"
     )
+
+@register_lowering(shin.int_adaptive_avg_pool2d.default)
+class LowerAdaptiveAvgPool2D:
+  @classmethod
+  def supports(cls, input, output_size) -> bool:
+    # the "adaptive" aspect of adaptive pooling operators is difficult to
+    # implement correctly.
+    #
+    # fortunately, provided the input is preprocessed correctly, torchvision
+    # models tend to not trigger the difficult cases.
+    #
+    # that means, we only support the case where we can convert it into an
+    # equivalent non-adaptive pooling operator.
+
+    N = 2
+    if N != len(output_size):
+      return False
+
+    ashape = input.meta.get("val").shape
+    if cls._find_equivalent_slide(ashape, output_size) is None:
+      return False
+
+    return True
+
+  @classmethod
+  def lower(cls, input, output_size) -> str:
+    # input is either T[N, i1, i2] or T[N, C, i1, i2]
+    ashape = input.meta.get("val").shape
+    rank = len(ashape)
+
+    rslide_info = cls._find_equivalent_slide(ashape, output_size)
+    has_channel = "true" if rank != 3 else "false"
+    kernel_size = ", ".join((str(d[0]) for d in reversed(rslide_info)))
+    stride = ", ".join((str(d[1]) for d in reversed(rslide_info)))
+    return (
+      f"algo.torch.TPool.iavg({types.get_element_type(input).name()},"
+      f" {has_channel}, {input.name}, Seq({kernel_size}),"
+      f" Seq({stride}), Seq(0, 0), Seq(1, 1))"
+    )
+
+  @staticmethod
+  def _find_equivalent_slide(shape, output_size):
+    # use reversed zip to avoid shape's channel dimension being problematic
+    rev = []
+    for in_size, out_size in zip(reversed(shape), reversed(output_size)):
+      # start uses floor division
+      # end uses ceiling division
+      assert in_size > 0 and out_size > 0
+      last_start = 0
+      last_end = -(in_size // -out_size)
+      window_size = last_end - last_start
+      stride = None
+
+      for i in range(1, out_size):
+        start = i * in_size // out_size
+        end = -((i + 1) * in_size // -out_size)
+        if end - start != window_size:
+          return None
+
+        next_stride = start - last_start
+        if stride is None:
+          stride = next_stride
+        elif stride != next_stride:
+          return None
+
+        last_start, last_end = start, end
+      rev.append((window_size, stride or 1))
+    return rev
