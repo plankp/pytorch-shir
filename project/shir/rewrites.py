@@ -40,6 +40,10 @@ class QuantOpRewrite:
       return True
     if self._rewrite_hardtanh(n):
       return True
+    if self._rewrite_hardsigmoid(n):
+      return True
+    if self._rewrite_hardswish(n):
+      return True
     if self._rewrite_add(n):
       return True
 
@@ -705,6 +709,104 @@ class QuantOpRewrite:
     return True
 
   """
+  q(hardsigmoid(dq(X)))
+    = requant(x - zx + 3/sx, 256/6 sx, -128)
+
+  Notes:
+  *  provded the output qparam has scale of 1/256 and zero point of -128
+  *  3/sx we approximate it with a integer.
+  """
+
+  def _match_hardsigmoid(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_act = node_q_output.args[0]
+    if node_act.op != "call_function" or node_act.target != aten.hardsigmoid.default:
+      return None
+
+    node_dq_input = node_act.args[0]
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    if qparam_out != (1/256.0, -128):
+      return None
+
+    return (
+      node_dq_input.args[0],
+      qparam_input
+    )
+
+  def _rewrite_hardsigmoid(self, anchor: Node) -> bool:
+    node_map = self._match_hardsigmoid(anchor)
+    if node_map is None:
+      return False
+
+    [x_node, (s_x, z_x)] = node_map
+    s_out = s_x * 256.0 / 6.0
+    z_out = -128
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (x_node,))
+      n2 = graph.call_function(aten.sub, (n1, z_x - round(3 / s_x)))
+      n3 = graph.call_function(shin.requantize, (n2, s_out, z_out))
+
+    anchor.replace_all_uses_with(n3)
+    return True
+
+  """
+  q(hardswish(dq(X)))
+    = q(1/6 sx^2 (x - zx) clamp(x - zx + 3/sx, 0, 6/sx))
+
+  As in hardsigmoid, 3/sx and 6/sx are approximated using integers
+  """
+
+  def _match_hardswish(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_act = node_q_output.args[0]
+    if node_act.op != "call_function":
+      return None
+    if node_act.target not in {aten.hardswish.default, aten.hardswish_.default}:
+      return None
+
+    node_dq_input = node_act.args[0]
+    qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
+    if not qparam_input:
+      return None
+
+    return (
+      node_dq_input.args[0],
+      qparam_input,
+      qparam_out,
+    )
+
+  def _rewrite_hardswish(self, anchor: Node) -> bool:
+    node_map = self._match_hardswish(anchor)
+    if node_map is None:
+      return False
+
+    [x_node, (s_x, z_x), (s_out, z_out)] = node_map
+    k = s_x / s_out * s_x / 6
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (x_node,))
+      n2 = graph.call_function(aten.sub, (n1, z_x - round(3 / s_x)))
+      n3 = graph.call_function(aten.clamp, (n2, 0, round(6 / s_x)))
+      n4 = graph.call_function(aten.sub, (n1, z_x))
+      n5 = graph.call_function(aten.mul, (n3, n4))
+      n6 = graph.call_function(shin.requantize, (n5, k, z_out))
+
+    anchor.replace_all_uses_with(n6)
+    return True
+
+  """
   IF X and Y have the same qparams:
   q(dq(X) + dq(Y))
     = q(s (X + Y - 2z))   <-- provided 2z does not overflow (unlikely)
@@ -724,7 +826,9 @@ class QuantOpRewrite:
       return None
 
     node_add = node_q_output.args[0]
-    if node_add.op != "call_function" or node_add.target != aten.add.Tensor:
+    if node_add.op != "call_function":
+      return None
+    if node_add.target not in {aten.add.Tensor, aten.add_.Tensor}:
       return None
 
     node_dq_lhs = node_add.args[0]

@@ -36,6 +36,7 @@ from torch.ao.quantization.pt2e.quantizer.quantizer import (
   Quantizer,
   QuantizationAnnotation,
   SharedQuantizationSpec,
+  FixedQParamsQuantizationSpec,
 )
 from torch.ao.quantization.observer import (
   HistogramObserver,
@@ -60,6 +61,17 @@ _act_qspec = QuantizationSpec(
   qscheme=torch.per_tensor_affine,
   is_dynamic=False,
   observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=2**-12),
+)
+
+# occasionally, it makes sense for some operators (like hardsigmoid) to have a
+# predefined quantization parameter that spans across the whole int8 range.
+_fixed_i8_qspec = FixedQParamsQuantizationSpec(
+  dtype=torch.int8,
+  quant_min=-128,
+  quant_max=127,
+  qscheme=torch.per_tensor_affine,
+  scale=1.0 / 256.0,
+  zero_point=-128,
 )
 
 # for weights, we want to use symmetric scheme to avoid doing too much weight
@@ -109,6 +121,13 @@ _qconfig_per_channel = QuantizationConfig(
   _act_qspec,
   _act_qspec,
   _weight_qspec_per_channel,
+  _bias_qspec,
+)
+
+_qconfig_fixed_output = QuantizationConfig(
+  _act_qspec,
+  _fixed_i8_qspec,
+  _weight_qspec_per_tensor,
   _bias_qspec,
 )
 
@@ -191,6 +210,11 @@ class BackendQuantizer(Quantizer):
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
     self._annotate_add(gm, qconfig)
+    self._annotate_activation([torch.nn.Hardswish], gm, qconfig)
+
+    # hardsigmoid (and friends?) have fixed output range
+    qconfig = _qconfig_fixed_output
+    self._annotate_activation([torch.nn.Hardsigmoid], gm, qconfig)
 
     # ops that may depend (and even override) earlier annotations
     self._annotate_in_out_shared_qspec(_OPS_IN_OUT_SHARING, gm)
@@ -425,6 +449,22 @@ class BackendQuantizer(Quantizer):
       _annotate_input_qspec_map(add_node, lhs, input_qspec)
       _annotate_input_qspec_map(add_node, rhs, input_qspec)
       _annotate_output_qspec(add_node, output_qspec)
+      _mark_nodes_as_annotated([*p.nodes])
+
+  def _annotate_activation(self, ops: List[Callable], gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    input_qspec = get_input_act_qspec(qconfig)
+    output_qspec = get_output_act_qspec(qconfig)
+
+    all_partitions = get_source_partitions(gm.graph, ops)
+    partitions = list(itertools.chain(*all_partitions.values()))
+    for p in partitions:
+      out = p.output_nodes[0]
+      inp = p.input_nodes[0]
+      if _is_annotated([out]):
+        continue
+
+      _annotate_input_qspec_map(out, inp, input_qspec)
+      _annotate_output_qspec(out, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
   def _annotate_in_out_shared_qspec(self, ops: List[Callable], gm: torch.fx.GraphModule):
