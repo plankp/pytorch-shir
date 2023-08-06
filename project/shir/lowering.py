@@ -196,7 +196,7 @@ class LowerConvEltTy:
     else:
       # sign extend (assert is for sanity purposes)
       assert ss and sbits < dbits
-      inner = f"algo.Sub(algo.Tuple(core.ParamUse(_0), algo.ConstantInteger(0, Some(algo.IntType({dbits})))))"
+      inner = f"algo.Add2(core.ParamUse(_0), algo.ConstantInteger(0, Some(algo.SignedIntType({dbits}))))"
       if not ds:
         # convert from signed to unsigned
         inner = f"core.Conversion({inner}, {dtype.name()})"
