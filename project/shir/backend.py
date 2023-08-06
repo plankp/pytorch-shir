@@ -89,7 +89,7 @@ class SHIRGraphModule(torch.nn.Module):
     result = self.gm(*args)
 
     if _CONF_EMIT_DATA_FILES:
-      data_dir = os.path.join(_CONF_EMIT_OUTPUT_DIR, f"data_{self._call_id}")
+      data_dir = os.path.join(_CONF_EMIT_OUTPUT_DIR, f"data{self._inst_id}_{self._call_id}")
       if not os.path.exists(data_dir):
         os.mkdir(data_dir)
 
