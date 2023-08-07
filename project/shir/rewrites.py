@@ -584,7 +584,30 @@ class QuantOpRewrite:
       return None
 
     node_pool = node_q_output.args[0]
-    if node_pool.op != "call_function" or node_pool.target != aten._adaptive_avg_pool2d.default:
+    if node_pool.op != "call_function":
+      return None
+
+    # we might come across _adaptive_avg_pool2d OR avg_pool2d.
+    pool_func = None
+    pool_args = None
+    if node_pool.target == aten._adaptive_avg_pool2d.default:
+      # since we don't have the shape information, assume we can lower it.
+      pool_func = shin.int_adaptive_avg_pool2d
+      pool_args = (node_pool.args[1],)
+    elif node_pool.target == aten.avg_pool2d.default:
+      # make sure it is something we can lower
+      args = _get_all_arguments(node_pool.args, node_pool.kwargs, node_pool.target._schema.arguments)
+      if (
+        not args[4]           # ceiling mode is false
+        and args[5]           # padded zeros count towards the divisor
+        and args[6] is None   # apparently aten.avg_pool2d allows a predefined divisor
+      ):
+        # avg_pool2d allows empty stride.
+        # it defaults to the same thing as kernel_size
+        pool_func = shin.int_avg_pool2d
+        pool_args = (args[1], args[2] or args[1], args[3])
+
+    if pool_func is None:
       return None
 
     node_dq_input = node_pool.args[0]
@@ -597,7 +620,8 @@ class QuantOpRewrite:
       return None
 
     return (
-      node_pool.args[1],
+      pool_func,
+      pool_args,
       node_dq_input.args[0],
     )
 
@@ -606,12 +630,12 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [output_size, x] = node_map
+    [pool_func, pool_args, x] = node_map
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(shin.int_adaptive_avg_pool2d, (n1, output_size))
+      n2 = graph.call_function(pool_func, (n1, *pool_args))
       n3 = graph.call_method("to", (n2, torch.int8))
 
     anchor.replace_all_uses_with(n3)

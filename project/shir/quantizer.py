@@ -187,6 +187,7 @@ _OPS_IN_OUT_SHARING = [
   torch.nn.Hardtanh,
   torch.nn.MaxPool2d,
   torch.nn.AdaptiveAvgPool2d,
+  torch.nn.functional.avg_pool2d,
   torch.ops.shir_intrinsic.flatten,
 ]
 

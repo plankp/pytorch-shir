@@ -21,9 +21,7 @@ from torch.ao.quantization.quantize_pt2e import (
   prepare_pt2e,
 )
 
-import shir_backend
-import shir_quantizer
-import shir_intrinsic
+import shir
 
 class Net(nn.Module):
   def __init__(self):
@@ -60,14 +58,14 @@ model, guards = torchdynamo.export(
   aten_graph=True,
 )
 
-quantizer = shir_quantizer.BackendQuantizer()
+quantizer = shir.BackendQuantizer()
 
-model = prepare_pt2e_quantizer(model, quantizer)
+model = prepare_pt2e(model, quantizer)
 model(*example_inputs)  # calibration
 model = convert_pt2e(model)
 
 torchdynamo.reset()
-model = torch.compile(backend=shir_backend.compiler)(model)
+model = torch.compile(backend=shir.compiler)(model)
 model(*example_inputs)
 
 test_loop(test_dataloader, model, loss_fn)

@@ -487,6 +487,31 @@ class LowerMean:
       f" {a.name}, {dims}, {keepDim})"
     )
 
+@register_lowering(shin.int_avg_pool2d.default)
+class LowerAvgPool2D:
+  @staticmethod
+  def supports(input, kernel_size, stride, padding) -> bool:
+    N = 2
+    if N != len(kernel_size) or N != len(stride) or N != len(padding):
+      return False
+    return True
+
+  @staticmethod
+  def lower(input, kernel_size, stride, padding) -> str:
+    # input is either T[N, i1, i2] or T[N, C, i1, i2]
+    ashape = input.meta.get("val").shape
+    rank = len(ashape)
+
+    has_channel = "true" if rank != 3 else "false"
+    kernel_size = ", ".join((str(d) for d in kernel_size))
+    stride = ", ".join((str(d) for d in stride))
+    padding = ", ".join((str(d) for d in padding))
+    return (
+      f"algo.torch.TPool.iavg({types.get_element_type(input).name()},"
+      f" {has_channel}, {input.name}, Seq({kernel_size}),"
+      f" Seq({stride}), Seq({padding}), Seq(1, 1))"
+    )
+
 @register_lowering(shin.int_adaptive_avg_pool2d.default)
 class LowerAdaptiveAvgPool2D:
   @classmethod

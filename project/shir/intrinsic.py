@@ -141,6 +141,16 @@ def int_adaptive_avg_pool2d(self, output_size):
   return aten._adaptive_avg_pool2d(self.float(), output_size).to(self.dtype)
 
 shir_intrinsic_lib.define(
+  "int_avg_pool2d(Tensor self, int[2] kernel_size, int[2] stride, int[2] padding) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "int_avg_pool2d", "CompositeExplicitAutograd")
+def int_avg_pool2d(self, kernel_size, stride, padding):
+  assert self.dtype == torch.int32
+  assert len(kernel_size) == len(stride) == len(padding) == 2
+  return torch.round(aten.avg_pool2d(self.float(), kernel_size, stride, padding)).to(self.dtype)
+
+shir_intrinsic_lib.define(
   "int_mean(Tensor self, int[]? dim, bool keepDim) -> Tensor"
 )
 
