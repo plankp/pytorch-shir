@@ -61,6 +61,36 @@ def _tensor_to_matrix_csv(t: torch.Tensor, f):
       print(row[i].item(), ",", sep="", end="", file=f)
     print(row[d - 1].item(), file=f)
 
+def _collect_placeholders(gm: torch.fx.GraphModule) -> List[str]:
+  placeholders = []
+  for n in gm.graph.nodes:
+    if n.op != "placeholder":
+      continue
+
+    tinfo = n.meta.get("val")
+    assert tinfo is not None, "Placeholder must be a tensor"
+    assert all((isinstance(d, int) for d in tinfo.shape)), "Dynamic shapes are not supported"
+
+    placeholders.append(n.target)
+  return placeholders
+
+def _has_many_uses(node: torch.fx.Node) -> bool:
+  user_count = len(node.users)
+  if user_count > 1:
+    return True
+
+  used = False
+  for user in node.users:
+    # each user may have multiple occurrences / uses of a single node
+    for n in user.all_input_nodes:
+      if n != node:
+        continue
+      if used:
+        return True
+      used = True
+
+  return False
+
 class SHIRGraphModule(torch.nn.Module):
   _iid_couter = count()   # assigns a number of each instance
 
@@ -111,20 +141,8 @@ class SHIRGraphModule(torch.nn.Module):
       self._force_compile()
       self._compiled = True
 
-  def _collect_placeholders(self):
-    self._placeholders = []
-    for n in self.gm.graph.nodes:
-      if n.op != "placeholder":
-        continue
-
-      tinfo = n.meta.get("val")
-      assert tinfo is not None, "Placeholder must be a tensor"
-      assert all((isinstance(d, int) for d in tinfo.shape)), "Dynamic shapes are not supported"
-
-      self._placeholders.append(n.target)
-
   def _force_compile(self):
-    self._collect_placeholders()
+    self.placeholders = _collect_placeholders(self.gm)
     clname = f"Module{self._inst_id}"
     with open(
       os.path.join(_CONF_EMIT_OUTPUT_DIR, f"{clname}.scala"), "w", encoding="utf-8"
@@ -169,26 +187,43 @@ class SHIRGraphModule(torch.nn.Module):
       print("}", file=f)
 
   def _emit_body(self, f):
+    lets_needed = 0
     for n in self.gm.graph.nodes:
-      # input (placeholder) and output nodes must be 2D in SHIR.
+      # assume every node that has many uses needs to be let-bound,
+      # which is definitely the case for tensors (which are SeqType's)
+      has_many_uses = _has_many_uses(n)
+      if has_many_uses:
+        lets_needed += 1
+
+      # furthermore, input (placeholder) and output nodes must be 2D in SHIR.
       match n.op:
         case "placeholder":
           typ = types.get_element_type(n)
-          shape = n.meta.get("val").shape
-          print(
-            "    val ", n.name,
-            " = core.TypeChecker.check(algo.torch.TInput(",
-            typ.name(), ", \"", n.target, "\", Seq(",
-            ", ".join((str(d) for d in shape)),
-            ")))",
-            sep="", file=f
-          )
+          shape = ", ".join((str(d) for d in n.meta.get("val").shape))
+
+          if has_many_uses:
+            print(
+              "  { val _init = core.TypeChecker.check(algo.torch.TInput(",
+              typ.name(), ", \"", n.target, "\", Seq(", shape, ")))\n",
+              "    val _param = core.ParamDef(_init.t)\n",
+              "    core.Let(_param,\n",
+              "  { val ", a.name, " = core.ParamUse(_param)",
+              sep="", file=f
+            )
+          else:
+            print(
+              "    val ", n.name,
+              " = core.TypeChecker.check(algo.torch.TInput(",
+              typ.name(), ", \"", n.target, "\", Seq(", shape, ")))",
+              sep="", file=f
+            )
 
         case "output":
           # sometimes, due to unfortunate graph slicing, we may end up with
           # multiple outputs, which we cannot handle
           [retv] = n.args
           assert isinstance(retv, torch.fx.Node), "Only single node output is allowed"
+          assert not has_many_uses  # not sure what this failing would mean...
 
           shape = retv.meta.get("val").shape
           dims = len(shape)
@@ -200,18 +235,30 @@ class SHIRGraphModule(torch.nn.Module):
             v = f"algo.Repeat({v}, 1)"
           if dims > 2:
             v = f"algo.torch.TFlatten({v}, 1, {dims - 1})"
-          print("    return core.TypeChecker.check(", v, ")", sep="", file=f)
+          print("    core.TypeChecker.check(", v, ")", sep="", file=f)
 
         case "call_function":
           obj = lowering.fetch_lowering(n.target)
-          print(
-            "    val ", n.name, " = core.TypeChecker.check(",
-            obj.lower(*n.args, **n.kwargs), ")",
-            sep="", file=f
-          )
+          expr = obj.lower(*n.args, **n.kwargs)
+          if has_many_uses:
+            print(
+              "    val _init = core.TypeChecker.check(", expr, ")\n",
+              "    val _param = core.ParamDef(_init.t)\n",
+              "    core.Let(_param,\n",
+              "  { val ", n.name, " = core.ParamUse(_param)",
+              sep="", file=f
+            )
+          else:
+            print(
+              "    val ", n.name, " = core.TypeChecker.check(", expr, ")",
+              sep="", file=f
+            )
 
         case _:
           assert False, "Unhandled fx node type when emitting"
+
+    for _ in range(lets_needed):
+      print("  }, _init)", file=f)
 
 class SHIROperatorSupport(OperatorSupport):
   def is_node_supported(self, submodules, n: torch.fx.Node) -> bool:
