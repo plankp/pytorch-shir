@@ -209,7 +209,7 @@ class BackendQuantizer(Quantizer):
     qconfig = _qconfig_per_tensor
     self._annotate_linear_relu(gm, qconfig)
     self._annotate_linear(gm, qconfig)
-    self._annotate_add(gm, qconfig)
+    self._annotate_bin_op(gm, qconfig)
     self._annotate_activation([torch.nn.Hardswish], gm, qconfig)
 
     # hardsigmoid (and friends?) have fixed output range
@@ -422,33 +422,30 @@ class BackendQuantizer(Quantizer):
       _annotate_output_qspec(conv_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
-  def _annotate_add(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+  def _annotate_bin_op(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
     input_qspec = get_input_act_qspec(qconfig)
     output_qspec = get_output_act_qspec(qconfig)
 
-    all_partitions = get_source_partitions(gm.graph, [operator.add, torch.add])
+    all_partitions = get_source_partitions(gm.graph, [
+      torch.add,
+      operator.add,
+      operator.iadd,  # some models accumulate residuals with +=
+
+      torch.mul,
+      operator.mul,
+    ])
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:
-      add_node = p.output_nodes[0]
-      if _is_annotated([add_node]):
+      node = p.output_nodes[0]
+      if _is_annotated([node]):
         continue
 
-      lhs = add_node.args[0]
-      rhs = add_node.args[1]
+      lhs = node.args[0]
+      rhs = node.args[1]
 
-      # if we do want both inputs to have the same qparam,
-      # see https://discuss.pytorch.org/t/share-qparams-in-pt2e/185266
-      #
-      # alas, the solution is tricky once we start using different qspecs,
-      # which is not great.
-      #
-      # but thankfully, we can implement the general case using fixed point
-      # arithmetic provided that the fractional scaling factor can be
-      # arbitrary large! (see reasoning in shir-lowering)
-
-      _annotate_input_qspec_map(add_node, lhs, input_qspec)
-      _annotate_input_qspec_map(add_node, rhs, input_qspec)
-      _annotate_output_qspec(add_node, output_qspec)
+      _annotate_input_qspec_map(node, lhs, input_qspec)
+      _annotate_input_qspec_map(node, rhs, input_qspec)
+      _annotate_output_qspec(node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
   def _annotate_activation(self, ops: List[Callable], gm: torch.fx.GraphModule, qconfig: QuantizationConfig):

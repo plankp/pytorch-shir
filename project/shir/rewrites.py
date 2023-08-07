@@ -46,6 +46,8 @@ class QuantOpRewrite:
       return True
     if self._rewrite_add(n):
       return True
+    if self._rewrite_mul(n):
+      return True
 
     return False
 
@@ -842,7 +844,6 @@ class QuantOpRewrite:
     if not qparam_rhs:
       return None
 
-
     return (
       node_dq_lhs.args[0],
       node_dq_rhs.args[0],
@@ -884,6 +885,60 @@ class QuantOpRewrite:
       n5 = graph.call_function(functional.qadd, (n2, s_x / s_out, n4, s_y / s_out, z_out))
 
     anchor.replace_all_uses_with(n5)
+    return True
+
+  """
+  q(dq(X) dq(Y))
+    = q(sx sy (X - zx) (Y - zy))
+  """
+
+  def _match_mul(self, node_q_output: Node):
+    qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
+    if not qparam_out:
+      return None
+
+    node_mul = node_q_output.args[0]
+    if node_mul.op != "call_function":
+      return None
+    if node_mul.target not in {aten.mul.Tensor, aten.mul_.Tensor}:
+      return None
+
+    node_dq_lhs = node_mul.args[0]
+    node_dq_rhs = node_mul.args[1]
+
+    qparam_lhs = self.fetch_dequant_per_tensor(node_dq_lhs, -128, 127, torch.int8)
+    if not qparam_lhs:
+      return None
+
+    qparam_rhs = self.fetch_dequant_per_tensor(node_dq_rhs, -128, 127, torch.int8)
+    if not qparam_rhs:
+      return None
+
+    return (
+      node_dq_lhs.args[0],
+      node_dq_rhs.args[0],
+      qparam_lhs,
+      qparam_rhs,
+      qparam_out,
+    )
+
+  def _rewrite_mul(self, anchor: Node) -> bool:
+    node_map = self._match_mul(anchor)
+    if node_map is None:
+      return False
+
+    [lhs_node, rhs_node, (s_x, z_x), (s_y, z_y), (s_out, z_out)] = node_map
+
+    graph = self.gm.graph
+    with graph.inserting_before(anchor):
+      n1 = graph.call_method("int", (lhs_node,))
+      n2 = graph.call_function(aten.sub, (n1, z_x))
+      n3 = graph.call_method("int", (rhs_node,))
+      n4 = graph.call_function(aten.sub, (n3, z_y))
+      n5 = graph.call_function(aten.mul, (n2, n4))
+      n6 = graph.call_function(shin.requantize, (n5, s_x * s_y / s_out, z_out))
+
+    anchor.replace_all_uses_with(n6)
     return True
 
 def rewrite_quantized_ops(gm: GraphModule):
