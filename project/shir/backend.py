@@ -142,7 +142,7 @@ class SHIRGraphModule(torch.nn.Module):
       self._compiled = True
 
   def _force_compile(self):
-    self.placeholders = _collect_placeholders(self.gm)
+    self._placeholders = _collect_placeholders(self.gm)
     clname = f"Module{self._inst_id}"
     with open(
       os.path.join(_CONF_EMIT_OUTPUT_DIR, f"{clname}.scala"), "w", encoding="utf-8"
