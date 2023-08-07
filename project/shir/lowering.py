@@ -76,7 +76,6 @@ class LowerShirRequantizeChannel:
     except AssertionError:
       fixpoint_method = False
 
-    fixpoint_method = False
     # synthesize the requant function and the stream of scales
     #
     # the main takeaway is that ConstantSeq has last element first,
