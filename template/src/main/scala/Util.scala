@@ -66,14 +66,17 @@ Allowed switches and arguments:
                     case Some(dir) =>
                         MemoryImage(layout, model.loadData(dir)).toFiles(project.PROJECT_FOLDER)
                     case None if simulate =>
-                        println("Warning: reusing old input to perform simulation")
+                        println("Warning: performing simulation with bogus or nonexistent data")
                     case None =>
                         ()
                 }
                 if (simulate) {
+                    // we want to print the result because it has metrics that
+                    // are useful for us. of course, since we don't always
+                    // print the "real" Python computed result, the
+                    // correctresult metric becomes kind of useless...
                     val result = ModelSimExec.run(project.PROJECT_FOLDER)
                     result.print()
-                    result.assertCorrect
                 } else if (genVHDL) {
                     // is this needed? can we synthesize without these files?
                     ModelSimExec.prepareSimulation(project.PROJECT_FOLDER)

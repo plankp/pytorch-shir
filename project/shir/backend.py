@@ -15,12 +15,15 @@ from functools import reduce
 from itertools import count
 import os
 import shutil
+import subprocess
 
 # some debug flags and configuration stuff
 _CONF_EMIT_SHIR_CODE = True
 _CONF_EMIT_DATA_FILES = True
+_CONF_EMIT_REAL_RESULT = False
 _CONF_EMIT_OUTPUT_DIR = "./data/generated"
 _CONF_TEMPLATE_DIR = "./template"
+_CONF_PERFORM_SIMULATION = False
 
 # some namespace aliases
 aten = torch.ops.aten
@@ -128,25 +131,37 @@ class SHIRGraphModule(torch.nn.Module):
     self._call_id += 1
     self.compile()
 
-    result = self.gm(*args)
+    if not _CONF_EMIT_DATA_FILES:
+      # if you aren't going to emit data files, then obviously the compiled
+      # model won't have anything to work with.
+      #
+      # in that case, we have Python evaluate the result using the fx graph.
+      return self.gm(*args)
 
-    if _CONF_EMIT_DATA_FILES:
-      data_dir = os.path.join(self._output_dir, f"data_{self._call_id}")
-      if not os.path.exists(data_dir):
-        os.mkdir(data_dir)
+    data_dir = os.path.join(self._output_dir, f"data_{self._call_id}")
+    if not os.path.exists(data_dir):
+      os.mkdir(data_dir)
 
-      for i, arg in enumerate(args):
-        with open(
-          os.path.join(data_dir, f"arg{i}.csv"), "w", encoding="utf-8"
-        ) as argf:
-          _tensor_to_matrix_csv(arg, argf)
+    for i, arg in enumerate(args):
+      with open(os.path.join(data_dir, f"arg{i}.csv"), "w", encoding="utf-8") as argf:
+        _tensor_to_matrix_csv(arg, argf)
 
-      with open(
-        os.path.join(data_dir, "result.csv"), "w", encoding="utf-8"
-      ) as resf:
+    result = None
+    if not _CONF_PERFORM_SIMULATION or _CONF_EMIT_REAL_RESULT:
+      result = self.gm(*args)
+
+    if _CONF_EMIT_REAL_RESULT:
+      # as mentioned in _emit_method_load_data, it will only load the data
+      # if we requested it to do so in the first place.
+      with open(os.path.join(data_dir, "result.csv"), "w", encoding="utf-8") as resf:
         _tensor_to_matrix_csv(result, resf)
 
-    return result
+    if not _CONF_PERFORM_SIMULATION:
+      return result
+
+    # at this point, we want to generate data and simulate,
+    # but we don't want to generating VHDL.
+    subprocess.run(['sbt', f'run --no-gen --sim "{data_dir}"'], check=True, cwd=self._output_dir)
 
   def compile(self):
     if self._compiled:
@@ -157,6 +172,7 @@ class SHIRGraphModule(torch.nn.Module):
       self._prepare_directory()
     if _CONF_EMIT_SHIR_CODE:
       self._emit_source()
+      subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self._output_dir)
 
   def _prepare_directory(self):
     # purge the output directory
@@ -185,25 +201,39 @@ class SHIRGraphModule(torch.nn.Module):
       print("  val name: String = \"", clname, "\"", sep="", file=f)
       print(file=f)
 
-      print("  def main(args: Array[String]): Unit = {", file=f)
-      print("    Util.drive(this, args)", file=f)
-      print("  }", file=f)
+      print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
       print(file=f)
 
-      print("  def generateIR(): Expr = {", file=f)
-      self._emit_body(f)
-      print("  }", file=f)
+      self._emit_method_generate_ir(f)
       print(file=f)
 
-      print("  def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
-      for i, arg in enumerate(self._inout_nodes[0]):
-        print("    \"", arg, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
-      print("    \"result\" -> Util.readIntCSV(Paths.get(folder, \"result.csv\").toFile())", file=f)
-      print("  )", file=f)
+      self._emit_method_load_data(f)
       print(file=f)
+
       print("}", file=f)
 
-  def _emit_body(self, f):
+  def _emit_method_load_data(self, f):
+    print("  def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
+
+    # inputs are always taken from .csv's
+    for i, arg in enumerate(self._inout_nodes[0]):
+      print("    \"", arg, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
+
+    # result depends on if we want ModelSim to check for exact matches.
+    # if we do, then clearly it also comes from .csv's.
+    # if we don't, then we can just create a matrix of zeros
+    if _CONF_EMIT_REAL_RESULT:
+      print("    \"result\" -> Util.readIntCSV(Paths.get(folder, \"result.csv\").toFile())", file=f)
+    else:
+      shape = self._inout_nodes[1].meta.get("val").shape
+      inner = reduce(lambda x, y: x * y, shape[1:], 1)
+      print("    \"result\" -> UniformSeq(UniformSeq(0, ", inner, "), ", shape[0], ")", sep="", file=f)
+
+    print("  )", file=f)
+
+  def _emit_method_generate_ir(self, f):
+    print("  def generateIR(): Expr = {", file=f)
+
     lets_needed = 0
     for n in self.gm.graph.nodes:
       # assume every node that has many uses needs to be let-bound,
@@ -276,6 +306,8 @@ class SHIRGraphModule(torch.nn.Module):
 
     for _ in range(lets_needed):
       print("  }, _init)", file=f)
+
+    print("  }", file=f)
 
 class SHIROperatorSupport(OperatorSupport):
   def is_node_supported(self, submodules, n: torch.fx.Node) -> bool:
