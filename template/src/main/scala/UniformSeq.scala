@@ -10,7 +10,7 @@ class UniformSeq[T] (value: T, len: Int) extends Seq[T] {
         if (0 <= i && i < len)
             value
         else
-            throw new IndexOutOfBoundsException(i)
+            throw new IndexOutOfBoundsException(s"Index ${i} is not in [0, ${len})")
 
     def length: Int = len
 

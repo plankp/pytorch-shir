@@ -161,7 +161,11 @@ class SHIRGraphModule(torch.nn.Module):
 
     # at this point, we want to generate data and simulate,
     # but we don't want to generating VHDL.
-    subprocess.run(['sbt', f'run --no-gen --sim "{data_dir}"'], check=True, cwd=self._output_dir)
+    #
+    # here, since the current working directory is already inside the output
+    # directory, reference the particular data folder name directly instead of
+    # using data_dir (since data_dir may contain relative paths, which is bad)
+    subprocess.run(['sbt', f'run --no-gen --sim "data_{self._call_id}"'], check=True, cwd=self._output_dir)
 
   def compile(self):
     if self._compiled:
@@ -227,7 +231,7 @@ class SHIRGraphModule(torch.nn.Module):
     else:
       shape = self._inout_nodes[1].meta.get("val").shape
       inner = reduce(lambda x, y: x * y, shape[1:], 1)
-      print("    \"result\" -> UniformSeq(UniformSeq(0, ", inner, "), ", shape[0], ")", sep="", file=f)
+      print("    \"result\" -> new UniformSeq(new UniformSeq(0, ", inner, "), ", shape[0], ")", sep="", file=f)
 
     print("  )", file=f)
 
