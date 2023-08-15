@@ -197,22 +197,21 @@ class SHIRGraphModule(torch.nn.Module):
       print("import core._", file=f)
       print("import algo._", file=f)
       print("import java.nio.file.Paths", file=f)
-      print(file=f)
 
-      print("object", clname, " extends GeneratedModel {", file=f)
       print(file=f)
+      print("object", clname, "extends GeneratedModel {", file=f)
 
+      print(file=f)
       print("  val name: String = \"", clname, "\"", sep="", file=f)
-      print(file=f)
 
+      print(file=f)
       print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
-      print(file=f)
 
+      print(file=f)
       self._emit_method_generate_ir(f)
-      print(file=f)
 
-      self._emit_method_load_data(f)
       print(file=f)
+      self._emit_method_load_data(f)
 
       print("}", file=f)
 
