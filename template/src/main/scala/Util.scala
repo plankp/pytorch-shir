@@ -13,9 +13,9 @@ program [dir] [flags]
 Allowed switches and arguments:
   dir               data directory
   -h | --help       display this message
-  --gen             generates the output directory and VHDL files (default)
+  --gen             generates the necessary hardware files (default)
   --no-gen          opposite of --gen
-  --sim             performs simulation with existing VHDL files (default)
+  --sim             performs simulation with whatever was generated (default)
   --no-sim          opposite of --sim
 """
 
@@ -57,25 +57,34 @@ Allowed switches and arguments:
         processArgv(args) match {
             case None => ()
             case Some((inputDir, genVHDL, simulate)) =>
-                val project = HDLProject(model.name, model.generateIR())
-                lazy val layout = MemoryLayout(project.compiledExpr)
+                // compute it here instead of going through HDLProject
+                // (which would cause IR generation even when unnecessary)
+                val projectFolder = s"out/${model.name}"
 
-                if (genVHDL)
+                if (genVHDL) {
+                    // also generate the memory layout file so that the Python
+                    // side can use this information to generate memory images.
+                    val project = HDLProject(model.name, model.generateIR())
+                    assert(project.PROJECT_FOLDER == projectFolder, "HDLProject is working with a different folder!")
                     project.writeHDLFiles()
+                    MemoryLayout(project.compiledExpr).toFile("memory.layout", projectFolder)
+                }
+
                 inputDir match {
                     case Some(dir) =>
-                        MemoryImage(layout, model.loadData(dir)).toFiles(project.PROJECT_FOLDER)
+                        val layout = MemoryLayout.fromFile(s"${projectFolder}/memory.layout")
+                        MemoryImage(layout, model.loadData(dir)).toFiles(projectFolder)
                     case None if simulate =>
-                        println("Warning: performing simulation with bogus or nonexistent data")
-                    case None =>
-                        ()
+                        println("Warning: performing simulation with potentially outdated or even nonexistent data")
+                    case None => ()
                 }
+
                 if (simulate) {
                     // we want to print the result because it has metrics that
                     // are useful for us. of course, since we don't always
                     // print the "real" Python computed result, the
                     // correctresult metric becomes kind of useless...
-                    val result = ModelSimExec.run(project.PROJECT_FOLDER)
+                    val result = ModelSimExec.run(projectFolder)
                     result.print()
                 }
         }
