@@ -77,9 +77,6 @@ Allowed switches and arguments:
                     // correctresult metric becomes kind of useless...
                     val result = ModelSimExec.run(project.PROJECT_FOLDER)
                     result.print()
-                } else if (genVHDL) {
-                    // is this needed? can we synthesize without these files?
-                    ModelSimExec.prepareSimulation(project.PROJECT_FOLDER)
                 }
         }
     }
