@@ -20,6 +20,12 @@ class SI:
   def maxval(self) -> int:
     return (1 << (self.bits - 1)) - 1
 
+  def cast(self, i: int) -> int:
+    i &= ((1 << self.bits) - 1)
+    if i & (1 << (self.bits - 1)):
+      return -((1 << self.bits) - i)
+    return i
+
 @dataclass(frozen=True)
 class UI:
   bits: int   # must be at least 1
@@ -32,6 +38,9 @@ class UI:
 
   def maxval(self) -> int:
     return (1 << self.bits) - 1
+
+  def cast(self, i: int) -> int:
+    return i & ((1 << self.bits) - 1)
 
 def unpack_int_type(ty) -> Tuple[bool, int]:
   match ty:
