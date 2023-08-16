@@ -3,7 +3,7 @@ Where the SHIRGraphModule is defined
 """
 
 import torch
-from typing import Tuple, List, Optional
+from typing import Any, Tuple, List, Dict, Optional, Union
 from . import lowering, types
 from functools import reduce
 from itertools import count
@@ -35,6 +35,29 @@ def _tensor_to_matrix_csv(t: torch.Tensor, f):
     for i in range(d - 1):
       print(row[i].item(), ",", sep="", end="", file=f)
     print(row[d - 1].item(), file=f)
+
+def _load_memory_layout_file(fname: str) -> List[Tuple[str, int, Union[types.SI, types.UI], List[int]]]:
+  # this is actually good enough for our purposes
+  # since we're limited to the types supported by PyTorch!
+  supported_types = {
+    "u8": types.UI(8),
+    "s8": types.SI(8),
+    "s16": types.SI(16),
+    "s32": types.SI(32),
+    "s64": types.SI(64),
+  }
+  entries = []
+  with open(fname, "r") as f:
+    while True:
+      line1 = f.readline()
+      if not line1:
+        break
+
+      line2 = f.readline()
+      (name, addr, ty) = line1.rstrip().split("\t")
+      dims = [int(d) for d in line2.rstrip().split(",")]
+      entries.append((name, int(addr, 16), supported_types[ty], dims))
+  return entries
 
 def _load_result_from_memfile(fname: str, result: torch.Tensor) -> torch.Tensor:
   original_shape = result.shape
