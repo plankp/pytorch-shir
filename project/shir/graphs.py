@@ -111,7 +111,7 @@ class SHIRGraphModule(torch.nn.Module):
     info = self._inout_nodes[1].meta.get("val")
     return layout.read_memory_dump(
       memory_dump_file, self._layout.get_entry("result"),
-      torch.emppty(info.shape, dtype=info.dtype)
+      torch.empty(info.shape, dtype=info.dtype)
     )
 
   def compile(self):

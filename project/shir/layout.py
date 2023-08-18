@@ -116,7 +116,6 @@ def read_memory_dump(fname: str, entry: LayoutEntry, out: torch.Tensor) -> torch
       inner = 0
       for line in range(entry.inner):
         line = f.readline().rstrip()
-        print(line)
         line_data = int(line, base=16)
 
         consumed_bits = 0
