@@ -9,6 +9,8 @@ from . import lowering, types, layout, config
 from functools import reduce
 from itertools import count
 import os
+import glob
+import ctypes
 import shutil
 import subprocess
 
@@ -62,7 +64,8 @@ class SHIRGraphModule(torch.nn.Module):
   _call_id: int
   _compiled: bool
   _inout_nodes: Optional[Tuple[List[Node], Node]]
-  _layout: layout.MemoryLayout
+  _layout: Optional[layout.MemoryLayout]
+  _driver: Optional[ctypes.CDLL]
 
   def __init__(self, gm: GraphModule):
     super().__init__()
@@ -72,6 +75,7 @@ class SHIRGraphModule(torch.nn.Module):
     self._call_id = 0
     self._inout_nodes = None
     self._layout = None
+    self._driver = None
 
     self._clname = f"Module{self._inst_id}"
     self._output_dir = os.path.join(config.EMIT_OUTPUT_DIR, f"module{self._inst_id}")
@@ -80,54 +84,57 @@ class SHIRGraphModule(torch.nn.Module):
     self._call_id += 1
     self.compile()
 
-    if not config.EMIT_DATA_FILES:
-      # if you aren't going to emit data files, then obviously the compiled
-      # model won't have anything to work with.
-      #
-      # in that case, we have Python evaluate the result using the fx graph.
+    if config.PERFORM_SYNTHESIS:
+      info = self._inout_nodes[1].meta.get("val")
+      result = torch.empty(info.shape, dtype=info.dtype)
+      r = self._driver.compute(
+        config.ACCEL_UUID,
+        ctypes.c_void_p(result.data_ptr()),
+        *(ctypes.c_void_p(arg.contiguous().data_ptr()) for arg in args)
+      )
+      if r == 0:
+        return result
+
+      assert False, f"Driver returned non-zero exit code: {r}"
+
+    elif config.PERFORM_SIMULATION:
+      data_dir = os.path.join(self._output_dir, f"data_{self._call_id}")
+      if not os.path.exists(data_dir):
+        os.mkdir(data_dir)
+
+      for i, arg in enumerate(args):
+        with open(os.path.join(data_dir, f"arg{i}.csv"), "w", encoding="utf-8") as argf:
+          layout.tensor_to_matrix_csv(arg, argf)
+
+      # here, since the current working directory is already inside the output
+      # directory, reference the particular data folder name directly instead of
+      # using data_dir (since data_dir may contain relative paths, which is bad)
+      subprocess.run(['sbt', f'run --no-gen --sim "data_{self._call_id}"'], check=True, cwd=self._output_dir)
+
+      # assume it didn't crash, then we would have ended up with a memory dump,
+      # from which, we can recover the result.
+      memory_dump_file = os.path.join(self._output_dir, "out", self._clname, "memory.dump")
+      info = self._inout_nodes[1].meta.get("val")
+      return layout.read_memory_dump(
+        memory_dump_file, self._layout.get_entry("result"),
+        torch.empty(info.shape, dtype=info.dtype)
+      )
+
+    else:
       return self.gm(*args)
-
-    data_dir = os.path.join(self._output_dir, f"data_{self._call_id}")
-    if not os.path.exists(data_dir):
-      os.mkdir(data_dir)
-
-    for i, arg in enumerate(args):
-      with open(os.path.join(data_dir, f"arg{i}.csv"), "w", encoding="utf-8") as argf:
-        layout.tensor_to_matrix_csv(arg, argf)
-
-    if not config.PERFORM_SIMULATION:
-      return self.gm(*args)
-
-    # at this point, we want to generate data and simulate,
-    # but we don't want to generating VHDL.
-    #
-    # here, since the current working directory is already inside the output
-    # directory, reference the particular data folder name directly instead of
-    # using data_dir (since data_dir may contain relative paths, which is bad)
-    subprocess.run(['sbt', f'run --no-gen --sim "data_{self._call_id}"'], check=True, cwd=self._output_dir)
-
-    # assume it didn't crash, then we would have ended up with a memory dump,
-    # from which, we can recover the result.
-    memory_dump_file = os.path.join(self._output_dir, "out", self._clname, "memory.dump")
-    info = self._inout_nodes[1].meta.get("val")
-    return layout.read_memory_dump(
-      memory_dump_file, self._layout.get_entry("result"),
-      torch.empty(info.shape, dtype=info.dtype)
-    )
 
   def compile(self):
     if self._compiled:
       return
 
     self._compiled = True
-    if config.EMIT_SHIR_CODE or config.EMIT_DATA_FILES:
+    if (
+      config.FORCE_GENERATE_FILES
+      or config.PERFORM_SIMULATION or config.PERFORM_SYNTHESIS
+    ):
       self._prepare_directory()
-    if config.EMIT_SHIR_CODE:
-      # emit the source, trigger generation, and load the memory layout file
       self._emit_source()
-      subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self._output_dir)
-      memory_layout_file = os.path.join(self._output_dir, "out", self._clname, "memory.layout")
-      self._layout = layout.read_layout_file(memory_layout_file)
+      self._generate_hardware_files()
 
   def _prepare_directory(self):
     # purge the output directory
@@ -136,6 +143,162 @@ class SHIRGraphModule(torch.nn.Module):
 
     # copy the template directory into the output directory
     shutil.copytree(config.TEMPLATE_DIR, self._output_dir)
+
+  def _generate_hardware_files(self):
+    # the bare minimum of VHDL and layout file (and maybe others) generation
+    subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self._output_dir)
+    files_dir = os.path.join(self._output_dir, "out", self._clname)
+    memory_layout_file = os.path.join(files_dir, "memory.layout")
+    self._layout = layout.read_layout_file(memory_layout_file)
+
+    if not config.PERFORM_SYNTHESIS:
+      return
+
+    synth_dir = os.path.join(self._output_dir, "synthesis")
+    with open(
+      os.path.join(synth_dir, "driver.c"), "w", encoding="utf-8"
+    ) as f:
+      self._emit_fpga_driver(f)
+
+    for vhdf in glob.glob(os.path.join(files_dir, "*.vhd")):
+      shutil.move(vhdf, os.path.join(synth_dir, "hw", "rtl", "generated"))
+
+    subprocess.run(['./synthesize.sh'], check=True, cwd=synth_dir)
+    self._driver = ctypes.cdll.LoadLibrary(os.path.join(
+      synth_dir, "build_driver", "libdriver.so"
+    ))
+
+  def _emit_fpga_driver(self, f):
+    print(r'''/* This file is autogenerated */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <inttypes.h>
+#include <uuid/uuid.h>
+#include <opae/fpga.h>
+#include "helper.h"
+
+#ifdef __cplusplus
+extern "C"
+#endif /* __cplusplus */
+int compute(
+  const char *restrict accel_uuid,
+  char *restrict result,''', file=f)
+
+    arg_mapping = {}
+    for i, arg in enumerate(self._inout_nodes[0]):
+      print("  const char *restrict arg", i, ", /* ", arg.target, " */", sep="", file=f)
+      arg_mapping[arg.target] = (i, arg)
+
+    print(r''') {
+  fpga_handle handle;
+  fpga_result r;
+  if ((r = find_and_open_fpga(accel_uuid, &handle)))
+    goto err_open_fpga;
+
+  /* XXX: Always allocate 100MB for now. */
+  char *buffer; uint64_t wsid;
+  if ((r = fpgaPrepareBuffer(handle, 1024 * 1024 * 100, &buffer, &wsid, 0)))
+    goto err_prepare_buffer;
+  uint64_t io_addr;
+  if ((r = fpgaGetIOAddress(handle, wsid, &io_addr)))
+    goto err_start_routine;''', file=f)
+
+    def emit_memcpy_helper(entry: layer.LayoutEntry, node: Node, emitted_name: str, node_is_source: bool):
+      shape = node.meta.get("val").shape
+      if len(shape) == 1:
+        inner = shape[0]
+      else:
+        inner = reduce(lambda x, y: x * y, shape[1:], 1)
+      length = inner * types.get_element_type(node).bits // 8
+
+      # it's just memcpy's at this stage.
+      # the tricky part is that whereas the nodes are contiguous,
+      # each row is allocated on a fresh cacheline
+      cacheline = entry.address
+      offset = 0
+      for row in entry.outer:
+        if node_is_source:
+          print("  memcpy(&buffer[CL(", cacheline, ")], &", emitted_name, "[", offset, "], ", length, ");", sep="", file=f)
+        else:
+          print("  memcpy(&", emitted_name, "[", offset, "], &buffer[CL(", cacheline, ")], ", length, ")", sep="", file=f)
+        cacheline += entry.inner
+        offset += length
+
+    result_entry = None
+    for entry in self._layout._entries:
+      if entry.name == "result":
+        result_entry = entry
+        continue
+
+      # compute the number of bytes on each "row" of data
+      (arg_id, arg_node) = arg_mapping[entry.name]
+      print(file=f)
+      emit_memcpy_helper(entry, arg_node, f"arg{arg_id}", True)
+
+    print(r'''
+  if ((r = fpgaWriteMMIO64(handle, 0, 0x00, io_addr / CL(1))))
+    goto err_start_routine;
+  if ((r = fpgaWriteMMIO64(handle, 0, 0x08, 1)))
+    goto err_start_routine;
+
+  for (;;) {
+#ifndef NDEBUG
+    usleep(1000000);
+    uint64_t write_req;
+    if (fpgaReadMMIO64(handle, 0, 0xC8, &write_req))
+      fprintf(stderr, "Could not fetch writes requested\n");
+    else
+      printf("%" PRu64 " writes requested\n", write_req);
+#else
+    usleep(100);
+#endif /* !NDEBUG */
+
+    uint64_t done = 0;
+    fpgaReadMMIO64(handle, 0, 0x80, &done);
+    if (done == 1)
+      break;
+  }
+''', file=f)
+
+    emit_memcpy_helper(result_entry, self._inout_nodes[1], "result", False)
+
+    print(r'''
+#ifndef NDEBUG
+  uint64_t cycles, readreq, readpending, writereq, writepending, readaf, writeaf;
+  if ((r = fpgaReadMMIO64(handle, 0, 0x88, &cycles)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xC0, &readreq)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xD0, &readpending)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xE0, &readaf)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xC8, &writereq)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xD8, &writepending)))
+    goto err_start_routine;
+  if ((r = fpgaReadMMIO64(handle, 0, 0xE8, &writeaf)))
+    goto err_start_routine;
+
+  printf(
+    "Execution time (cycles): %" PRu64 "\n"
+    "Read requests          : %" PRu64 " (of which %" PRu64 "pending)\n"
+    "Write requests         : %" PRu64 " (of which %" PRu64 "pending)\n"
+    "Read request buffer  %" PRu64 "times almost full\n"
+    "Write request buffer %" PRu64 "times almost full\n",
+    cycles, readreq, readpending, writereq, writepending, readaf, writeaf
+  );
+#endif /* !NDEBUG */
+
+err_start_routine:
+  fpgaReleaseBuffer(handle, wsid);
+err_prepare_buffer:
+  close_fpga(handle);
+err_open_fpga:
+  return r;
+}''', file=f)
 
   def _emit_source(self):
     self._inout_nodes = _collect_inout_nodes(self.gm)
