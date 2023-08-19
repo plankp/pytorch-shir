@@ -89,8 +89,8 @@ class SHIRGraphModule(torch.nn.Module):
       result = torch.empty(info.shape, dtype=info.dtype)
       r = self._driver.compute(
         config.ACCEL_UUID,
+        *(ctypes.c_void_p(arg.contiguous().data_ptr()) for arg in args),
         ctypes.c_void_p(result.data_ptr()),
-        *(ctypes.c_void_p(arg.contiguous().data_ptr()) for arg in args)
       )
       if r == 0:
         return result
@@ -174,6 +174,7 @@ class SHIRGraphModule(torch.nn.Module):
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include <uuid/uuid.h>
 #include <opae/fpga.h>
@@ -183,15 +184,15 @@ class SHIRGraphModule(torch.nn.Module):
 extern "C"
 #endif /* __cplusplus */
 int compute(
-  const char *restrict accel_uuid,
-  char *restrict result,''', file=f)
+  const char *restrict accel_uuid,''', file=f)
 
     arg_mapping = {}
     for i, arg in enumerate(self._inout_nodes[0]):
       print("  const char *restrict arg", i, ", /* ", arg.target, " */", sep="", file=f)
       arg_mapping[arg.target] = (i, arg)
 
-    print(r''') {
+    print(r'''char *restrict result
+) {
   fpga_handle handle;
   fpga_result r;
   if ((r = find_and_open_fpga(accel_uuid, &handle)))
@@ -199,13 +200,13 @@ int compute(
 
   /* XXX: Always allocate 100MB for now. */
   char *buffer; uint64_t wsid;
-  if ((r = fpgaPrepareBuffer(handle, 1024 * 1024 * 100, &buffer, &wsid, 0)))
+  if ((r = fpgaPrepareBuffer(handle, 1024 * 1024 * 100, (void **) &buffer, &wsid, 0)))
     goto err_prepare_buffer;
   uint64_t io_addr;
   if ((r = fpgaGetIOAddress(handle, wsid, &io_addr)))
     goto err_start_routine;''', file=f)
 
-    def emit_memcpy_helper(entry: layer.LayoutEntry, node: Node, emitted_name: str, node_is_source: bool):
+    def emit_memcpy_helper(entry: layout.LayoutEntry, node: Node, emitted_name: str, node_is_source: bool):
       shape = node.meta.get("val").shape
       if len(shape) == 1:
         inner = shape[0]
@@ -218,11 +219,11 @@ int compute(
       # each row is allocated on a fresh cacheline
       cacheline = entry.address
       offset = 0
-      for row in entry.outer:
+      for row in range(entry.outer):
         if node_is_source:
           print("  memcpy(&buffer[CL(", cacheline, ")], &", emitted_name, "[", offset, "], ", length, ");", sep="", file=f)
         else:
-          print("  memcpy(&", emitted_name, "[", offset, "], &buffer[CL(", cacheline, ")], ", length, ")", sep="", file=f)
+          print("  memcpy(&", emitted_name, "[", offset, "], &buffer[CL(", cacheline, ")], ", length, ");", sep="", file=f)
         cacheline += entry.inner
         offset += length
 
