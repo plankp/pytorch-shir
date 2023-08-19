@@ -147,8 +147,9 @@ class SHIRGraphModule(torch.nn.Module):
   def _generate_hardware_files(self):
     # the bare minimum of VHDL and layout file (and maybe others) generation
     subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self._output_dir)
-    files_dir = os.path.join(self._output_dir, "out", self._clname)
-    memory_layout_file = os.path.join(files_dir, "memory.layout")
+    memory_layout_file = os.path.join(
+      self._output_dir, "out", self._clname, "memory.layout"
+    )
     self._layout = layout.read_layout_file(memory_layout_file)
 
     if not config.PERFORM_SYNTHESIS:
@@ -160,10 +161,10 @@ class SHIRGraphModule(torch.nn.Module):
     ) as f:
       self._emit_fpga_driver(f)
 
-    for vhdf in glob.glob(os.path.join(files_dir, "*.vhd")):
-      shutil.move(vhdf, os.path.join(synth_dir, "hw", "rtl", "generated"))
-
-    subprocess.run(['./synthesize.sh'], check=True, cwd=synth_dir)
+    subprocess.run(
+      ['./synthesize.sh', os.path.join("..", "out", self._clname)],
+      check=True, cwd=synth_dir
+    )
     self._driver = ctypes.cdll.LoadLibrary(os.path.join(
       synth_dir, "build_driver", "libdriver.so"
     ))

@@ -6,7 +6,7 @@ Everything in here (and it's subdirectories) form the template when compiling SH
 
 *  copy `vhdltemplates/` here
 *  copy a SHIR library (a packaged `.jar`) into `lib/`
-*  copy `synthesis/` here
+*  copy `synthesis/` here (if synthesis is enabled)
 
 With a few files omitted, you should end up with something like this:
 
@@ -17,5 +17,6 @@ template/
   |- vhdltemplates/
   |   |- (whatever was inside it, omitted)
   |- synthesis/
-      |- (whatever was inside it, omitted)
+      |- synthesize.sh
+      |- (whatever is needed to synthesize, load, and build `build_driver/libdriver.so`)
 ```
