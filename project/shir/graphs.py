@@ -3,6 +3,7 @@ Where the SHIRGraphModule is defined
 """
 
 import torch
+from torch.fx import GraphModule, Node
 from typing import Tuple, List, Optional
 from . import lowering, types, layout, config
 from functools import reduce
@@ -11,7 +12,7 @@ import os
 import shutil
 import subprocess
 
-def _collect_inout_nodes(gm: torch.fx.GraphModule) -> Tuple[List[str], torch.fx.Node]:
+def _collect_inout_nodes(gm: GraphModule) -> Tuple[List[Node], Node]:
   placeholders = []
   output = None
   for n in gm.graph.nodes:
@@ -20,7 +21,7 @@ def _collect_inout_nodes(gm: torch.fx.GraphModule) -> Tuple[List[str], torch.fx.
       assert tinfo is not None, "Placeholder must be a tensor"
       assert all((isinstance(d, int) for d in tinfo.shape)), "Dynamic shapes are not supported"
 
-      placeholders.append(n.target)
+      placeholders.append(n)
     elif n.op == "output":
       assert len(n.args) == 1, "Only single output node is supported"
       node = n.args[0]
@@ -33,7 +34,7 @@ def _collect_inout_nodes(gm: torch.fx.GraphModule) -> Tuple[List[str], torch.fx.
       assert output == node, "Two output nodes returning different values"
   return (placeholders, output)
 
-def _has_many_uses(node: torch.fx.Node) -> bool:
+def _has_many_uses(node: Node) -> bool:
   user_count = len(node.users)
   if user_count > 1:
     return True
@@ -56,14 +57,14 @@ _iid_counter = count()
 
 class SHIRGraphModule(torch.nn.Module):
   # assumption: graph does not change (it really shouldn't!)
-  gm: torch.fx.GraphModule
+  gm: GraphModule
   _inst_id: int
   _call_id: int
   _compiled: bool
-  _inout_nodes: Optional[Tuple[List[str], torch.fx.Node]]
+  _inout_nodes: Optional[Tuple[List[Node], Node]]
   _layout: layout.MemoryLayout
 
-  def __init__(self, gm: torch.fx.GraphModule):
+  def __init__(self, gm: GraphModule):
     super().__init__()
     self._inst_id = next(_iid_counter)
     self.gm = gm
@@ -169,7 +170,7 @@ class SHIRGraphModule(torch.nn.Module):
 
     # inputs are always taken from .csv's
     for i, arg in enumerate(self._inout_nodes[0]):
-      print("    \"", arg, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
+      print("    \"", arg.target, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
 
     # result is not taken from .csv, but we still need to allocate dummy data
     # so that the RAM size is correctly calculated during simulation.
