@@ -252,7 +252,7 @@ int compute(
     if (fpgaReadMMIO64(handle, 0, 0xC8, &write_req))
       fprintf(stderr, "Could not fetch writes requested\n");
     else
-      printf("%" PRu64 " writes requested\n", write_req);
+      printf("%" PRIu64 " writes requested\n", write_req);
 #else
     usleep(100);
 #endif /* !NDEBUG */
@@ -285,11 +285,11 @@ int compute(
     goto err_start_routine;
 
   printf(
-    "Execution time (cycles): %" PRu64 "\n"
-    "Read requests          : %" PRu64 " (of which %" PRu64 "pending)\n"
-    "Write requests         : %" PRu64 " (of which %" PRu64 "pending)\n"
-    "Read request buffer  %" PRu64 "times almost full\n"
-    "Write request buffer %" PRu64 "times almost full\n",
+    "Execution time (cycles): %" PRIu64 "\n"
+    "Read requests          : %" PRIu64 " (of which %" PRIu64 "pending)\n"
+    "Write requests         : %" PRIu64 " (of which %" PRIu64 "pending)\n"
+    "Read request buffer  %" PRIu64 "times almost full\n"
+    "Write request buffer %" PRIu64 "times almost full\n",
     cycles, readreq, readpending, writereq, writepending, readaf, writeaf
   );
 #endif /* !NDEBUG */
