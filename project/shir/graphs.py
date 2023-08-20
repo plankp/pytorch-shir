@@ -12,6 +12,7 @@ import os
 import glob
 import ctypes
 import shutil
+import signal
 import subprocess
 
 def _collect_inout_nodes(gm: GraphModule) -> Tuple[List[Node], Node]:
@@ -87,11 +88,18 @@ class SHIRGraphModule(torch.nn.Module):
     if config.PERFORM_SYNTHESIS:
       info = self._inout_nodes[1].meta.get("val")
       result = torch.empty(info.shape, dtype=info.dtype)
+
+      # temporarily map SIGINT back to the default handler before
+      # entering loaded compute function, which isn't perfect,
+      # but at least you'd be able to stop the process.
+      old_handler = signal.signal(signal.SIGINT, signal.SIG_DFL)
       r = self._driver.compute(
         config.ACCEL_UUID,
         *(ctypes.c_void_p(arg.contiguous().data_ptr()) for arg in args),
         ctypes.c_void_p(result.data_ptr()),
       )
+      signal.signal(signal.SIGINT, old_handler)
+
       if r == 0:
         return result
 
