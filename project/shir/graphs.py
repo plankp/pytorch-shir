@@ -286,10 +286,10 @@ int compute(
 
   printf(
     "Execution time (cycles): %" PRIu64 "\n"
-    "Read requests          : %" PRIu64 " (of which %" PRIu64 "pending)\n"
-    "Write requests         : %" PRIu64 " (of which %" PRIu64 "pending)\n"
-    "Read request buffer  %" PRIu64 "times almost full\n"
-    "Write request buffer %" PRIu64 "times almost full\n",
+    "Read requests          : %" PRIu64 " (of which %" PRIu64 " pending)\n"
+    "Write requests         : %" PRIu64 " (of which %" PRIu64 " pending)\n"
+    "Read request buffer  %" PRIu64 " times almost full\n"
+    "Write request buffer %" PRIu64 " times almost full\n",
     cycles, readreq, readpending, writereq, writepending, readaf, writeaf
   );
 #endif /* !NDEBUG */
