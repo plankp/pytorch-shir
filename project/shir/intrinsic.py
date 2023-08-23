@@ -103,6 +103,18 @@ def qadd_meta(self, s1, rhs, s2, z):
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
+  "qconv(Tensor self, int zp, Tensor weights, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "qconv", "CompositeExplicitAutograd")
+def qconv_meta(self, zp, weights, stride, padding, dilation, groups):
+  assert self.dtype == weights.dtype == torch.int8
+  return aten.convolution(
+    self.float() - zp, weights.float(), None,
+    stride, padding, dilation, False, [0], groups
+  ).int()
+
+shir_intrinsic_lib.define(
   "int_addmm(Tensor self, Tensor lhs, Tensor rhs) -> Tensor"
 )
 

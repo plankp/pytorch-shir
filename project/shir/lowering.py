@@ -407,35 +407,31 @@ class LowerShirIntAddmm:
   def lower(acc, lhs, rhs) -> str:
     return f"algo.torch.SIAdd32MM8({acc.name}, {lhs.name}, {rhs.name})"
 
-@register_lowering(aten.convolution.default)
-class LowerConvolution:
+@register_lowering(shin.qconv.default)
+class LowerQConv:
   @staticmethod
-  def supports(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> bool:
-    if transposed:
-      return False
-    if any((p != 0 for p in output_padding)):
-      return False
-
-    # disallow bias here. expect a rewrite to move it into a separate add.
-    if bias is not None:
-      return False
-
-    # some cases that are technically allowed, but we weren't able to
-    # reproduce it.
+  def supports(input, zp, weight, stride, padding, dilation, groups) -> bool:
+    # sanity check: the underlying aten.convolution supports them,
+    # but the normal nn.ConvNd doesn't seem to generate these cases.
+    # we could handle them, but we disable for now.
     N = len(input.meta.get("val").shape) - 2
     if N != len(stride) or N != len(padding) or N != len(dilation):
+      return False
+
+    # groups implementation is broken due to unfortunate zipping + select.
+    # disable for now.
+    if groups != 1:
       return False
 
     return True
 
   @staticmethod
-  def lower(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> str:
+  def lower(input, zp, weight, stride, padding, dilation, groups) -> str:
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     return (
-      f"algo.torch.TConvolution({types.get_element_type(input).name()},"
-      f" {input.name}, {weight.name},"
+      f"algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
       f" Seq({stride}), Seq({padding}), Seq({dilation}),"
       f" {groups})"
     )

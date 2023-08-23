@@ -310,9 +310,19 @@ class QuantOpRewrite:
     if qparam_weight != qparam_weight1:
       return None
 
+    # make sure the convolution uses parameters that we support.
+    # that means, transpose is false and output padding is all zeros.
+    conv_args = _get_all_arguments(
+      node_conv.args, node_conv.kwargs, node_conv.target._schema.arguments
+    )
+    if len(conv_args) != 9:
+      return None
+    if conv_args[6] or any(conv_args[7]):
+      return None
+
     return (
       node_relu is not None,
-      node_conv.args[3:],
+      (conv_args[3], conv_args[4], conv_args[5], conv_args[8]),
       node_dq_input.args[0],
       node_q_weight.args[0],
       node_conv.args[2],
@@ -351,17 +361,17 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_method("int", (x_node,))
-      n2 = graph.call_function(aten.sub, (n1, z_x))
-      n3 = graph.get_attr(kernel_attr)
-      n4 = graph.call_method("int", (n3,))
-      n5 = None if b is None else graph.get_attr(bias_attr)
-      n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
+      n1 = graph.get_attr(kernel_attr)
+      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, *conv_params))
+      if b is not None:
+        n3 = graph.get_attr(bias_attr)
+        n3 = graph.call_function(torch.reshape, (n3, [-1] + [1] * (kernel_q.ndim - 2)))
+        n2 = graph.call_function(torch.add, (n2, n3))
       if needs_relu:
-        n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shin.requantize, (n6, k / s_out, z_out))
+        n2 = graph.call_function(aten.relu, (n2,))
+      n3 = graph.call_function(shin.requant, (n2, k / s_out, z_out))
 
-    anchor.replace_all_uses_with(n7)
+    anchor.replace_all_uses_with(n3)
     return True
 
   """
@@ -408,9 +418,19 @@ class QuantOpRewrite:
     if qparam_weight != qparam_weight1:
       return None
 
+    # make sure the convolution uses parameters use support.
+    # that means, transpose is false and output padding is all zeros.
+    conv_args = _get_all_arguments(
+      node_conv.args, node_conv.kwargs, node_conv.target._schema.arguments
+    )
+    if len(conv_args) != 9:
+      return None
+    if conv_args[6] or any(conv_args[7]):
+      return None
+
     return (
       node_relu is not None,
-      node_conv.args[3:],
+      (conv_args[3], conv_args[4], conv_args[5], conv_args[8]),
       node_dq_input.args[0],
       node_q_weight.args[0],
       node_conv.args[2],
@@ -449,22 +469,25 @@ class QuantOpRewrite:
       setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     # we keep the scales as a Python list and leave the responsibility of
-    # quantizing these values to the lowering step!
+    # quantizing these values to the lowering step.
+    #
+    # we cannot use a tensor here, since later decompositions will pass it
+    # as a placeholder, and then we won't be able to read these values!
     scales = (k / s_out).float().tolist()
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_method("int", (x_node,))
-      n2 = graph.call_function(aten.sub, (n1, z_x))
-      n3 = graph.get_attr(kernel_attr)
-      n4 = graph.call_method("int", (n3,))
-      n5 = None if b is None else graph.get_attr(bias_attr)
-      n6 = graph.call_function(aten.convolution, (n2, n4, n5, *conv_params))
+      n1 = graph.get_attr(kernel_attr)
+      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, *conv_params))
+      if b is not None:
+        n3 = graph.get_attr(bias_attr)
+        n3 = graph.call_function(torch.reshape, (n3, [-1] + [1] * (kernel_q.ndim - 2)))
+        n2 = graph.call_function(torch.add, (n2, n3))
       if needs_relu:
-        n6 = graph.call_function(aten.relu, (n6,))
-      n7 = graph.call_function(shin.requantize_channel, (n6, scales, z_out))
+        n2 = graph.call_function(aten.relu, (n2,))
+      n3 = graph.call_function(shin.requantize_channel, (n2, scales, z_out))
 
-    anchor.replace_all_uses_with(n7)
+    anchor.replace_all_uses_with(n3)
     return True
 
   """
@@ -970,36 +993,4 @@ def rewrite_quantized_ops(gm: GraphModule):
   obj.rewrite()
 
 def rewrite_late(gm: GraphModule):
-  changed = False
-  for n in gm.graph.nodes:
-    if n.op != "call_function" or n.target != aten.convolution.default:
-      continue
-    if n.args[2] is None:
-      continue
-
-    kernel_node = n.args[1]
-    info = kernel_node.meta.get("val")
-    if info is None:
-      continue
-
-    # Turn:
-    #   n = aten.convolution(i, k, b, ...)
-    # into:
-    #   p = aten.convolution(i, k, None, ...)
-    #   q = torch.reshape(b, [-1, 1, 1, ...])
-    #   n = torch.add(p, q)
-    changed = True
-    broadcast = [-1] + [1] * (len(info.shape) - 2)
-    new_args = list(n.args)
-    new_args[2] = None
-    graph = gm.graph
-    with graph.inserting_before(n):
-      p = graph.call_function(aten.convolution, tuple(new_args))
-      q = graph.call_function(torch.reshape, (n.args[2], broadcast))
-    n.target = torch.add
-    n.args = (p, q)
-
-  if changed:
-    gm.graph.eliminate_dead_code()
-    gm.graph.lint()
-    gm.recompile()
+  return gm
