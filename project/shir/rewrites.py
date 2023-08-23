@@ -590,11 +590,9 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(shin.int_mean, (n1, *mean_args))
-      n3 = graph.call_method("to", (n2, torch.int8))
+      n1 = graph.call_function(shin.int_mean, (x, *mean_args))
 
-    anchor.replace_all_uses_with(n3)
+    anchor.replace_all_uses_with(n1)
     return True
 
   """
@@ -657,11 +655,9 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_method("int", (x,))
-      n2 = graph.call_function(pool_func, (n1, *pool_args))
-      n3 = graph.call_method("to", (n2, torch.int8))
+      n1 = graph.call_function(pool_func, (x, *pool_args))
 
-    anchor.replace_all_uses_with(n3)
+    anchor.replace_all_uses_with(n1)
     return True
 
   """
