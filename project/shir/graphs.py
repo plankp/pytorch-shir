@@ -89,6 +89,7 @@ class SHIRGraphModule(torch.nn.Module):
     if config.PERFORM_SYNTHESIS:
       bytes_per_cl = config.CACHELINE_BITS // 8
       bytes_needed = bytes_per_cl * self._layout.cachelines()
+      bytes_needed = (bytes_needed + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
       with mmap.mmap(-1, bytes_needed) as mem:
         arg_mapping = {}
         for i, arg in enumerate(self._inout_nodes[0]):
@@ -105,7 +106,7 @@ class SHIRGraphModule(torch.nn.Module):
             ndim = len(shape)
             if ndim == 1:
               inner = shape[0]
-            elif ndim > 2:
+            elif ndim > 1:
               outer = shape[0]
               inner = reduce(lambda x, y: x * y, shape[1:])
             result = region.as_strided((outer, inner), (region.stride(0), 1)).view(shape)
@@ -118,7 +119,7 @@ class SHIRGraphModule(torch.nn.Module):
         with self._driver.find_and_open_fpga(config.ACCEL_UUID) as handle:
           with self._driver.prepare_buffer(handle, mem, bytes_needed) as wsid:
             self._driver.start_computation(handle)
-            while self._driver.is_complete(handle):
+            while not self._driver.is_complete(handle):
               pass  # spin
 
             cycles = self._driver.read_mmio64(handle, 0, 0x88)

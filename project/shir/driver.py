@@ -21,24 +21,27 @@ class Wrapper:
   @contextmanager
   def prepare_buffer(self, handle, mem, bytes_needed):
     wsid = C.c_uint64()
-    if r := self._impl.prepare_buffer(handle, mem, bytes_needed, C.byref(wsid)):
+    memtype = C.c_char * bytes_needed
+    if r := self._impl.prepare_buffer(
+      handle, memtype.from_buffer(mem), C.c_uint64(bytes_needed), C.byref(wsid)
+    ):
       raise Exception(f"driver.prepare_buffer failed: {r}")
     try:
       yield wsid
     finally:
       self._impl.release_buffer(handle, wsid)
 
-  def start_computation(handle):
+  def start_computation(self, handle):
     if r := self._impl.start_computation(handle):
       raise Exception(f"driver.start_computation failed: {r}")
 
-  def is_complete(handle) -> bool:
+  def is_complete(self, handle) -> bool:
     done = C.c_uint64(0)
     if r := self._impl.poll_for_completion(handle, C.byref(done)):
       raise Exception(f"driver.poll_for_completion failed: {r}")
     return done.value
 
-  def read_mmio64(handle, ionum: int, offset: int) -> Optional[int]:
+  def read_mmio64(self, handle, ionum: int, offset: int) -> Optional[int]:
     result = C.c_uint64()
     if self._impl.fpgaReadMMIO64(
       handle, C.c_uint32(ionum), C.c_uint64(offset), C.byref(result)
