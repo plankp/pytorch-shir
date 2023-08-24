@@ -41,9 +41,22 @@ class LayoutEntry:
   def get_torch_type(self):
     return _MEMORY_LAYOUT_TYPE_MAP[self._ty][1]
 
+  def cachelines(self) -> int:
+    return self.outer * self.inner
+
+  def frombuffer(self, buffer) -> torch.Tensor:
+    bytes_per_cl = config.CACHELINE_BITS // 8
+    return torch.frombuffer(
+      buffer,
+      dtype=torch.int8,
+      offset=self.address * bytes_per_cl,
+      count=self.cachelines() * bytes_per_cl,
+    ).view(self.outer, -1).view(self.get_torch_type())
+
 class MemoryLayout:
   def __init__(self, entries: List[LayoutEntry]):
     self._entries = entries
+    self._cached_cachelines = None
 
   def get_entry(self, name: str) -> Optional[LayoutEntry]:
     # linear search for now, could cache a LUT if needed
@@ -51,6 +64,15 @@ class MemoryLayout:
       if entry.name == name:
         return entry
     return None
+
+  def cachelines(self) -> int:
+    result = self._cached_cachelines
+    if result is None:
+      result = 0
+      for entry in self._entries:
+        result = max(result, entry.address + entry.cachelines())
+      self._cached_cachelines = result
+    return result
 
 def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
   if t.ndim < 2:
