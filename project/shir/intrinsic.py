@@ -144,15 +144,6 @@ def int_max_pool2d(self, kern_size, stride, pad, dilation):
   return aten.max_pool2d(self.float(), kern_size, stride, pad, dilation).to(self.dtype)
 
 shir_intrinsic_lib.define(
-  "int_adaptive_avg_pool2d(Tensor self, int[2] output_size) -> Tensor"
-)
-
-@impl(shir_intrinsic_lib, "int_adaptive_avg_pool2d", "CompositeExplicitAutograd")
-def int_adaptive_avg_pool2d(self, output_size):
-  assert self.dtype == torch.int8
-  return aten._adaptive_avg_pool2d(self.float(), output_size).to(self.dtype)
-
-shir_intrinsic_lib.define(
   "int_avg_pool2d(Tensor self, int[2] kernel_size, int[2] stride, int[2] padding) -> Tensor"
 )
 

@@ -8,6 +8,7 @@ from typing import List, Optional
 from . import types, config
 from functools import reduce
 from dataclasses import dataclass
+import mmap
 import os
 
 _SUPPORTED_TORCH_TYPES = {
@@ -73,6 +74,13 @@ class MemoryLayout:
         result = max(result, entry.address + entry.cachelines())
       self._cached_cachelines = result
     return result
+
+  def bytes_needed(self, round_to_page=True) -> int:
+    n = config.CACHELINE_BITS // 8 * self.cachelines()
+    if round_to_page:
+      n = (n + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+
+    return n
 
 def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
   if t.ndim < 2:
