@@ -121,7 +121,7 @@ class SHIRGraphModule(torch.nn.Module):
         meminfo = (mmap.mmap(-1, sz), sz)
         self._buffer = meminfo
 
-      arg_mapping = {arg.target: (i, arg) for i, arg in enumerate(self._inout_nodes[0])}
+      arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(self._inout_nodes[0])}
       inputs = [None] * len(self._inout_nodes[0])
       output = None
 
@@ -261,7 +261,7 @@ class SHIRGraphModule(torch.nn.Module):
 
     # inputs are always taken from .csv's
     for i, arg in enumerate(self._inout_nodes[0]):
-      print("    \"", arg.target, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
+      print("    \"arg", i, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
 
     # result is not taken from .csv, but we still need to allocate dummy data
     # so that the RAM size is correctly calculated during simulation.
@@ -275,6 +275,7 @@ class SHIRGraphModule(torch.nn.Module):
     print("  def generateIR(): Expr = {", file=f)
 
     lets_needed = 0
+    placeholder_id = 0
     for n in self.gm.graph.nodes:
       # assume every node that has many uses needs to be let-bound,
       # which is definitely the case for tensors (which are SeqType's)
@@ -291,7 +292,7 @@ class SHIRGraphModule(torch.nn.Module):
           if many_uses:
             print(
               "  { val _init = core.TypeChecker.check(algo.torch.TInput(",
-              typ.name(), ", \"", n.target, "\", Seq(", shape, ")))\n",
+              typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))\n",
               "    val _param = core.ParamDef(_init.t)\n",
               "    core.Let(_param,\n",
               "  { val ", a.name, " = core.ParamUse(_param)",
@@ -301,9 +302,10 @@ class SHIRGraphModule(torch.nn.Module):
             print(
               "    val ", n.name,
               " = core.TypeChecker.check(algo.torch.TInput(",
-              typ.name(), ", \"", n.target, "\", Seq(", shape, ")))",
+              typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))",
               sep="", file=f
             )
+          placeholder_id += 1
 
         case "output":
           # sometimes, due to unfortunate graph slicing, we may end up with
