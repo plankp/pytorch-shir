@@ -9,7 +9,6 @@ from . import lowering, types, layout, config, driver
 from functools import reduce
 from itertools import count
 from pathlib import Path
-import mmap
 import ctypes
 import shutil
 import subprocess
@@ -87,7 +86,7 @@ class SHIRGraphModule(torch.nn.Module):
   _inout_nodes: Optional[Tuple[List[Node], Node]]
   _inout_tensors: Optional[Tuple[List[torch.Tensor], torch.Tensor]]
   _layout: Optional[layout.MemoryLayout]
-  _buffer: Optional[Tuple[mmap.mmap, int]]
+  _buffer: Optional[Any]  # a buffer
 
   def __init__(self, gm: GraphModule):
     super().__init__()
@@ -104,8 +103,8 @@ class SHIRGraphModule(torch.nn.Module):
 
   def __del__(self):
     self._inout_tensors = None
-    if self._buffer:
-      self._buffer[0].close()
+    if self._buffer is not None:
+      driver.free_buffer(self._buffer)
       self._buffer = None  # probably redundant
 
   def get_in_tensor(self, index) -> torch.Tensor:
@@ -118,7 +117,7 @@ class SHIRGraphModule(torch.nn.Module):
       if meminfo is None:
         # only enforce page length requirement when running with FPGA.
         sz = self._layout.bytes_needed(round_to_page=config.PERFORM_SYNTHESIS)
-        meminfo = (mmap.mmap(-1, sz), sz)
+        meminfo = driver.alloc_buffer(sz)
         self._buffer = meminfo
 
       arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(self._inout_nodes[0])}
@@ -126,7 +125,7 @@ class SHIRGraphModule(torch.nn.Module):
       output = None
 
       for entry in self._layout._entries:
-        region = entry.frombuffer(meminfo[0])
+        region = entry.frombuffer(meminfo)
         if entry.name == "result":
           output = _reshape_region(
             region,
@@ -150,20 +149,19 @@ class SHIRGraphModule(torch.nn.Module):
     self._call_id += 1
 
     if config.PERFORM_SYNTHESIS:
-      with self._driver.find_and_open_fpga(config.ACCEL_UUID) as handle:
-        buffer, sz = self._buffer
-        with self._driver.prepare_buffer(handle, buffer, sz) as wsid:
-          self._driver.start_computation(handle)
-          while not self._driver.is_complete(handle):
+      with driver.find_and_open_fpga(config.ACCEL_UUID) as fpga:
+        with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
+          fpga.start_computation()
+          while not fpga.is_complete():
             pass  # spin
 
-          cycles = self._driver.read_mmio64(handle, 0, 0x88)
-          readreq = self._driver.read_mmio64(handle, 0, 0xC0)
-          readpending = self._driver.read_mmio64(handle, 0, 0xD0)
-          readaf = self._driver.read_mmio64(handle, 0, 0xE0)
-          writereq = self._driver.read_mmio64(handle, 0, 0xC8)
-          writepending = self._driver.read_mmio64(handle, 0, 0xD8)
-          writeaf = self._driver.read_mmio64(handle, 0, 0xE8)
+          cycles = fpga.read_mmio64(0, 0x88)
+          readreq = fpga.read_mmio64(0, 0xC0)
+          readpending = fpga.read_mmio64(0, 0xD0)
+          readaf = fpga.read_mmio64(0, 0xE0)
+          writereq = fpga.read_mmio64(0, 0xC8)
+          writepending = fpga.read_mmio64(0, 0xD8)
+          writeaf = fpga.read_mmio64(0, 0xE8)
 
           print(
             "Execution time (cycles): ", cycles, "\n",
@@ -221,9 +219,6 @@ class SHIRGraphModule(torch.nn.Module):
       return
 
     synth_dir = self._output_dir / "synthesis"
-    self._driver = driver.Wrapper(ctypes.cdll.LoadLibrary(
-      synth_dir / "build_driver" / "libdriver.so"
-    ))
     subprocess.run(
       ['./synthesize.sh', str(Path("..") / "out" / self._clname)],
       check=True, cwd=synth_dir

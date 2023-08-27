@@ -18,5 +18,5 @@ template/
   |   |- (whatever was inside it, omitted)
   |- synthesis/
       |- synthesize.sh
-      |- (whatever is needed to synthesize, load, and build `build_driver/libdriver.so`)
+      |- (whatever is needed to synthesize and load the design)
 ```

@@ -2,6 +2,8 @@
 All sorts of configuration flags
 """
 
+""" Settings that you would play with """
+
 # if we should trigger synthesis
 PERFORM_SYNTHESIS = False
 
@@ -19,6 +21,10 @@ CACHELINE_BITS = 512
 # each model will get its own subdir here
 EMIT_OUTPUT_DIR = "./data/generated"
 
+""" Settings that you normally wouldn't touch """
+
 # the template directory
-# YOU shouldn't be touching this!
 TEMPLATE_DIR = "./template"
+
+# the shared library for driver
+DRIVER_LIB = "./driver/build/libdriver.so"
