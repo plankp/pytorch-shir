@@ -10,10 +10,34 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch._functorch.aot_autograd import aot_export_module
+from torch._decomp import core_aten_decompositions, get_decompositions
 from itertools import count
 from pathlib import Path
 from typing import List, Callable
 from . import types, lowering, graphs, rewrites, config
+
+# notes on decompositing core ATen to prims:
+# -  not all core ATen ops have a prims decomposition (e.g. aten.mm)
+# -  not all prims decompositions are "good" (e.g. aten.relu uses masking)
+aten = torch.ops.aten
+shir_decomps = get_decompositions([
+  aten._to_copy,
+  aten.sym_size,
+  aten.add,
+  aten.rsub,
+  aten.sub,
+  aten.mul,
+  aten.dot,
+  aten.sum,
+  aten.where,
+  aten.maximum,
+  aten.squeeze,
+  aten.expand.default,
+  aten.permute.default,
+  aten.unsqueeze.default,
+])
+decomps = {**core_aten_decompositions(), **shir_decomps}
 
 class SHIROperatorSupport(OperatorSupport):
   def is_node_supported(self, submodules, n: torch.fx.Node) -> bool:
@@ -147,31 +171,43 @@ def apply_shir_ops(gm: GraphModule):
   gm.recompile()
 
 def compiler(gm: GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
-  # we ideally would use something like aot_autograd or aot_module_simplified
-  # or the like to decompose into an even smaller instruction set.
-  # unfortunately, doing so loses too much information.
+  # first thing is to perform a set of "early" rewrites, which is just
+  # quantization related rewrites at the moment.
   #
-  # the big problem is that, in order to play nicely with the FPGA, the inputs
-  # and outputs has to located on some page of host RAM. at last, PyTorch does
-  # not seem to offer guarantees on memory location, hence often times we need
-  # to copy.
-  #
-  # yet, for a good amount of data like weights and biases, the copy is not
-  # needed. likewise, depending on the situation, it is possible to avoid the
-  # copy for inputs and outputs.
-  #
-  # by using aot_autograd and friends, you lose access to these values (which
-  # is also the reason why rewrite_quantized_ops had to happen super early.)
-
+  # the reason for this is because these rewrites need access to the weights,
+  # and it is much easier to do so at this stage (compared to after
+  # aot-autograd).
   mode = FakeTensorMode(allow_non_fake_inputs=True)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
-
   rewrites.rewrite_quantized_ops(gm)
 
-  FakeTensorProp(gm, mode).propagate(*example_inputs)
+  # then we hand it off to aot-autograd to perform decompositions.
+  #
+  # we would end up with a graph that only contains decomposed ops and a
+  # signature that contains a mapping to the parameters.
+  aot_gm, sig = aot_export_module(
+    gm, example_inputs,
+    trace_joint=False,
+    decompositions=decomps,
+  )
+  assert len(sig.buffers_to_mutate) == 0, "Mutation is not supported at the moment"
 
+  # which, we use that information to rematerialize the code for fetching the
+  # model arguments.
+  g = aot_gm.graph
+  for n in g.nodes:
+    if n.op == "placeholder" and (param := sig.inputs_to_parameters.get(n.name)):
+      # we bring the parameter from the original graph to the new graph!
+      setattr(aot_gm, param, torch.nn.Parameter(getattr(gm, param), False))
+      with g.inserting_before(n):
+        n1 = g.get_attr(param)
+      n.replace_all_uses_with(n1, propagate_meta=True)
+      g.erase_node(n)
+
+  # with this decomposed + getattr's graph, we can carve out the bits that are
+  # supported by SHIR, and perform extra rewrites as necessary.
   supported_ops = SHIROperatorSupport()
-  partitioner = CapabilityBasedPartitioner(gm, supported_ops, allows_single_node_partition=True)
+  partitioner = CapabilityBasedPartitioner(aot_gm, supported_ops, allows_single_node_partition=True)
   partitions = partitioner.propose_partitions()
   fused_graph = partitioner.fuse_partitions(partitions)
   apply_shir_ops(fused_graph)

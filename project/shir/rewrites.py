@@ -13,14 +13,12 @@ from torch._dynamo.source import (
 )
 from . import functional
 
-# all ops are fine to use, just make sure they are using the correct "key".
-# in most cases, that means whatever.default
+# any ops in aten, shin, qd and even external functions are fine to use. some
+# prims ops are actually not safe to call, but we don't make use of them
+# anyway.
 aten = torch.ops.aten
 shin = torch.ops.shir_intrinsic
 qd = torch.ops.quantized_decomposed
-
-# TODO:
-# the call_method stuff needs to go!
 
 def find_equiv_fixed_slide(shape: torch.Size, output_size: List[int]) -> Optional[List[Tuple[int, int]]]:
   # avoid dealing with the optional channel dimension by indexing in reverse.
