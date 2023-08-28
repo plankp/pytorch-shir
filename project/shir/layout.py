@@ -126,7 +126,7 @@ def read_layout_file(fname: str) -> MemoryLayout:
   return MemoryLayout(entries)
 
 def read_memory_dump(fname: str, entry: LayoutEntry, inner_len: int) -> torch.Tensor:
-  result = torch.empty((entry.outer, inner_len), entry.get_torch_type())
+  result = torch.empty((entry.outer, inner_len), dtype=entry.get_torch_type())
   ety = entry.get_shir_type()
 
   # a memory dump (may) start off with a few lines of comments,
@@ -162,4 +162,4 @@ def read_memory_dump(fname: str, entry: LayoutEntry, inner_len: int) -> torch.Te
           line_data >>= ety.bits
           consumed_bits += ety.bits
 
-  return out
+  return result

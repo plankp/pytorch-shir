@@ -82,7 +82,7 @@ class SHIRProject:
     return layout.read_memory_dump(memory_dump_file, entry, inner_len)
 
   def synthesize(self):
-    synth_dir = slef._output_dir / "synthesis"
+    synth_dir = self.output_dir / "synthesis"
     subprocess.run(
       ['./synthesize.sh', str(Path("..") / "out" / self.clname)],
       check=True, cwd=synth_dir
@@ -235,7 +235,8 @@ class SHIRGraphSimModule(torch.nn.Module):
     super().__init__()
     self.project = project
     self._result_entry = project.load_layout_file().get_entry("result")
-    self._result_shape = shape = _collect_inout_nodes(gm)[1]
+    output_node = _collect_inout_nodes(gm)[1]
+    self._result_shape = shape = output_node.meta.get("val").shape
     self._result_inner = layout.reshape_size_to_matrix(shape)[1]
 
   def __call__(self, *args) -> torch.Tensor:
@@ -250,7 +251,7 @@ class SHIRGraphSimModule(torch.nn.Module):
         ['sbt', f'run --no-gen --sim "{data_dir}"'],
         check=True, cwd=self.project.output_dir
       )
-      return project.read_memory_dump(
+      return self.project.read_memory_dump(
         self._result_entry,
         self._result_inner
       ).reshape(self._result_shape)
