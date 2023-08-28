@@ -4,7 +4,7 @@ Deals with everything memory image / memory layout related
 """
 
 import torch
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from . import types, config
 from functools import reduce
 from dataclasses import dataclass
@@ -45,7 +45,7 @@ class LayoutEntry:
   def cachelines(self) -> int:
     return self.outer * self.inner
 
-  def frombuffer(self, buffer) -> torch.Tensor:
+  def from_buffer(self, buffer) -> torch.Tensor:
     bytes_per_cl = config.CACHELINE_BITS // 8
     return torch.frombuffer(
       buffer,
@@ -82,6 +82,16 @@ class MemoryLayout:
 
     return n
 
+def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
+  ndim = len(t)
+  inner = outer = 1
+  if ndim == 1:
+    inner = t[0]
+  elif ndim > 1:
+    outer = t[0]
+    inner = reduce(lambda x, y: x * y, t[1:])
+  return (outer, inner)
+
 def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
   if t.ndim < 2:
     return t.reshape((1, -1))
@@ -115,16 +125,12 @@ def read_layout_file(fname: str) -> MemoryLayout:
       entries.append(LayoutEntry(name, ty, int(addr, 16), outer, inner))
   return MemoryLayout(entries)
 
-def read_memory_dump(fname: str, entry: LayoutEntry, out: torch.Tensor) -> torch.Tensor:
-  # result shares underlying buffer with out!
-  result = reshape_to_matrix(out)
-  assert result.size(0) == entry.outer, f"Number of outer entries mismatch"
-
-  inner_len = result.size(1)
+def read_memory_dump(fname: str, entry: LayoutEntry, inner_len: int) -> torch.Tensor:
+  result = torch.empty((entry.outer, inner_len), entry.get_torch_type())
   ety = entry.get_shir_type()
 
   # a memory dump (may) start off with a few lines of comments,
-  # it's all lines of cachelines as hex nibbles + '\n'
+  # it's all lines of cachelines as hex nibbles (so divide by 4) + '\n'
   chars_per_line = config.CACHELINE_BITS // 4 + 1
 
   # use binary mode for fseek sanity (even if it may not be needed).
@@ -136,8 +142,7 @@ def read_memory_dump(fname: str, entry: LayoutEntry, out: torch.Tensor) -> torch
 
     # at this point, we read sth that wasn't a comment.
     # unread that since it must be a line of data.
-    #
-    # but after the unread, we want to jump ahead to where the entry starts.
+    # after the unread, we to jump ahead to where the entry starts.
     f.seek(-1 + chars_per_line * entry.address, os.SEEK_CUR)
 
     # at this point, we just repeatedly readline and load the data into the

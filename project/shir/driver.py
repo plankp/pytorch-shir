@@ -1,11 +1,16 @@
+"""
+The Python side of the FPGA driver,
+which is necessary when running with synthesis mode.
+
+This module is expected to be loaded only when synthesis mode is enabled.
+"""
+
 from contextlib import contextmanager
 from typing import Optional
 import ctypes as C
 from . import config
 
 _impl = C.cdll.LoadLibrary(config.DRIVER_LIB)
-
-# don't do it for fpga.h since it is only needed if user wants FPGA support.
 
 # buffer.h
 _impl.alloc_buffer.restype  = C.c_void_p

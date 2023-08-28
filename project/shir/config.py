@@ -8,7 +8,7 @@ All sorts of configuration flags
 PERFORM_SYNTHESIS = False
 
 # the UUID of the accelerator as a bytestring
-# only relevant if PERFORM_SYNTHESIS = True
+# only relevant if PERFORM_SYNTHESIS
 ACCEL_UUID = None
 
 # if we should simulate the hardware
@@ -27,4 +27,5 @@ EMIT_OUTPUT_DIR = "./data/generated"
 TEMPLATE_DIR = "./template"
 
 # the shared library for driver
+# only relevant if PERFORM_SYNTHESIS
 DRIVER_LIB = "./driver/build/libdriver.so"

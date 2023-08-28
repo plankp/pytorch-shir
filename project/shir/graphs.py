@@ -1,17 +1,15 @@
 """
-Where the SHIRGraphModule is defined
+Where the various different SHIR graph modules + compilation logic are defined
 """
 
 import torch
 from torch.fx import GraphModule, Node
 from typing import Tuple, List, Optional, Any
-from . import lowering, types, layout, config, driver
-from functools import reduce
-from itertools import count
+from . import lowering, types, layout, config
 from pathlib import Path
-import ctypes
 import shutil
 import subprocess
+import tempfile
 
 def _collect_inout_nodes(gm: GraphModule) -> Tuple[List[Node], Node]:
   placeholders = []
@@ -53,181 +51,46 @@ def has_many_uses(node: Node) -> bool:
   return False
 
 def _reshape_region(t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-  inner = outer = 1
-  ndim = len(shape)
-  if ndim == 1:
-    inner = shape[0]
-  elif ndim > 1:
-    outer = shape[0]
-    inner = reduce(lambda x, y: x * y, shape[1:])
+  return t.as_strided(
+    layout.reshape_size_to_matrix(shape),
+    (t.stride(0), 1)
+  ).view(shape)
 
-  return t.as_strided((outer, inner), (t.stride(0), 1)).view(shape)
+# a helper class that deals with interacting with sbt project being generated.
+class SHIRProject:
+  clname: str
+  output_dir: Path
 
-# a counter for counting instances of SHIRGraphModule
-# (it's not perfect, but at least it reduces the amount of collisions)
-_iid_counter = count()
+  def __init__(self, clname: str, output_dir: Path):
+    self.clname = clname
+    self.output_dir = output_dir
 
-# since we use CapabilityBasedPartitioner when extracting the subgraph,
-# making this an nn.Module is easier to work with.
-#
-# aside from that, this does not behave like a conventional module:
-# usually the module receives its imput via the __call__ method where it will
-# returns the result as a tensor.
-# in our case, the input values are expected to be provided beforehand by
-# mutating preallocated tensors and the output always returns the same memory
-# location.
-class SHIRGraphModule(torch.nn.Module):
-  # we assume the graph does not change (which it shouldn't...)
-  gm: GraphModule
-  _inst_id: int
-  _call_id: int
-  _clname: str
-  _output_dir: Path
-  _inout_nodes: Optional[Tuple[List[Node], Node]]
-  _inout_tensors: Optional[Tuple[List[torch.Tensor], torch.Tensor]]
-  _layout: Optional[layout.MemoryLayout]
-  _buffer: Optional[Any]  # a buffer
+  def prepare_directory(self):
+    if self.output_dir.exists():
+      shutil.rmtree(self.output_dir)
+    shutil.copytree(config.TEMPLATE_DIR, self.output_dir)
 
-  def __init__(self, gm: GraphModule):
-    super().__init__()
-    self._inst_id = next(_iid_counter)
-    self._call_id = 0
-    self.gm = gm
-    self._clname = f"Module{self._inst_id}"
-    self._output_dir = Path(config.EMIT_OUTPUT_DIR) / f"module{self._inst_id}"
+  def generate_hardware_files(self):
+    subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self.output_dir)
 
-    self._inout_nodes = None
-    self._inout_tensors = None
-    self._layout = None
-    self._buffer = None
+  def load_layout_file(self) -> layout.MemoryLayout:
+    memory_layout_file = self.output_dir / "out" / self.clname / "memory.layout"
+    return layout.read_layout_file(memory_layout_file)
 
-  def __del__(self):
-    self._inout_tensors = None
-    if self._buffer is not None:
-      driver.free_buffer(self._buffer)
-      self._buffer = None  # probably redundant
+  def read_memory_dump(self, entry: layout.LayoutEntry, inner_len: int) -> torch.Tensor:
+    memory_dump_file = self.output_dir / "out" / self.clname / "memory.dump"
+    return layout.read_memory_dump(memory_dump_file, entry, inner_len)
 
-  def get_in_tensor(self, index) -> torch.Tensor:
-    return self.get_inout_tensors()[0][index]
-
-  def get_inout_tensors(self) -> Tuple[List[torch.Tensor], torch.Tensor]:
-    t = self._inout_tensors
-    if t is None:
-      meminfo = self._buffer
-      if meminfo is None:
-        # only enforce page length requirement when running with FPGA.
-        sz = self._layout.bytes_needed(round_to_page=config.PERFORM_SYNTHESIS)
-        meminfo = driver.alloc_buffer(sz)
-        self._buffer = meminfo
-
-      arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(self._inout_nodes[0])}
-      inputs = [None] * len(self._inout_nodes[0])
-      output = None
-
-      for entry in self._layout._entries:
-        region = entry.frombuffer(meminfo)
-        if entry.name == "result":
-          output = _reshape_region(
-            region,
-            self._inout_nodes[1].meta.get("val").shape
-          )
-        else:
-          (arg_id, arg_node) = arg_mapping[entry.name]
-          inputs[arg_id] = _reshape_region(
-            region,
-            arg_node.meta.get("val").shape
-          )
-
-      t = (inputs, output)
-      self._inout_tensors = t
-    return t
-
-  def __call__(self) -> torch.Tensor:
-    # call this first to ensure the memory buffer exists!
-    # (it's also easier for non-synthesis targets to do it here)
-    args, result = self.get_inout_tensors()
-    self._call_id += 1
-
-    if config.PERFORM_SYNTHESIS:
-      with driver.find_and_open_fpga(config.ACCEL_UUID) as fpga:
-        with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
-          fpga.start_computation()
-          while not fpga.is_complete():
-            pass  # spin
-
-          cycles = fpga.read_mmio64(0, 0x88)
-          readreq = fpga.read_mmio64(0, 0xC0)
-          readpending = fpga.read_mmio64(0, 0xD0)
-          readaf = fpga.read_mmio64(0, 0xE0)
-          writereq = fpga.read_mmio64(0, 0xC8)
-          writepending = fpga.read_mmio64(0, 0xD8)
-          writeaf = fpga.read_mmio64(0, 0xE8)
-
-          print(
-            "Execution time (cycles): ", cycles, "\n",
-            "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
-            "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
-            "Read request buffer  ", readaf, " times almost full\n"
-            "Write request buffer ", writeaf, " times almost full",
-            sep="",
-          )
-
-    elif config.PERFORM_SIMULATION:
-      data_dir = self._output_dir / f"data_{self._call_id}"
-      if not data_dir.exists():
-        data_dir.mkdir()
-
-      for i, arg in enumerate(args):
-        with (data_dir / f"arg{i}.csv").open("w", encoding="utf-8") as argf:
-          layout.tensor_to_matrix_csv(arg, argf)
-
-      # here, since the current working directory is already inside the output
-      # directory, reference the particular data folder name directly instead of
-      # using data_dir (since data_dir may contain relative paths, which is bad)
-      subprocess.run(['sbt', f'run --no-gen --sim "data_{self._call_id}"'], check=True, cwd=self._output_dir)
-
-      # assume it didn't crash, then we would have ended up with a memory dump,
-      # from which, we can recover the result.
-      memory_dump_file = self._output_dir / "out" / self._clname / "memory.dump"
-      layout.read_memory_dump(memory_dump_file, self._layout.get_entry("result"), result)
-
-    else:
-      # clearly, the copy here is not needed,
-      # but we do it anyway to keep the __call__ behavior uniform.
-      result.copy_(self.gm(*args))
-
-    return result
-
-  def compile(self):
-    self._prepare_directory()
-    self._emit_source()
-    self._generate_hardware_files()
-
-  def _prepare_directory(self):
-    if self._output_dir.exists():
-      shutil.rmtree(self._output_dir)
-
-    shutil.copytree(config.TEMPLATE_DIR, self._output_dir)
-
-  def _generate_hardware_files(self):
-    # the bare minimum of VHDL and layout file (and maybe others) generation
-    subprocess.run(['sbt', 'run --gen --no-sim'], check=True, cwd=self._output_dir)
-    memory_layout_file = self._output_dir / "out" / self._clname / "memory.layout"
-    self._layout = layout.read_layout_file(memory_layout_file)
-
-    if not config.PERFORM_SYNTHESIS:
-      return
-
-    synth_dir = self._output_dir / "synthesis"
+  def synthesize(self):
+    synth_dir = slef._output_dir / "synthesis"
     subprocess.run(
-      ['./synthesize.sh', str(Path("..") / "out" / self._clname)],
+      ['./synthesize.sh', str(Path("..") / "out" / self.clname)],
       check=True, cwd=synth_dir
     )
 
-  def _emit_source(self):
-    self._inout_nodes = _collect_inout_nodes(self.gm)
+  def emit_source(self, gm):
     with (
-      self._output_dir / "src" / "main" / "scala" / f"{self._clname}.scala"
+      self.output_dir / "src" / "main" / "scala" / f"{self.clname}.scala"
     ).open("w", encoding="utf-8") as f:
       print("// This file is autogenerated", file=f)
       print("import core._", file=f)
@@ -235,43 +98,60 @@ class SHIRGraphModule(torch.nn.Module):
       print("import java.nio.file.Paths", file=f)
 
       print(file=f)
-      print("object", self._clname, "extends GeneratedModel {", file=f)
+      print("object", self.clname, "extends GeneratedModel {", file=f)
 
       print(file=f)
-      print("  val name: String = \"", self._clname, "\"", sep="", file=f)
+      print("  val name: String = \"", self.clname, "\"", sep="", file=f)
 
       print(file=f)
       print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
 
       print(file=f)
-      self._emit_method_generate_ir(f)
+      self._emit_method_load_data(f, gm)
 
       print(file=f)
-      self._emit_method_load_data(f)
+      self._emit_method_generate_ir(f, gm)
 
       print("}", file=f)
 
-  def _emit_method_load_data(self, f):
+  def _emit_method_load_data(self, f, gm):
     print("  def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
 
-    # inputs are always taken from .csv's
-    for i, arg in enumerate(self._inout_nodes[0]):
-      print("    \"arg", i, "\" -> Util.readIntCSV(Paths.get(folder, \"arg", i, ".csv\").toFile()),", sep="", file=f)
+    output_node = None
+    placeholder_id = 0
+    for n in gm.graph.nodes:
+      if n.op == "placeholder":
+        # only inputs come from csv's
+        print(
+          "    \"arg", placeholder_id,
+          "\" -> Util.readIntCSV(Paths.get(folder, \"arg", placeholder_id,
+          ".csv\").toFile()),",
+          sep="", file=f
+        )
+        placeholder_id += 1
 
-    # result is not taken from .csv, but we still need to allocate dummy data
-    # so that the RAM size is correctly calculated during simulation.
-    shape = self._inout_nodes[1].meta.get("val").shape
-    inner = reduce(lambda x, y: x * y, shape[1:], 1)
-    print("    \"result\" -> new UniformSeq(new UniformSeq(0, ", inner, "), ", shape[0], ")", sep="", file=f)
+      elif n.op == "output":
+        assert output_node is None, f"Multi-output node not supported"
+        assert len(n.args) == 1, "Multi-valued output node not supported"
+        output_node = n.args[0].meta.get("val")
+
+    # for the result, we still need to give it some dummy value for simulation
+    # to determine the RAM size.
+    (outer, inner) = layout.reshape_size_to_matrix(output_node.shape)
+    print(
+      "    \"result\" -> new UniformSeq(new UniformSeq(0, ",
+      inner, "), ", outer, ")",
+      sep="", file=f
+    )
 
     print("  )", file=f)
 
-  def _emit_method_generate_ir(self, f):
+  def _emit_method_generate_ir(self, f, gm):
     print("  def generateIR(): Expr = {", file=f)
 
     lets_needed = 0
     placeholder_id = 0
-    for n in self.gm.graph.nodes:
+    for n in gm.graph.nodes:
       # assume every node that has many uses needs to be let-bound,
       # which is definitely the case for tensors (which are SeqType's)
       many_uses = has_many_uses(n)
@@ -279,69 +159,181 @@ class SHIRGraphModule(torch.nn.Module):
         lets_needed += 1
 
       # furthermore, input (placeholder) and output nodes must be 2D in SHIR.
-      match n.op:
-        case "placeholder":
-          typ = types.get_element_type(n)
-          shape = ", ".join((str(d) for d in n.meta.get("val").shape))
+      if n.op == "placeholder":
+        typ = types.get_element_type(n)
+        shape = ", ".join((str(d) for d in n.meta.get("val").shape))
 
-          if many_uses:
-            print(
-              "  { val _init = core.TypeChecker.check(algo.torch.TInput(",
-              typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))\n",
-              "    val _param = core.ParamDef(_init.t)\n",
-              "    core.Let(_param,\n",
-              "  { val ", a.name, " = core.ParamUse(_param)",
-              sep="", file=f
-            )
-          else:
-            print(
-              "    val ", n.name,
-              " = core.TypeChecker.check(algo.torch.TInput(",
-              typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))",
-              sep="", file=f
-            )
-          placeholder_id += 1
+        if many_uses:
+          print(
+            "  { val _init = core.TypeChecker.check(algo.torch.TInput(",
+            typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))\n",
+            "    val _param = core.ParamDef(_init.t)\n",
+            "    core.Let(_param,\n",
+            "  { val ", a.name, " = core.ParamUse(_param)",
+            sep="", file=f
+          )
+        else:
+          print(
+            "    val ", n.name,
+            " = core.TypeChecker.check(algo.torch.TInput(",
+            typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))",
+            sep="", file=f
+          )
+        placeholder_id += 1
 
-        case "output":
-          # sometimes, due to unfortunate graph slicing, we may end up with
-          # multiple outputs, which we cannot handle
-          [retv] = n.args
-          assert isinstance(retv, torch.fx.Node), "Only single node output is allowed"
-          assert not many_uses  # not sure what this failing would mean...
+      elif n.op == "output":
+        # sometimes, due to unfortunate graph slicing, we may end up with
+        # multiple outputs, which we cannot handle
+        [retv] = n.args
+        assert isinstance(retv, Node), "Only single node output is allowed"
+        assert not many_uses  # not sure what this failing would mean...
 
-          shape = retv.meta.get("val").shape
-          dims = len(shape)
-          v = retv.name
+        shape = retv.meta.get("val").shape
+        dims = len(shape)
+        v = retv.name
 
-          if dims < 1:
-            v = f"algo.Repeat({v}, 1)"
-          if dims < 2:
-            v = f"algo.Repeat({v}, 1)"
-          if dims > 2:
-            v = f"algo.torch.TFlatten({v}, 1, {dims - 1})"
-          print("    core.TypeChecker.check(", v, ")", sep="", file=f)
+        if dims < 1:
+          v = f"algo.Repeat({v}, 1)"
+        if dims < 2:
+          v = f"algo.Repeat({v}, 1)"
+        if dims > 2:
+          v = f"algo.torch.TFlatten({v}, 1, {dims - 1})"
+        print("    core.TypeChecker.check(", v, ")", sep="", file=f)
 
-        case "call_function":
-          obj = lowering.fetch_lowering(n.target)
-          expr = obj.lower(*n.args, **n.kwargs)
-          if many_uses:
-            print(
-              "    val _init = core.TypeChecker.check(", expr, ")\n",
-              "    val _param = core.ParamDef(_init.t)\n",
-              "    core.Let(_param,\n",
-              "  { val ", n.name, " = core.ParamUse(_param)",
-              sep="", file=f
-            )
-          else:
-            print(
-              "    val ", n.name, " = core.TypeChecker.check(", expr, ")",
-              sep="", file=f
-            )
+      elif n.op == "call_function":
+        obj = lowering.fetch_lowering(n.target)
+        expr = obj.lower(*n.args, **n.kwargs)
+        if many_uses:
+          print(
+            "    val _init = core.TypeChecker.check(", expr, ")\n",
+            "    val _param = core.ParamDef(_init.t)\n",
+            "    core.Let(_param,\n",
+            "  { val ", n.name, " = core.ParamUse(_param)",
+            sep="", file=f
+          )
+        else:
+          print(
+            "    val ", n.name, " = core.TypeChecker.check(", expr, ")",
+            sep="", file=f
+          )
 
-        case _:
-          assert False, "Unhandled fx node type when emitting"
+      else:
+        assert False, "Unhandled fx node type when emitting"
 
     for _ in range(lets_needed):
       print("  }, _init)", file=f)
 
     print("  }", file=f)
+
+class SHIRGraphSimModule(torch.nn.Module):
+  project: SHIRProject
+  _result_entry: Optional[layout.LayoutEntry]
+  _result_inner: int
+  _result_shape: torch.Size
+
+  def __init__(self, gm: GraphModule, project: SHIRProject):
+    super().__init__()
+    self.project = project
+    self._result_entry = project.load_layout_file().get_entry("result")
+    self._result_shape = shape = _collect_inout_nodes(gm)[1]
+    self._result_inner = layout.reshape_size_to_matrix(shape)[1]
+
+  def __call__(self, *args) -> torch.Tensor:
+    with tempfile.TemporaryDirectory() as data_dir:
+      for i, arg in enumerate(args):
+        with (
+          Path(data_dir) / f"arg{i}.csv"
+        ).open("w", encoding="utf-8") as f:
+          layout.tensor_to_matrix_csv(arg, f)
+
+      subprocess.run(
+        ['sbt', f'run --no-gen --sim "{data_dir}"'],
+        check=True, cwd=self.project.output_dir
+      )
+      return project.read_memory_dump(
+        self._result_entry,
+        self._result_inner
+      ).reshape(self._result_shape)
+
+# as the FPGA wills it, we actually preallocate memory for input and output
+# data. the caller does not pass data via __call__. instead, they should use
+# get_in_tensor to copy the values. for outputs, it will always return the
+# same memory location, so the caller is expected to do a copy (if needed).
+class SHIRGraphFpgaModule(torch.nn.Module):
+  gm: GraphModule
+  _driver: Any  # something that behaves like driver.py
+  _layout: Optional[layout.MemoryLayout]
+  _buffer: Optional[Any]  # buffer allocated by the driver
+  _inputs: Optional[List[torch.Tensor]]
+  _output: Optional[torch.Tensor]
+
+  def __init__(self, gm: GraphModule, project: SHIRProject, driver):
+    super().__init__()
+    self.gm = gm
+    self._driver = driver
+    self._layout = project.load_layout_file()
+    self._buffer = None
+    self._inputs = None
+    self._output = None
+
+  def __call__(self) -> torch.Tensor:
+    self._prepare_buffer()
+
+    with self._driver.find_and_open_fpga(config.ACCEL_UUID) as fpga:
+      with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
+        fpga.start_computation()
+        while not fpga.is_complete():
+          pass  # spin
+
+        cycles = fpga.read_mmio64(0, 0x88)
+        readreq = fpga.read_mmio64(0, 0xC0)
+        readpending = fpga.read_mmio64(0, 0xD0)
+        readaf = fpga.read_mmio64(0, 0xE0)
+        writereq = fpga.read_mmio64(0, 0xC8)
+        writepending = fpga.read_mmio64(0, 0xD8)
+        writeaf = fpga.read_mmio64(0, 0xE8)
+
+        print(
+          "Execution time (cycles): ", cycles, "\n",
+          "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
+          "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
+          "Read request buffer  ", readaf, " times almost full\n"
+          "Write request buffer ", writeaf, " times almost full",
+          sep="",
+        )
+
+    return self._output
+
+  def get_in_tensor(self, index) -> torch.Tensor:
+    self._prepare_buffer()
+    return self._inputs[index]
+
+  def _prepare_buffer(self):
+    meminfo = self._buffer
+    if meminfo is not None:
+      return
+
+    sz = self._layout.bytes_needed(round_to_page=True)
+    meminfo = self._driver.alloc_buffer(sz)
+    self._buffer = meminfo
+
+    (in_nodes, out_node) = _collect_inout_nodes(self.gm)
+    arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(in_nodes)}
+    inputs = [None] * len(in_nodes)
+    output = None
+
+    for entry in self._layout._entries:
+      region = entry.from_buffer(meminfo)
+      if entry.name == "result":
+        output = _reshape_region(region, out_node.meta.get("val").shape)
+      else:
+        (id, node) = arg_mapping[entry.name]
+        inputs[id] = _reshape_region(region, node.meta.get("val").shape)
+
+    self._inputs = inputs
+    self._output = output
+
+  def __del__(self):
+    if self._buffer is not None:
+      self._driver.free_buffer(self._buffer)
+      self._buffer = None

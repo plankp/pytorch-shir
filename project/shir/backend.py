@@ -10,8 +10,10 @@ from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 from torch._subclasses.fake_tensor import FakeTensorMode
+from itertools import count
+from pathlib import Path
 from typing import List, Callable
-from . import types, lowering, graphs, rewrites
+from . import types, lowering, graphs, rewrites, config
 
 class SHIROperatorSupport(OperatorSupport):
   def is_node_supported(self, submodules, n: torch.fx.Node) -> bool:
@@ -48,31 +50,58 @@ def may_avoid_output_copy(original_node: Node) -> bool:
 
   return True
 
+# a global counter used to (hopefully) avoid clashing module names when
+# generating the SHIR projects
+_instance_counter = count()
+
 def apply_shir_ops(gm: GraphModule):
   # look for call_modules which point to a submodule containing only the
-  # supported operators. swap those out with our own SHIRGraphModule and
-  # trigger compilation.
+  # supported operators. we swap them out with our custom submodules depending
+  # on the active configuration.
   for n in gm.graph.nodes:
     if n.op == "call_module":
       assert not n.kwargs
       submod = gm.get_submodule(n.target)
-      # print("\n  FUSED GRAPH\n")
-      # submod.print_readable()
 
-      shir_graph = graphs.SHIRGraphModule(submod)
-      shir_graph.compile()  # trigger compilation
-      gm.delete_submodule(n.target)
-      gm.add_submodule(n.target, shir_graph)
+      idnum = next(_instance_counter)
+      project = graphs.SHIRProject(
+        f"Module{idnum}",
+        Path(config.EMIT_OUTPUT_DIR) / f"module{idnum}"
+      )
 
-  # but recall that SHIRGraphModule places inputs and outputs in special
-  # preallocated buffers, so traverse the graph again to fix this.
+      # regardless of the active configuration, we always trigger compilation.
+      # (we'd like to make sure code type checks and what not)
+      project.prepare_directory()
+      project.emit_source(submod)
+      project.generate_hardware_files()
+
+      shir_graph = None
+      if config.PERFORM_SYNTHESIS:
+        from . import driver
+        project.synthesize()
+        shir_graph = graphs.SHIRGraphFpgaModule(submod, project, driver)
+      elif config.PERFORM_SIMULATION:
+        shir_graph = graphs.SHIRGraphSimModule(submod, project)
+
+      if shir_graph:
+        gm.delete_submodule(n.target)
+        gm.add_submodule(n.target, shir_graph)
+
+  # now is the tricky part.
   #
-  # since our graph now has side effects, we MUST clean up redundant nodes
-  # by ourselves. (eliminate_dead_code removes too much)
+  # SHIRGraphFpgaModule preallocates the inputs and outputs and expects the
+  # caller (us) to pass data by copying it there, so we traverse the graph
+  # again to fix this.
+  #
+  # since our graph now has side effects, we MUST NOT use eliminate_dead_code
+  # to get rid of redundant nodes.
   for n in gm.graph.nodes:
     if n.op == "call_module":
-      pending_erase = []
       submod = gm.get_submodule(n.target)
+      if not isinstance(submod, graphs.SHIRGraphFpgaModule):
+        continue
+
+      pending_erase = []
       args = n.args
 
       g = gm.graph
@@ -80,8 +109,7 @@ def apply_shir_ops(gm: GraphModule):
         n1 = g.get_attr(n.target)
         n1_used = False
         for i, arg in enumerate(args):
-          # we would like to avoid copying the input.
-          # it is difficult, and so, we only look for some common cases.
+          # we try to avoid the input copy by handling some common cases.
           if arg.op == "get_attr" and not graphs.has_many_uses(arg):
             # this is a weight / bias with a single use.
             # we can copy the values into the expected location in advance.
