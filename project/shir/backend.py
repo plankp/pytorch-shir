@@ -17,10 +17,13 @@ from pathlib import Path
 from typing import List, Callable
 from . import types, lowering, graphs, rewrites, config
 
+# some aliases
+aten = torch.ops.aten
+qd = torch.ops.quantized_decomposed
+
 # notes on decompositing core ATen to prims:
 # -  not all core ATen ops have a prims decomposition (e.g. aten.mm)
 # -  not all prims decompositions are "good" (e.g. aten.relu uses masking)
-aten = torch.ops.aten
 shir_decomps = get_decompositions([
   aten._to_copy,
   aten.sym_size,
@@ -119,8 +122,32 @@ def apply_shir_ops(gm: GraphModule):
   #
   # since our graph now has side effects, we MUST NOT use eliminate_dead_code
   # to get rid of redundant nodes.
+  #
+  # also rewrite some qd ops since the torch variants are faster...
   for n in gm.graph.nodes:
-    if n.op == "call_module":
+    if n.op == "call_function" and (
+      n.target == qd.quantize_per_tensor.default and
+      n.args[3] == -128 and n.args[4] == 127 and n.args[5] == torch.int8
+    ):
+      g = gm.graph
+      with g.inserting_before(n):
+        n1 = g.call_function(torch.quantize_per_tensor, (n.args[0], n.args[1], n.args[2]), {"dtype": torch.qint8})
+        n2 = g.call_method("int_repr", (n1,))
+      n.replace_all_uses_with(n2)
+      g.erase_node(n)
+
+    elif n.op == "call_function" and (
+      n.target == qd.dequantize_per_tensor.default and
+      n.args[3] == -128 and n.args[4] == 127 and n.args[5] == torch.int8
+    ):
+      g = gm.graph
+      with g.inserting_before(n):
+        n1 = g.call_function(torch._make_per_tensor_quantized_tensor, (n.args[0], n.args[1], n.args[2]))
+        n2 = g.call_method("dequantize", (n1,))
+      n.replace_all_uses_with(n2)
+      g.erase_node(n)
+
+    elif n.op == "call_module":
       submod = gm.get_submodule(n.target)
       if not isinstance(submod, graphs.SHIRGraphFpgaModule):
         continue
