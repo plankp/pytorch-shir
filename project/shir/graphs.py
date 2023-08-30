@@ -81,6 +81,9 @@ class SHIRProject:
     memory_dump_file = self.output_dir / "out" / self.clname / "memory.dump"
     return layout.read_memory_dump(memory_dump_file, entry, inner_len)
 
+  def get_gbs_file(self) -> Path:
+    return self.output_dir / "synthesis" / "build_synth" / "hello_afu_unsigned_ssl.gbs"
+
   def synthesize(self):
     synth_dir = self.output_dir / "synthesis"
     subprocess.run(
@@ -256,6 +259,8 @@ class SHIRGraphSimModule(torch.nn.Module):
         self._result_inner
       ).reshape(self._result_shape)
 
+_last_flashed_gbs = None
+
 # as the FPGA wills it, we actually preallocate memory for input and output
 # data. the caller does not pass data via __call__. instead, they should use
 # get_in_tensor to copy the values. for outputs, it will always return the
@@ -267,6 +272,7 @@ class SHIRGraphFpgaModule(torch.nn.Module):
   _buffer: Optional[Any]  # buffer allocated by the driver
   _inputs: Optional[List[torch.Tensor]]
   _output: Optional[torch.Tensor]
+  _gbs_file: Path
 
   def __init__(self, gm: GraphModule, project: SHIRProject, driver):
     super().__init__()
@@ -276,9 +282,16 @@ class SHIRGraphFpgaModule(torch.nn.Module):
     self._buffer = None
     self._inputs = None
     self._output = None
+    self._gbs_file = project.get_gbs_file()
 
   def __call__(self) -> torch.Tensor:
     self._prepare_buffer()
+
+    # reconfigure the fpga if needed
+    global _last_flashed_gbs
+    if _last_flashed_gbs is None or not self._gbs_file.samefile(_last_flashed_gbs):
+      subprocess.run(['fpgaconf', '-v', self._gbs_file])
+      _last_flashed_gbs = self._gbs_file
 
     with self._driver.find_and_open_fpga(config.ACCEL_UUID) as fpga:
       with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
