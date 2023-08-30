@@ -2,9 +2,11 @@
 A whole bunch of bit-related utilities for lowering
 """
 
+import torch
 from typing import Tuple, List
 import math
 import struct
+from . import types
 
 def to_signed(v: int, bits=32) -> int:
   v &= (1 << bits) - 1
@@ -55,3 +57,24 @@ def qscale_to_fixpoint(x: List[float]) -> Tuple[List[int], int, int]:
     qvalues[i] = frac
     max_width = max(max_width, frac.bit_length())
   return qvalues, max_width, final_scale
+
+def get_narrow_type(x: torch.Tensor):
+  if x.dtype == torch.bool:
+    return types.UI(1) if torch.any(x) else types.UI(0)
+
+  SUPPORTED_TYPES = {torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64}
+  assert x.dtype in SUPPORTED_TYPES, f"{x.dtype} is not supported"
+
+  max_value = torch.max(x).item()
+  min_value = torch.min(x).item()
+  unsigned = True
+
+  if max_value < 0:
+    unsigned = False
+    max_value = ~max_value
+  if min_value < 0:
+    unsigned = False
+    min_value = ~min_value
+
+  width = max(max_value.bit_length(), min_value.bit_length())
+  return types.UI(width) if unsigned else types.SI(width + 1)
