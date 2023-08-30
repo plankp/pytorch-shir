@@ -266,27 +266,41 @@ _last_flashed_gbs = None
 # get_in_tensor to copy the values. for outputs, it will always return the
 # same memory location, so the caller is expected to do a copy (if needed).
 class SHIRGraphFpgaModule(torch.nn.Module):
-  gm: GraphModule
   _driver: Any  # something that behaves like driver.py
-  _layout: Optional[layout.MemoryLayout]
-  _buffer: Optional[Any]  # buffer allocated by the driver
-  _inputs: Optional[List[torch.Tensor]]
-  _output: Optional[torch.Tensor]
+  _layout: layout.MemoryLayout
   _gbs_file: Path
+  _buffer: Any  # buffer allocated by the driver
+  _inputs: List[torch.Tensor]
+  _output: torch.Tensor
 
   def __init__(self, gm: GraphModule, project: SHIRProject, driver):
     super().__init__()
-    self.gm = gm
     self._driver = driver
     self._layout = project.load_layout_file()
-    self._buffer = None
-    self._inputs = None
-    self._output = None
     self._gbs_file = project.get_gbs_file()
 
-  def __call__(self) -> torch.Tensor:
-    self._prepare_buffer()
+    # allocate the buffer
+    sz = self._layout.bytes_needed(round_to_page=True)
+    meminfo = self._driver.alloc_buffer(sz)
+    self._buffer = meminfo
 
+    (in_nodes, out_node) = _collect_inout_nodes(gm)
+    arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(in_nodes)}
+    inputs = [None] * len(in_nodes)
+    output = None
+
+    for entry in self._layout._entries:
+      region = entry.from_buffer(meminfo)
+      if entry.name == "result":
+        output = _reshape_region(region, out_node.meta.get("val").shape)
+      else:
+        (id, node) = arg_mapping[entry.name]
+        inputs[id] = _reshape_region(region, node.meta.get("val").shape)
+
+    self._inputs = inputs
+    self._output = output
+
+  def __call__(self) -> torch.Tensor:
     # reconfigure the fpga if needed
     global _last_flashed_gbs
     if _last_flashed_gbs is None or not self._gbs_file.samefile(_last_flashed_gbs):
@@ -319,33 +333,7 @@ class SHIRGraphFpgaModule(torch.nn.Module):
     return self._output
 
   def get_in_tensor(self, index) -> torch.Tensor:
-    self._prepare_buffer()
     return self._inputs[index]
-
-  def _prepare_buffer(self):
-    meminfo = self._buffer
-    if meminfo is not None:
-      return
-
-    sz = self._layout.bytes_needed(round_to_page=True)
-    meminfo = self._driver.alloc_buffer(sz)
-    self._buffer = meminfo
-
-    (in_nodes, out_node) = _collect_inout_nodes(self.gm)
-    arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(in_nodes)}
-    inputs = [None] * len(in_nodes)
-    output = None
-
-    for entry in self._layout._entries:
-      region = entry.from_buffer(meminfo)
-      if entry.name == "result":
-        output = _reshape_region(region, out_node.meta.get("val").shape)
-      else:
-        (id, node) = arg_mapping[entry.name]
-        inputs[id] = _reshape_region(region, node.meta.get("val").shape)
-
-    self._inputs = inputs
-    self._output = output
 
   def __del__(self):
     if self._buffer is not None:
