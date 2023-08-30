@@ -91,7 +91,7 @@ class SHIRProject:
       check=True, cwd=synth_dir
     )
 
-  def emit_source(self, gm):
+  def emit_source(self, gm, arg_elt_types):
     with (
       self.output_dir / "src" / "main" / "scala" / f"{self.clname}.scala"
     ).open("w", encoding="utf-8") as f:
@@ -113,7 +113,7 @@ class SHIRProject:
       self._emit_method_load_data(f, gm)
 
       print(file=f)
-      self._emit_method_generate_ir(f, gm)
+      self._emit_method_generate_ir(f, gm, arg_elt_types)
 
       print("}", file=f)
 
@@ -149,7 +149,7 @@ class SHIRProject:
 
     print("  )", file=f)
 
-  def _emit_method_generate_ir(self, f, gm):
+  def _emit_method_generate_ir(self, f, gm, arg_elt_types):
     print("  def generateIR(): Expr = {", file=f)
 
     lets_needed = 0
@@ -163,13 +163,22 @@ class SHIRProject:
 
       # furthermore, input (placeholder) and output nodes must be 2D in SHIR.
       if n.op == "placeholder":
-        typ = types.get_element_type(n)
-        shape = ", ".join((str(d) for d in n.meta.get("val").shape))
+        # since the actual input data might be narrower than PyTorch's types,
+        # we read the input as the SHIR type, and then instantly promote it
+        # into PyTorch's data type.
 
+        data_typ = types.get_element_type(n)
+        real_typ = arg_elt_types[placeholder_id] or data_typ
+        shapeinfo = n.meta.get("val").shape
+        shape = ", ".join((str(d) for d in shapeinfo))
+
+        casted_input = lowering.LowerConvEltTy.emit(
+          f"algo.torch.TInput({real_typ.name()}, \"arg{placeholder_id}\", Seq({shape}))",
+          len(shapeinfo), real_typ, data_typ
+        )
         if many_uses:
           print(
-            "  { val _init = core.TypeChecker.check(algo.torch.TInput(",
-            typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))\n",
+            "  { val _init = core.TypeChecker.check(", casted_input, ")\n",
             "    val _param = core.ParamDef(_init.t)\n",
             "    core.Let(_param,\n",
             "  { val ", a.name, " = core.ParamUse(_param)",
@@ -177,9 +186,7 @@ class SHIRProject:
           )
         else:
           print(
-            "    val ", n.name,
-            " = core.TypeChecker.check(algo.torch.TInput(",
-            typ.name(), ", \"arg", placeholder_id, "\", Seq(", shape, ")))",
+            "    val ", n.name, " = core.TypeChecker.check(", casted_input, ")",
             sep="", file=f
           )
         placeholder_id += 1
@@ -290,10 +297,19 @@ class SHIRGraphFpgaModule(torch.nn.Module):
     output = None
 
     for entry in self._layout._entries:
-      region = entry.from_buffer(meminfo)
+      # some inputs have reduced bitwidth and are not representable by
+      # PyTorch. leave the cell as None in those cases.
+      #
+      # it is technically possible to have a int32 buffer reduced as s8.
+      # in this case, the input will have a corresponding tensor since
+      # we can use int8 for that.
+      region = None
+      if entry.get_torch_type() is not None:
+        region = entry.from_buffer(meminfo)
+
       if entry.name == "result":
         output = _reshape_region(region, out_node.meta.get("val").shape)
-      else:
+      elif region is not None:
         (id, node) = arg_mapping[entry.name]
         inputs[id] = _reshape_region(region, node.meta.get("val").shape)
 

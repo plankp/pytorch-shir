@@ -172,12 +172,18 @@ class LowerConvEltTy:
       case _:
         return False
 
+  @classmethod
+  def lower(cls, a, dtype) -> str:
+    return cls.emit(
+      a.name, len(a.meta.get("val").shape),
+      types.get_element_type(a),
+      types.get_scalar_type(dtype),
+    )
+
   @staticmethod
-  def lower(a, dtype) -> str:
-    atype = types.get_element_type(a)
-    dtype = types.get_scalar_type(dtype)
+  def emit(aname, arank, atype, dtype) -> str:
     if atype == dtype:
-      return a.name
+      return aname
 
     ss, sbits = types.unpack_int_type(atype)
     ds, dbits = types.unpack_int_type(dtype)
@@ -195,7 +201,7 @@ class LowerConvEltTy:
     else:
       # sign extend (assert is for sanity purposes)
       assert ss and sbits < dbits
-      inner = f"algo.Add2(core.ParamUse(_0), algo.ConstantInteger(0, Some(algo.SignedIntType({dbits}))))"
+      inner = f"core.Conversion(core.ParamUse(_0), algo.SignedIntType({dbits}))"
       if not ds:
         # convert from signed to unsigned
         inner = f"core.Conversion({inner}, {dtype.name()})"
@@ -203,8 +209,7 @@ class LowerConvEltTy:
         f"{{ val _0 = core.ParamDef({atype.name()}); algo.AlgoLambda(_0, {inner}) }}"
       )
 
-    rank = len(a.meta.get("val").shape)
-    return f"algo.Map({rank}, {converter}, {a.name})"
+    return f"algo.Map({arank}, {converter}, {aname})"
 
 class LowerArithBinaryOperatorTemplate:
   @staticmethod

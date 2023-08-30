@@ -15,7 +15,7 @@ from torch._decomp import core_aten_decompositions, get_decompositions
 from itertools import count
 from pathlib import Path
 from typing import List, Callable
-from . import types, lowering, graphs, rewrites, config
+from . import types, lowering, graphs, rewrites, config, bit_utils
 
 # some aliases
 aten = torch.ops.aten
@@ -96,10 +96,23 @@ def apply_shir_ops(gm: GraphModule):
         Path(config.EMIT_OUTPUT_DIR) / f"module{idnum}"
       )
 
-      # regardless of the active configuration, we always trigger compilation.
-      # (we'd like to make sure code type checks and what not)
+      # at this point, all outer values are passed into the inner graph as
+      # arguments / placeholders. weights and biases are known, and can be
+      # recovered by looking for get_attr nodes.
+      #
+      # we look for them and calculate the narrowest possible SHIR type for
+      # these values.
+      #
+      # use array instead of map due to lack of sparsity for quantized models.
+      arg_elt_types = [None] * len(n.args)
+      for i, arg in enumerate(n.args):
+        if arg.op == "get_attr":
+          arg_elt_types[i] = bit_utils.get_narrow_type(getattr(gm, arg.target))
+
+      # then trigger compilation regardless of active configuration using the
+      # bitwidth information
       project.prepare_directory()
-      project.emit_source(submod)
+      project.emit_source(submod, arg_elt_types)
       project.generate_hardware_files()
 
       shir_graph = None
@@ -116,14 +129,25 @@ def apply_shir_ops(gm: GraphModule):
 
   # now is the tricky part.
   #
-  # SHIRGraphFpgaModule preallocates the inputs and outputs and expects the
-  # caller (us) to pass data by copying it there, so we traverse the graph
-  # again to fix this.
+  # both SHIR graphs may be expecting inputs of reduced bitwidth (see above).
   #
-  # since our graph now has side effects, we MUST NOT use eliminate_dead_code
-  # to get rid of redundant nodes.
+  # for SHIRGraphSimModule, this is (presently) not a problem since it always
+  # passes values by serializing the tensors into csv's, and the
+  # deserialization business is done in layout.py.
   #
-  # also rewrite some qd ops since the torch variants are faster...
+  # for SHIRGraphFpgaModule, however, we have two problems:
+  # 1.  it preallocates memory for the input and output, so we need to make
+  #     the values go to where it expects it to be.
+  # 2.  PyTorch does not support variable bitwidth values, so naive copy is
+  #     not going to work.
+  #
+  # note that thankfully, the 2nd case only happens to weights and bias, so
+  # we only do the tricky copy once.
+  #
+  # with this copying, our graph is no longer side effect free, so DO NOT use
+  # eliminate_dead_code to get rid of redundant nodes.
+  #
+  # also rewrite some operations. e.g. qd ops because they are slow...
   for n in gm.graph.nodes:
     if n.op == "call_function" and (
       n.target == qd.quantize_per_tensor.default and
@@ -152,24 +176,25 @@ def apply_shir_ops(gm: GraphModule):
       if not isinstance(submod, graphs.SHIRGraphFpgaModule):
         continue
 
-      pending_erase = []
       args = n.args
-
       g = gm.graph
       with g.inserting_before(n):
         n1 = g.get_attr(n.target)
         n1_used = False
         for i, arg in enumerate(args):
           # we try to avoid the input copy by handling some common cases.
-          if arg.op == "get_attr" and not graphs.has_many_uses(arg):
-            # this is a weight / bias with a single use.
-            # we can copy the values into the expected location in advance.
+          if arg.op == "get_attr":
+            # this is a weight / bias. we can copy the values into the shared
+            # memory buffers AOT.
             dst = submod.get_in_tensor(i)
-            dst.copy_(getattr(gm, arg.target))
-            setattr(gm, arg.target, torch.nn.Parameter(dst, False))
-            # at this point, the original node still "uses" this arg,
-            # so delay the erase to later
-            pending_erase.append(arg)
+            src = getattr(gm, arg.target)
+            if dst is not None:
+              dst.copy_(src)
+            else:
+              # reaching here means the weights have reduced to a bitwidth that is
+              # not supported by PyTorch. example: int32 bias reduced as s20.
+              entry = submod._layout.get_entry(f"arg{i}")
+              entry.to_buffer(submod._buffer, src)
 
           else:
             n1_used = True
@@ -190,8 +215,6 @@ def apply_shir_ops(gm: GraphModule):
 
       n.replace_all_uses_with(n_result)
       g.erase_node(n)
-      for n in reversed(pending_erase):
-        g.erase_node(n)
 
   # for sanity sake, recompile it.
   gm.graph.lint()

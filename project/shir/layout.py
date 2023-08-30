@@ -5,7 +5,7 @@ Deals with everything memory image / memory layout related
 
 import torch
 from typing import List, Optional, Tuple
-from . import types, config
+from . import types, config, bit_utils
 from functools import reduce
 from dataclasses import dataclass
 import mmap
@@ -15,14 +15,22 @@ _SUPPORTED_TORCH_TYPES = {
   torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
 }
 
-# this is good enough for our purposes
-_MEMORY_LAYOUT_TYPE_MAP = {
-  "u8": (types.UI(8), torch.uint8),
-  "s8": (types.SI(8), torch.int8),
-  "s16": (types.SI(16), torch.int16),
-  "s32": (types.SI(32), torch.int32),
-  "s64": (types.SI(64), torch.int64),
-}
+def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
+  ndim = len(t)
+  inner = outer = 1
+  if ndim == 1:
+    inner = t[0]
+  elif ndim > 1:
+    outer = t[0]
+    inner = reduce(lambda x, y: x * y, t[1:])
+  return (outer, inner)
+
+def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
+  if t.ndim < 2:
+    return t.reshape((1, -1))
+  if t.ndim > 2:
+    return t.reshape((t.size(0), -1))
+  return t
 
 """
 Our representation of SHIR's MemoryLayout class.
@@ -37,10 +45,20 @@ class LayoutEntry:
   inner     : int   # number of cachelines for each row
 
   def get_shir_type(self):
-    return _MEMORY_LAYOUT_TYPE_MAP[self._ty][0]
+    if self._ty[0] == 'u':
+      return types.UI(int(self._ty[1:]))
+    if self._ty[0] == 's':
+      return types.SI(int(self._ty[1:]))
+    return None
 
   def get_torch_type(self):
-    return _MEMORY_LAYOUT_TYPE_MAP[self._ty][1]
+    return {
+      "u8": torch.uint8,
+      "s8": torch.int8,
+      "s16": torch.int16,
+      "s32": torch.int32,
+      "s64": torch.int64,
+    }.get(self._ty)
 
   def cachelines(self) -> int:
     return self.outer * self.inner
@@ -53,6 +71,31 @@ class LayoutEntry:
       offset=self.address * bytes_per_cl,
       count=self.cachelines() * bytes_per_cl,
     ).view(self.outer, -1).view(self.get_torch_type())
+
+  def to_buffer(self, buffer, tensor: torch.Tensor):
+    tensor = reshape_to_matrix(tensor)
+    assert tensor.dtype in _SUPPORTED_TORCH_TYPES, "Tensor dtype is not supported"
+    ety = self.get_shir_type()
+    mask = (1 << ety.bits) - 1
+    bytes_per_cl = config.CACHELINE_BITS // 8
+    line_offset = self.address * bytes_per_cl
+    for row in range(min(self.outer, tensor.size(0))):
+      col = 0
+      for i in range(self.inner):
+        line_data = 0
+        shamt = 0
+
+        # we only write full pieces of data on each cacheline.
+        # if it does not fit, then it goes onto the next cacheline.
+        while col < tensor.size(1) and shamt + ety.bits <= config.CACHELINE_BITS:
+          # use cast to normalize / extend accordingly then use the mask to
+          # get rid of the unwanted sign bits.
+          line_data |= (ety.cast(tensor[row, col].item()) & mask) << shamt
+          col += 1
+          shamt += ety.bits
+
+        buffer[line_offset:line_offset + bytes_per_cl] = line_data.to_bytes(bytes_per_cl, byteorder="little")
+        line_offset += bytes_per_cl
 
 class MemoryLayout:
   def __init__(self, entries: List[LayoutEntry]):
@@ -81,23 +124,6 @@ class MemoryLayout:
       n = (n + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
 
     return n
-
-def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
-  ndim = len(t)
-  inner = outer = 1
-  if ndim == 1:
-    inner = t[0]
-  elif ndim > 1:
-    outer = t[0]
-    inner = reduce(lambda x, y: x * y, t[1:])
-  return (outer, inner)
-
-def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
-  if t.ndim < 2:
-    return t.reshape((1, -1))
-  if t.ndim > 2:
-    return t.reshape((t.size(0), -1))
-  return t
 
 def tensor_to_matrix_csv(t: torch.Tensor, f):
   assert t.dtype in _SUPPORTED_TORCH_TYPES, "Tensor dtype is not supported"
@@ -153,8 +179,13 @@ def read_memory_dump(fname: str, entry: LayoutEntry, inner_len: int) -> torch.Te
         line = f.readline().rstrip()
         line_data = int(line, base=16)
 
+        # in case we have ugly data widths such as 20 bit integers over a 512
+        # bit cacheline, you only have floor(512/20) = 25 pieces of data per
+        # cacheline. the remaining data starts on the next cacheline.
+        #
+        # hence, the loop condition with consumed-bits is calculated this way.
         consumed_bits = 0
-        while inner < inner_len and consumed_bits < config.CACHELINE_BITS:
+        while inner < inner_len and consumed_bits + ety.bits <= config.CACHELINE_BITS:
           # the line goes from high memory to low memory.
           # that means we just need to extract the low part.
           result[outer, inner] = ety.cast(line_data)
