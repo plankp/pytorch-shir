@@ -103,6 +103,18 @@ def qadd_meta(self, s1, rhs, s2, z):
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
+  "qconv(Tensor self, int zp, Tensor weights, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "qconv", "CompositeExplicitAutograd")
+def qconv_meta(self, zp, weights, stride, padding, dilation, groups):
+  assert self.dtype == weights.dtype == torch.int8
+  return aten.convolution(
+    self.float() - zp, weights.float(), None,
+    stride, padding, dilation, False, [0], groups
+  ).int()
+
+shir_intrinsic_lib.define(
   "int_addmm(Tensor self, Tensor lhs, Tensor rhs) -> Tensor"
 )
 
@@ -128,17 +140,8 @@ shir_intrinsic_lib.define(
 
 @impl(shir_intrinsic_lib, "int_max_pool2d", "CompositeExplicitAutograd")
 def int_max_pool2d(self, kern_size, stride, pad, dilation):
-  assert self.dtype in {torch.int8, torch.int32}
+  assert self.dtype == torch.int8
   return aten.max_pool2d(self.float(), kern_size, stride, pad, dilation).to(self.dtype)
-
-shir_intrinsic_lib.define(
-  "int_adaptive_avg_pool2d(Tensor self, int[2] output_size) -> Tensor"
-)
-
-@impl(shir_intrinsic_lib, "int_adaptive_avg_pool2d", "CompositeExplicitAutograd")
-def int_adaptive_avg_pool2d(self, output_size):
-  assert self.dtype == torch.int32
-  return aten._adaptive_avg_pool2d(self.float(), output_size).to(self.dtype)
 
 shir_intrinsic_lib.define(
   "int_avg_pool2d(Tensor self, int[2] kernel_size, int[2] stride, int[2] padding) -> Tensor"
@@ -146,7 +149,7 @@ shir_intrinsic_lib.define(
 
 @impl(shir_intrinsic_lib, "int_avg_pool2d", "CompositeExplicitAutograd")
 def int_avg_pool2d(self, kernel_size, stride, padding):
-  assert self.dtype == torch.int32
+  assert self.dtype == torch.int8
   assert len(kernel_size) == len(stride) == len(padding) == 2
   return torch.round(aten.avg_pool2d(self.float(), kernel_size, stride, padding)).to(self.dtype)
 
@@ -157,5 +160,5 @@ shir_intrinsic_lib.define(
 @impl(shir_intrinsic_lib, "int_mean", "CompositeExplicitAutograd")
 def int_mean(self, dim, keepDim):
   # we sneak a round it to get an answer that is "closer" to SHIR
-  assert self.dtype == torch.int32
+  assert self.dtype == torch.int8
   return torch.round(aten.mean.dim(self.float(), dim, keepDim)).to(self.dtype)

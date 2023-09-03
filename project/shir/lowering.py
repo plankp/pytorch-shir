@@ -172,12 +172,18 @@ class LowerConvEltTy:
       case _:
         return False
 
+  @classmethod
+  def lower(cls, a, dtype) -> str:
+    return cls.emit(
+      a.name, len(a.meta.get("val").shape),
+      types.get_element_type(a),
+      types.get_scalar_type(dtype),
+    )
+
   @staticmethod
-  def lower(a, dtype) -> str:
-    atype = types.get_element_type(a)
-    dtype = types.get_scalar_type(dtype)
+  def emit(aname, arank, atype, dtype) -> str:
     if atype == dtype:
-      return a.name
+      return aname
 
     ss, sbits = types.unpack_int_type(atype)
     ds, dbits = types.unpack_int_type(dtype)
@@ -195,7 +201,7 @@ class LowerConvEltTy:
     else:
       # sign extend (assert is for sanity purposes)
       assert ss and sbits < dbits
-      inner = f"algo.Add2(core.ParamUse(_0), algo.ConstantInteger(0, Some(algo.SignedIntType({dbits}))))"
+      inner = f"core.Conversion(core.ParamUse(_0), algo.SignedIntType({dbits}))"
       if not ds:
         # convert from signed to unsigned
         inner = f"core.Conversion({inner}, {dtype.name()})"
@@ -203,8 +209,7 @@ class LowerConvEltTy:
         f"{{ val _0 = core.ParamDef({atype.name()}); algo.AlgoLambda(_0, {inner}) }}"
       )
 
-    rank = len(a.meta.get("val").shape)
-    return f"algo.Map({rank}, {converter}, {a.name})"
+    return f"algo.Map({arank}, {converter}, {aname})"
 
 class LowerArithBinaryOperatorTemplate:
   @staticmethod
@@ -407,35 +412,31 @@ class LowerShirIntAddmm:
   def lower(acc, lhs, rhs) -> str:
     return f"algo.torch.SIAdd32MM8({acc.name}, {lhs.name}, {rhs.name})"
 
-@register_lowering(aten.convolution.default)
-class LowerConvolution:
+@register_lowering(shin.qconv.default)
+class LowerQConv:
   @staticmethod
-  def supports(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> bool:
-    if transposed:
-      return False
-    if any((p != 0 for p in output_padding)):
-      return False
-
-    # disallow bias here. expect a rewrite to move it into a separate add.
-    if bias is not None:
-      return False
-
-    # some cases that are technically allowed, but we weren't able to
-    # reproduce it.
+  def supports(input, zp, weight, stride, padding, dilation, groups) -> bool:
+    # sanity check: the underlying aten.convolution supports them,
+    # but the normal nn.ConvNd doesn't seem to generate these cases.
+    # we could handle them, but we disable for now.
     N = len(input.meta.get("val").shape) - 2
     if N != len(stride) or N != len(padding) or N != len(dilation):
+      return False
+
+    # groups implementation is broken due to unfortunate zipping + select.
+    # disable for now.
+    if groups != 1:
       return False
 
     return True
 
   @staticmethod
-  def lower(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups) -> str:
+  def lower(input, zp, weight, stride, padding, dilation, groups) -> str:
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     return (
-      f"algo.torch.TConvolution({types.get_element_type(input).name()},"
-      f" {input.name}, {weight.name},"
+      f"algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
       f" Seq({stride}), Seq({padding}), Seq({dilation}),"
       f" {groups})"
     )
@@ -510,71 +511,3 @@ class LowerAvgPool2D:
       f" {has_channel}, {input.name}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq(1, 1))"
     )
-
-@register_lowering(shin.int_adaptive_avg_pool2d.default)
-class LowerAdaptiveAvgPool2D:
-  @classmethod
-  def supports(cls, input, output_size) -> bool:
-    # the "adaptive" aspect of adaptive pooling operators is difficult to
-    # implement correctly.
-    #
-    # fortunately, provided the input is preprocessed correctly, torchvision
-    # models tend to not trigger the difficult cases.
-    #
-    # that means, we only support the case where we can convert it into an
-    # equivalent non-adaptive pooling operator.
-
-    N = 2
-    if N != len(output_size):
-      return False
-
-    ashape = input.meta.get("val").shape
-    if cls._find_equivalent_slide(ashape, output_size) is None:
-      return False
-
-    return True
-
-  @classmethod
-  def lower(cls, input, output_size) -> str:
-    # input is either T[N, i1, i2] or T[N, C, i1, i2]
-    ashape = input.meta.get("val").shape
-    rank = len(ashape)
-
-    rslide_info = cls._find_equivalent_slide(ashape, output_size)
-    has_channel = "true" if rank != 3 else "false"
-    kernel_size = ", ".join((str(d[0]) for d in reversed(rslide_info)))
-    stride = ", ".join((str(d[1]) for d in reversed(rslide_info)))
-    return (
-      f"algo.torch.TPool.iavg({types.get_element_type(input).name()},"
-      f" {has_channel}, {input.name}, Seq({kernel_size}),"
-      f" Seq({stride}), Seq(0, 0), Seq(1, 1))"
-    )
-
-  @staticmethod
-  def _find_equivalent_slide(shape, output_size):
-    # use reversed zip to avoid shape's channel dimension being problematic
-    rev = []
-    for in_size, out_size in zip(reversed(shape), reversed(output_size)):
-      # start uses floor division
-      # end uses ceiling division
-      assert in_size > 0 and out_size > 0
-      last_start = 0
-      last_end = -(in_size // -out_size)
-      window_size = last_end - last_start
-      stride = None
-
-      for i in range(1, out_size):
-        start = i * in_size // out_size
-        end = -((i + 1) * in_size // -out_size)
-        if end - start != window_size:
-          return None
-
-        next_stride = start - last_start
-        if stride is None:
-          stride = next_stride
-        elif stride != next_stride:
-          return None
-
-        last_start, last_end = start, end
-      rev.append((window_size, stride or 1))
-    return rev
