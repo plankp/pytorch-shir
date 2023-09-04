@@ -49,14 +49,18 @@ class LowerShirRequantize:
 
     if fixpoint_method:
       requant_kernel = (
-        f"algo.torch.SIRequantFixed32.asFunction("
-        f"{w}, algo.ConstantInteger({q}, Some(algo.IntType({w}))), {shamt}, {z})"
+        f"algo.torch.RequantFixedInt8.asFunction("
+        f"Seq(None,"
+        f" Some(algo.ConstantInteger({q}, Some(algo.IntType({w}))))),"
+        f" Seq({shamt}, {z}))"
       )
     else:
       fbits32 = bit_utils.to_signed(bit_utils.f32_to_bits(s), 32)
       requant_kernel = (
-        f"algo.torch.SIRequantFloat32.asFunction("
-        f"algo.ConstantInteger({fbits32}, Some(algo.IntType(32))), {z})"
+        f"algo.torch.RequantFloatInt8.asFunction("
+        f"Seq(None,"
+        f" Some(algo.ConstantInteger({fbits32}, Some(algo.IntType(32)))),"
+        f" Seq({z}))"
       )
 
     rank = len(a.meta.get("val").shape)
@@ -82,16 +86,16 @@ class LowerShirRequantizeChannel:
     # hence the bare minimum is to reverse the stream.
     if fixpoint_method:
       sseq = reversed(q)
-      requant_kernel = f"algo.torch.SIRequantFixed32.asFunction({w}, {shamt}, {z})"
+      requant_kernel = f"algo.torch.RequantFixedInt8.asPerChannelFunction({shamt}, {z})"
 
     else:
       w = 32
       sseq = (bit_utils.f32_to_bits(x) for x in reversed(s))
-      requant_kernel = f"algo.torch.SIRequantFloat32.asFunction({z})"
+      requant_kernel = f"algo.torch.RequantFloatInt8.asPerChannelFunction({z})"
 
     sseq = ", ".join((str(bit_utils.to_signed(x, 32)) for x in sseq))
     return (
-      f"algo.torch.TZipChannel({requant_kernel}, {a.name},"
+      f"algo.torch.ZipChannel({requant_kernel}, {a.name},"
       f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))"
     )
 
@@ -109,14 +113,15 @@ class LowerFlatten:
       return f"algo.Repeat({a.name}, 1)"
 
     # otherwise, get rid of the negative indexing and then use
-    # algo.torch.TFlatten.
+    # algo.torch.Flatten.
     if start < 0:
       start = rank + start
     if end < 0:
       end = rank + end
 
-    return f"algo.torch.TFlatten({a.name}, {start}, {end})"
+    return f"algo.torch.Flatten({a.name}, {start}, {end})"
 
+'''
 @register_lowering(aten.view.default)
 class LowerView:
   @staticmethod
@@ -366,6 +371,7 @@ class LowerQadd:
       f"algo.torch.TZipAll(algo.torch.SIRequantAdd32.asFunction("
       f"{w}, {ia}, {ib}, {shamt}, {z}), {a.name}, {b.name})"
     )
+'''
 
 @register_lowering(aten.relu.default)
 class LowerRelu:
@@ -385,7 +391,7 @@ class LowerClamp:
     s32 = types.SI(32)
     ty = types.get_element_type(a)
     tmin = max(s32.minval(), ty.minval())
-    tmax = max(s32.maxval(), ty.maxval())
+    tmax = min(s32.maxval(), ty.maxval())
     return (
       (clmin is None or tmin <= clmin <= tmax) and
       (clmax is None or tmin <= clmax <= tmax)
@@ -393,14 +399,21 @@ class LowerClamp:
 
   @staticmethod
   def lower(a, clmin=None, clmax=None) -> str:
-    ty = types.get_element_type(a)
+    # the assumption (from #supports) is that clamping limits, if not None,
+    # are valid values of the type AND s32 (due to SHIR).
+    is_signed = isinstance(types.get_element_type(a), types.SI)
+    vmin = "None" if clmin is None else f"Some({LowerClamp.remat(clmin, is_signed)})"
+    vmax = "None" if clmax is None else f"Some({LowerClamp.remat(clmax, is_signed)})"
+
     rank = len(a.meta.get("val").shape)
-    vmin = "None" if clmin is None else f"Some({clmin})"
-    vmax = "None" if clmax is None else f"Some({clmax})"
-    return (
-      f"algo.Map({rank}, algo.torch.IClamp.asFunction("
-      f"{ty.name()}, {vmin}, {vmax}), {a.name})"
-    )
+    return f"algo.Map({rank}, algo.torch.Clamp.asFunction({vmin}, {vmax}), {a.name})"
+
+  @staticmethod
+  def remat(x: int, signed: bool) -> str:
+    bits = (~x if x < 0 else x).bit_length()
+    if signed:
+      return f"algo.ConstantInteger({x}, Some(algo.SignedIntType({bits + 1})))"
+    return f"algo.ConstantInteger({x}, Some(algo.IntType({max(bits, 1)})))"
 
 @register_lowering(shin.int_addmm.default)
 class LowerShirIntAddmm:
@@ -410,8 +423,12 @@ class LowerShirIntAddmm:
 
   @staticmethod
   def lower(acc, lhs, rhs) -> str:
-    return f"algo.torch.SIAdd32MM8({acc.name}, {lhs.name}, {rhs.name})"
+    return (
+      f"algo.Map(2, algo.torch.MaybeTruncInt.signed(32),"
+      f" algo.torch.AddMMInt({acc.name}, {lhs.name}, {rhs.name}))"
+    )
 
+'''
 @register_lowering(shin.qconv.default)
 class LowerQConv:
   @staticmethod
@@ -511,3 +528,4 @@ class LowerAvgPool2D:
       f" {has_channel}, {input.name}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq(1, 1))"
     )
+'''

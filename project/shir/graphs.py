@@ -163,22 +163,25 @@ class SHIRProject:
 
       # furthermore, input (placeholder) and output nodes must be 2D in SHIR.
       if n.op == "placeholder":
-        # since the actual input data might be narrower than PyTorch's types,
-        # we read the input as the SHIR type, and then instantly promote it
-        # into PyTorch's data type.
+        # since these are all tensors, we would have gotten type and shape
+        # annotations on all of them.
+        #
+        # the actual SHIR type may be different from the tensors' metadata:
+        # -  the signedness has to match
+        # -  the width may be narrower than the annotation
+        #
+        # the users can assume input tensors already satisfy these properties
+        # and are expected to do the corresponding extension if necessary.
 
-        data_typ = types.get_element_type(n)
-        real_typ = arg_elt_types[placeholder_id] or data_typ
-        shapeinfo = n.meta.get("val").shape
-        shape = ", ".join((str(d) for d in shapeinfo))
+        real_typ = arg_elt_types[placeholder_id] or types.get_element_type(n)
+        shape = ", ".join((str(d) for d in n.meta.get("val").shape))
 
-        casted_input = lowering.LowerConvEltTy.emit(
-          f"algo.torch.TInput({real_typ.name()}, \"arg{placeholder_id}\", Seq({shape}))",
-          len(shapeinfo), real_typ, data_typ
-        )
         if many_uses:
           print(
-            "  { val _init = core.TypeChecker.check(", casted_input, ")\n",
+            "  { val _init = core.TypeChecker.check(",
+            "algo.torch.Input(", real_typ.name(),
+            ", \"arg", placeholder_id, "\", Seq(", shape, "))",
+            ")\n",
             "    val _param = core.ParamDef(_init.t)\n",
             "    core.Let(_param,\n",
             "  { val ", a.name, " = core.ParamUse(_param)",
@@ -186,7 +189,10 @@ class SHIRProject:
           )
         else:
           print(
-            "    val ", n.name, " = core.TypeChecker.check(", casted_input, ")",
+            "    val ", n.name, " = core.TypeChecker.check(",
+            "algo.torch.Input(", real_typ.name(),
+            ", \"arg", placeholder_id, "\", Seq(", shape, "))",
+            ")",
             sep="", file=f
           )
         placeholder_id += 1
@@ -198,8 +204,8 @@ class SHIRProject:
         assert isinstance(retv, Node), "Only single node output is allowed"
         assert not many_uses  # not sure what this failing would mean...
 
-        shape = retv.meta.get("val").shape
-        dims = len(shape)
+        annot_typ = types.get_element_type(retv)
+        dims = len(retv.meta.get("val").shape)
         v = retv.name
 
         if dims < 1:
@@ -207,8 +213,15 @@ class SHIRProject:
         if dims < 2:
           v = f"algo.Repeat({v}, 1)"
         if dims > 2:
-          v = f"algo.torch.TFlatten({v}, 1, {dims - 1})"
-        print("    core.TypeChecker.check(", v, ")", sep="", file=f)
+          v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
+        print(
+          "    core.TypeChecker.check(algo.Map(2, { ",
+          " val _0 = core.ParamDef();",
+          " algo.AlgoLambda(_0, core.Conversion(core.ParamUse(_0), ",
+          annot_typ.name(), "))",
+          " }, ", v, "))",
+          sep="", file=f
+        )
 
       elif n.op == "call_function":
         obj = lowering.fetch_lowering(n.target)
