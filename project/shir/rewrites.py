@@ -1022,6 +1022,3 @@ class QuantOpRewrite:
 def rewrite_quantized_ops(gm: GraphModule):
   obj = QuantOpRewrite(gm)
   obj.rewrite()
-
-def rewrite_late(gm: GraphModule):
-  return gm
