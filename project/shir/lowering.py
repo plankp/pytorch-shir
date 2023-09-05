@@ -32,6 +32,12 @@ shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
+def remat_imm(x: int, signed: bool) -> str:
+  bits = (~x if x < 0 else x).bit_length()
+  if signed:
+    return f"algo.ConstantInteger({x}, Some(algo.SignedIntType({bits + 1})))"
+  return f"algo.ConstantInteger({x}, Some(algo.IntType({max(bits, 1)})))"
+
 @register_lowering(shin.requantize.default)
 class LowerShirRequantize:
   @staticmethod
@@ -95,7 +101,7 @@ class LowerShirRequantizeChannel:
 
     sseq = ", ".join((str(bit_utils.to_signed(x, 32)) for x in sseq))
     return (
-      f"algo.torch.ZipChannel({requant_kernel}, {a.name},"
+      f"algo.torch.MapZippedChannel({requant_kernel}, {a.name},"
       f" algo.ConstantSeq(Seq({sseq}), Some(algo.IntType({w}))))"
     )
 
@@ -121,7 +127,6 @@ class LowerFlatten:
 
     return f"algo.torch.Flatten({a.name}, {start}, {end})"
 
-'''
 @register_lowering(aten.view.default)
 class LowerView:
   @staticmethod
@@ -137,8 +142,7 @@ class LowerView:
       a = f"algo.Repeat({a.name}, 1)"
 
     if shape == []:
-      # turn T[1, ..., 1] into T
-      return f"algo.Convert({a}, {shir_type.get_element_type(a).name()})"
+      return f"algo.torch.TensorItem({a})"
 
     def iter_shape():
       for s in shape:
@@ -151,7 +155,7 @@ class LowerView:
         yield s
 
     w = ", ".join((str(s) for s in iter_shape()))
-    return (f"algo.Join(algo.SplitAll({a}, Seq({w})))")
+    return f"algo.Join(algo.SplitAll({a}, Seq({w})))"
 
 @register_lowering(prims.broadcast_in_dim.default)
 class LowerBroadcastInDim:
@@ -163,8 +167,9 @@ class LowerBroadcastInDim:
   def lower(a, shape, broadcast_dims) -> str:
     shape = ", ".join((str(d) for d in shape))
     dims = ", ".join((str(d) for d in broadcast_dims))
-    return f"algo.torch.TBroadcast({a.name}, Seq({shape}), Seq({dims}))"
+    return f"algo.torch.Broadcast({a.name}, Seq({shape}), Seq({dims}))"
 
+'''
 @register_lowering(prims.convert_element_type.default)
 class LowerConvEltTy:
   @staticmethod
@@ -215,6 +220,7 @@ class LowerConvEltTy:
       )
 
     return f"algo.Map({arank}, {converter}, {aname})"
+'''
 
 class LowerArithBinaryOperatorTemplate:
   @staticmethod
@@ -251,7 +257,7 @@ class LowerArithBinaryOperatorTemplate:
   def _normalize_repr(value, ty) -> Tuple[str, int]:
     match value:
       case int(_):
-        return (f"algo.ConstantInteger({value}, Some({ty.name()}))", 0)
+        return (remat_imm(value, isinstance(ty, types.SI)), 0)
       case _:
         return (value.name, len(value.meta.get("val").shape))
 
@@ -276,14 +282,14 @@ class LowerArithBinaryOperatorTemplate:
       kernel = cls.apply_op(ty, pair)
       return (
         f"algo.Map({rank}, {{"
-        f" val _0 = core.ParamDef({tyname});"
+        f" val _0 = core.ParamDef();"
         f" algo.AlgoLambda(_0, {kernel}) }}, {lhs})"
       )
 
     kernel = cls.apply_op(ty, "core.ParamUse(_0)")
     return (
-      f"algo.torch.TZipAll({{"
-      f" val _0 = core.ParamDef(algo.TupleType({tyname}, {tyname}));"
+      f"algo.torch.MapZipAll({{"
+      f" val _0 = core.ParamDef();"
       f" algo.AlgoLambda(_0, {kernel}) }}, {lhs}, {rhs})"
     )
 
@@ -291,30 +297,19 @@ class LowerArithBinaryOperatorTemplate:
 class LowerAdd(LowerArithBinaryOperatorTemplate):
   @staticmethod
   def apply_op(ty, pair):
-    signed, bits = types.unpack_int_type(ty)
-    f = f"algo.TruncInteger(algo.Add({pair}), {bits})"
-    if signed:
-      f = f"core.Conversion({f}, {ty.name()})"
-    return f
+    return f"algo.torch.CappedAddInt({pair}, {ty.name()})"
 
 @register_lowering(prims.sub.default)
 class LowerSub(LowerArithBinaryOperatorTemplate):
   @staticmethod
   def apply_op(ty, pair):
-    signed, _ = types.unpack_int_type(ty)
-    if signed:
-      return f"algo.Sub({pair})"
-    return f"core.Conversion(algo.Sub({pair}), {ty.name()})"
+    return f"algo.torch.CappedSubInt({pair}, {ty.name()})"
 
 @register_lowering(prims.mul.default)
 class LowerMul(LowerArithBinaryOperatorTemplate):
   @staticmethod
   def apply_op(ty, pair):
-    signed, bits = types.unpack_int_type(ty)
-    f = f"algo.TruncInteger(algo.Mul({pair}), {bits})"
-    if signed:
-      f = f"core.Conversion({f}, {ty.name()})"
-    return f
+    return f"algo.torch.MaybeTruncInt(algo.Mul({pair}), {ty.name()})"
 
 @register_lowering(prims.maximum.default)
 class LowerMax(LowerArithBinaryOperatorTemplate):
@@ -328,6 +323,7 @@ class LowerMin(LowerArithBinaryOperatorTemplate):
   def apply_op(ty, pair):
     return f"algo.Min({pair})"
 
+'''
 @register_lowering(shin.qadd.default)
 class LowerQadd:
   @staticmethod
@@ -402,18 +398,11 @@ class LowerClamp:
     # the assumption (from #supports) is that clamping limits, if not None,
     # are valid values of the type AND s32 (due to SHIR).
     is_signed = isinstance(types.get_element_type(a), types.SI)
-    vmin = "None" if clmin is None else f"Some({LowerClamp.remat(clmin, is_signed)})"
-    vmax = "None" if clmax is None else f"Some({LowerClamp.remat(clmax, is_signed)})"
+    vmin = "None" if clmin is None else f"Some({remat_imm(clmin, is_signed)})"
+    vmax = "None" if clmax is None else f"Some({remat_imm(clmax, is_signed)})"
 
     rank = len(a.meta.get("val").shape)
     return f"algo.Map({rank}, algo.torch.Clamp.asFunction({vmin}, {vmax}), {a.name})"
-
-  @staticmethod
-  def remat(x: int, signed: bool) -> str:
-    bits = (~x if x < 0 else x).bit_length()
-    if signed:
-      return f"algo.ConstantInteger({x}, Some(algo.SignedIntType({bits + 1})))"
-    return f"algo.ConstantInteger({x}, Some(algo.IntType({max(bits, 1)})))"
 
 @register_lowering(shin.int_addmm.default)
 class LowerShirIntAddmm:
@@ -428,7 +417,6 @@ class LowerShirIntAddmm:
       f" algo.torch.AddMMInt({acc.name}, {lhs.name}, {rhs.name}))"
     )
 
-'''
 @register_lowering(shin.qconv.default)
 class LowerQConv:
   @staticmethod
@@ -452,10 +440,12 @@ class LowerQConv:
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
+    rank = len(input.meta.get("val").shape)
     return (
+      f"algo.Map({rank}, algo.torch.MaybeTruncInt.signed(32),"
       f"algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
       f" Seq({stride}), Seq({padding}), Seq({dilation}),"
-      f" {groups})"
+      f" {groups}))"
     )
 
 @register_lowering(shin.int_max_pool2d.default)
@@ -480,8 +470,8 @@ class LowerMaxPool2D:
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     return (
-      f"algo.torch.TPool.imax({types.get_element_type(input).name()},"
-      f" {has_channel}, {input.name}, Seq({kernel_size}),"
+      f"algo.torch.Pool(algo.torch.ReduceMax.asFunction(),"
+      f" {input.name}, {has_channel}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq({dilation}))"
     )
 
@@ -500,7 +490,7 @@ class LowerMean:
     dims = ", ".join((str(d if d >= 0 else rank + d) for d in dims))
     keepDim = "true" if keepDim else "false"
     return (
-      f"algo.torch.TReduce.iavg({types.get_element_type(a).name()},"
+      f"algo.torch.Reduce(algo.torch.ReduceAvgInt.asFunction(),"
       f" {a.name}, {dims}, {keepDim})"
     )
 
@@ -516,16 +506,14 @@ class LowerAvgPool2D:
   @staticmethod
   def lower(input, kernel_size, stride, padding) -> str:
     # input is either T[N, i1, i2] or T[N, C, i1, i2]
-    ashape = input.meta.get("val").shape
-    rank = len(ashape)
+    rank = len(input.meta.get("val").shape)
 
     has_channel = "true" if rank != 3 else "false"
     kernel_size = ", ".join((str(d) for d in kernel_size))
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     return (
-      f"algo.torch.TPool.iavg({types.get_element_type(input).name()},"
-      f" {has_channel}, {input.name}, Seq({kernel_size}),"
+      f"algo.torch.Pool(algo.torch.ReduceAvgInt.asFunction(),"
+      f" {input.name}, {has_channel}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq(1, 1))"
     )
-'''
