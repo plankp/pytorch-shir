@@ -26,6 +26,9 @@ class SI:
       return -((1 << self.bits) - i)
     return i
 
+  def to_signed(self):
+    return self
+
 @dataclass(frozen=True)
 class UI:
   bits: int   # must be at least 1
@@ -41,6 +44,10 @@ class UI:
 
   def cast(self, i: int) -> int:
     return i & ((1 << self.bits) - 1)
+
+  def to_signed(self):
+    # give one extra bit for the sign
+    return SI(self.bits + 1)
 
 def unpack_int_type(ty) -> Tuple[bool, int]:
   match ty:

@@ -107,7 +107,14 @@ def apply_shir_ops(gm: GraphModule):
       arg_elt_types = [None] * len(n.args)
       for i, arg in enumerate(n.args):
         if arg.op == "get_attr":
-          arg_elt_types[i] = bit_utils.get_narrow_type(getattr(gm, arg.target))
+          torch_ty = types.get_element_type(arg)
+          real_ty = bit_utils.get_narrow_type(getattr(gm, arg.target))
+
+          # Avoid differing signedness for now.
+          # (can only happen if the type was signed but tensor was all positive.)
+          if isinstance(torch_ty, types.SI) and isinstance(real_ty, types.UI):
+            real_ty = real_ty.to_signed()
+          arg_elt_types[i] = real_ty
 
       # then trigger compilation regardless of active configuration using the
       # bitwidth information
