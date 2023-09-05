@@ -135,7 +135,7 @@ class SHIRProject:
 
       elif n.op == "output":
         assert output_node is None, f"Multi-output node not supported"
-        assert len(n.args) == 1, "Multi-valued output node not supported"
+        assert isinstance(n.args[0], Node), "Multi-valued output node not supported"
         output_node = n.args[0].meta.get("val")
 
     # for the result, we still need to give it some dummy value for simulation
@@ -215,7 +215,7 @@ class SHIRProject:
         if dims > 2:
           v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
         print(
-          "    core.TypeChecker.check(algo.Map(2, { ",
+          "    core.TypeChecker.check(algo.Map(2, {",
           " val _0 = core.ParamDef();",
           " algo.AlgoLambda(_0, core.Conversion(core.ParamUse(_0), ",
           annot_typ.name(), "))",
