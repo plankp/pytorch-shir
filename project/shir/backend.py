@@ -246,11 +246,17 @@ def compiler(gm: GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
   # model arguments.
   g = aot_gm.graph
   for n in g.nodes:
-    if n.op == "placeholder" and (param := sig.inputs_to_parameters.get(n.name)):
-      # we bring the parameter from the original graph to the new graph!
-      setattr(aot_gm, param, torch.nn.Parameter(getattr(gm, param), False))
+    if n.op != "placeholder":
+      continue
+
+    if (name := sig.inputs_to_parameters.get(n.name)) is not None:
+      aot_gm.register_parameter(name, torch.nn.Parameter(getattr(gm, name), False))
+    elif (name := sig.inputs_to_buffers.get(n.name)) is not None:
+      aot_gm.register_buffer(name, getattr(gm, name))
+
+    if name is not None:
       with g.inserting_before(n):
-        n1 = g.get_attr(param)
+        n1 = g.get_attr(name)
       n.replace_all_uses_with(n1, propagate_meta=True)
       g.erase_node(n)
 
