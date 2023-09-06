@@ -169,7 +169,6 @@ class LowerBroadcastInDim:
     dims = ", ".join((str(d) for d in broadcast_dims))
     return f"algo.torch.Broadcast({a.name}, Seq({shape}), Seq({dims}))"
 
-'''
 @register_lowering(prims.convert_element_type.default)
 class LowerConvEltTy:
   @staticmethod
@@ -182,45 +181,47 @@ class LowerConvEltTy:
       case _:
         return False
 
-  @classmethod
-  def lower(cls, a, dtype) -> str:
-    return cls.emit(
-      a.name, len(a.meta.get("val").shape),
-      types.get_element_type(a),
-      types.get_scalar_type(dtype),
-    )
-
   @staticmethod
-  def emit(aname, arank, atype, dtype) -> str:
+  def lower(a, dtype) -> str:
+    atype = types.get_element_type(a)
+    dtype = types.get_scalar_type(dtype)
     if atype == dtype:
-      return aname
+      return a.name
 
     ss, sbits = types.unpack_int_type(atype)
     ds, dbits = types.unpack_int_type(dtype)
 
-    if sbits >= dbits or not ss:
-      # truncate or zero extend
-      inner = f"algo.TruncInteger(core.ParamUse(_0), {dbits})"
-      if ds:
-        # convert from unsigned to signed
-        inner = f"core.Conversion({inner}, {dtype.name()})"
-      converter = (
-        f"{{ val _0 = core.ParamDef({atype.name()}); algo.AlgoLambda(_0, {inner}) }}"
-      )
+    # recall that the PyTorch type is just an upper bound on the bit width, so
+    # all extensions of matching signedness are no-ops.
+    if ss == ds and sbits <= dbits:
+      return a.name
+
+    # at this point, we need to actually do the extension.
+    # we do it case by case.
+    if sbits <= dbits:
+      # then it must be either a signed extension then convert to unsigned
+      # or zero extension then convert to signed.
+      #
+      # note that in the case where sbits == dbits, the extend is still needed
+      # since the input value may be narrower than sbits!
+      converter = f"core.Conversion(algo.ExtendInteger(core.ParamUse(_0), {dbits}), {dtype.name()})"
 
     else:
-      # sign extend (assert is for sanity purposes)
-      assert ss and sbits < dbits
-      inner = f"core.Conversion(core.ParamUse(_0), algo.SignedIntType({dbits}))"
-      if not ds:
-        # convert from signed to unsigned
-        inner = f"core.Conversion({inner}, {dtype.name()})"
-      converter = (
-        f"{{ val _0 = core.ParamDef({atype.name()}); algo.AlgoLambda(_0, {inner}) }}"
-      )
+      # we have to first extend the input to the source width, perform
+      # truncation, then fix the signedness.
+      #
+      # DON'T use ExtendInteger to truncate signed integers: VHDL will preserve
+      # the sign bit, which is not what PyTorch does.
+      converter = f"algo.TruncInteger(algo.ExtendInteger(core.ParamUse(_0), {sbits}), {dbits})"
+      if ds:
+        # convert from unsigned to signed
+        converter = f"core.Conversion({converter}, {dtype.name()})"
 
-    return f"algo.Map({arank}, {converter}, {aname})"
-'''
+    rank = len(a.meta.get("val").shape)
+    return (
+      f"algo.Map({rank}, {{ val _0 = core.ParamDef();"
+      f" algo.AlgoLambda(_0, {converter}) }}, {a.name})"
+    )
 
 class LowerArithBinaryOperatorTemplate:
   @staticmethod
@@ -323,7 +324,6 @@ class LowerMin(LowerArithBinaryOperatorTemplate):
   def apply_op(ty, pair):
     return f"algo.Min({pair})"
 
-'''
 @register_lowering(shin.qadd.default)
 class LowerQadd:
   @staticmethod
@@ -359,15 +359,14 @@ class LowerQadd:
     rank = len(a.meta.get("val").shape)
     if rank == 0:
       return (
-        f"algo.torch.SIRequantAdd32({a.name}, {b.name},"
-        f" {w}, {ia}, {ib}, {shamt}, {z})"
+        f"algo.torch.RequantFixedAddInt8({a.name}, {b.name},"
+        f" {ia}, {ib}, {shamt}, {z})"
       )
 
     return (
-      f"algo.torch.TZipAll(algo.torch.SIRequantAdd32.asFunction("
-      f"{w}, {ia}, {ib}, {shamt}, {z}), {a.name}, {b.name})"
+      f"algo.torch.MapZipAll(algo.torch.RequantFixedAddInt8.asAddFunction("
+      f"{ia}, {ib}, {shamt}, {z}), {a.name}, {b.name})"
     )
-'''
 
 @register_lowering(aten.relu.default)
 class LowerRelu:
@@ -443,7 +442,7 @@ class LowerQConv:
     rank = len(input.meta.get("val").shape)
     return (
       f"algo.Map({rank}, algo.torch.MaybeTruncInt.signed(32),"
-      f"algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
+      f" algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
       f" Seq({stride}), Seq({padding}), Seq({dilation}),"
       f" {groups}))"
     )
