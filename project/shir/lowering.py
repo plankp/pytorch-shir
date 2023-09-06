@@ -142,7 +142,7 @@ class LowerView:
       a = f"algo.Repeat({a.name}, 1)"
 
     if shape == []:
-      return f"algo.torch.TensorItem({a})"
+      return f"algo.Item({a})"
 
     def iter_shape():
       for s in shape:

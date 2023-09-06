@@ -215,11 +215,9 @@ class SHIRProject:
         if dims > 2:
           v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
         print(
-          "    core.TypeChecker.check(algo.Map(2, {",
-          " val _0 = core.ParamDef();",
-          " algo.AlgoLambda(_0, core.Conversion(core.ParamUse(_0), ",
-          annot_typ.name(), "))",
-          " }, ", v, "))",
+          "    core.TypeChecker.check(algo.Map(2,",
+          " algo.ExtendInteger.asFunction(types = Seq(", annot_typ.bits, ")),",
+          " ", v, "))",
           sep="", file=f
         )
 
