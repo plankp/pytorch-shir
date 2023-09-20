@@ -402,7 +402,7 @@ class QuantOpRewrite:
         n2 = graph.call_function(aten.add, (n2, n3))
       if needs_relu:
         n2 = graph.call_function(aten.relu, (n2,))
-      n3 = graph.call_function(shin.requant, (n2, k / s_out, z_out))
+      n3 = graph.call_function(shin.requantize, (n2, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n3)
     return True
