@@ -204,15 +204,15 @@ class LowerConvEltTy:
       #
       # note that in the case where sbits == dbits, the extend is still needed
       # since the input value may be narrower than sbits!
-      converter = f"core.Conversion(algo.ExtendInteger(core.ParamUse(_0), {dbits}), {dtype.name()})"
+      converter = f"core.Conversion(algo.ResizeInteger(core.ParamUse(_0), {dbits}), {dtype.name()})"
 
     else:
       # we have to first extend the input to the source width, perform
       # truncation, then fix the signedness.
       #
-      # DON'T use ExtendInteger to truncate signed integers: VHDL will preserve
+      # DON'T use ResizeInteger to truncate signed integers: VHDL will preserve
       # the sign bit, which is not what PyTorch does.
-      converter = f"algo.TruncInteger(algo.ExtendInteger(core.ParamUse(_0), {sbits}), {dbits})"
+      converter = f"algo.TruncInteger(algo.ResizeInteger(core.ParamUse(_0), {sbits}), {dbits})"
       if ds:
         # convert from unsigned to signed
         converter = f"core.Conversion({converter}, {dtype.name()})"
