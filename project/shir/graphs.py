@@ -216,7 +216,7 @@ class SHIRProject:
           v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
         print(
           "    core.TypeChecker.check(algo.Map(2,",
-          " algo.ExtendInteger.asFunction(types = Seq(", annot_typ.bits, ")),",
+          " algo.ResizeInteger.asFunction(types = Seq(", annot_typ.bits, ")),",
           " ", v, "))",
           sep="", file=f
         )
