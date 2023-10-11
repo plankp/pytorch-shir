@@ -16,27 +16,30 @@ from torch.ao.quantization.pt2e.utils import (
   _get_tensor_constant_from_node,
   _get_all_arguments,
 )
-from torch.ao.quantization.pt2e.quantizer.utils import (
+from torch.ao.quantization.quantizer.utils import (
   _annotate_input_qspec_map,
   _annotate_output_qspec,
-  get_input_act_qspec,
-  get_output_act_qspec,
-  get_bias_qspec,
-  get_weight_qspec,
 )
 from torch.fx.passes.utils.source_matcher_utils import (
   get_source_partitions,
   SourcePartition
 )
 from torch.ao.quantization.pt2e.graph_utils import find_sequential_partitions
-from torch.ao.quantization.pt2e.quantizer.quantizer import (
-  OperatorConfig,
-  QuantizationConfig,
+from torch.ao.quantization.quantizer.quantizer import (
   QuantizationSpec,
   Quantizer,
   QuantizationAnnotation,
   SharedQuantizationSpec,
   FixedQParamsQuantizationSpec,
+)
+from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
+  OperatorConfig,
+  QuantizationConfig,
+  get_input_act_qspec,
+  get_output_act_qspec,
+  get_bias_qspec,
+  get_weight_qspec,
+  _is_annotated,
 )
 from torch.ao.quantization.observer import (
   HistogramObserver,
@@ -142,12 +145,6 @@ def _mark_nodes_as_annotated(nodes: List[torch.fx.Node]):
       if "quantization_annotation" not in node.meta:
         node.meta["quantization_annotation"] = QuantizationAnnotation()
       node.meta["quantization_annotation"]._annotated = True
-
-def _is_annotated(nodes: List[torch.fx.Node]):
-  return any(((
-    "quantization_annotation" in node.meta
-    and node.meta["quantization_annotation"]._annotated
-  ) for node in nodes if node is not None))
 
 def _extract_linear_fields(gm: torch.fx.GraphModule, p: SourcePartition):
   input_node = p.input_nodes[0]
