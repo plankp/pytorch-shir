@@ -17,18 +17,19 @@ from torch.ao.quantization.quantize_pt2e import (
 
 import shir
 
+# always use static shapes
+torchdynamo.config.automatic_dynamic_shapes = False
+
 SAVED_MODEL_PATH = "./data/model_simple_conv.pth"
 
 class Net(nn.Module):
   def __init__(self):
     super().__init__()
     self.conv1 = nn.Conv2d(1, 1, 5)
-    self.act1 = nn.ReLU()
-
     self.fc = nn.Linear(576, 10)
 
   def forward(self, x):
-    x = self.act1(self.conv1(x))
+    x = self.conv1(x)
     x = torch.ops.shir_intrinsic.flatten(x, 1, -1)
     x = self.fc(x)
     return x
@@ -36,6 +37,7 @@ class Net(nn.Module):
 # the accuracy is around 92.2%
 
 model = reload_cached(SAVED_MODEL_PATH, Net, learning_rate=0.01)
+model.eval()
 test_loop(test_dataloader, model, loss_fn)
 
 print(model)
@@ -44,9 +46,8 @@ example_inputs = (get_example_input(),)
 
 model, guards = torchdynamo.export(
   model,
-  *copy.deepcopy(example_inputs),
   aten_graph=True,
-)
+)(*copy.deepcopy(example_inputs))
 
 quantizer = shir.BackendQuantizer()
 

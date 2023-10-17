@@ -18,6 +18,9 @@ from torch.ao.quantization.quantize_pt2e import (
 )
 import shir
 
+# always use static shapes
+torchdynamo.config.automatic_dynamic_shapes = False
+
 class Net(nn.Module):
   def __init__(self):
     super().__init__()
@@ -33,16 +36,15 @@ class Net(nn.Module):
 SAVED_MODEL_PATH = "./data/model_simple_slp.pth"
 
 model = reload_cached(SAVED_MODEL_PATH, Net)
+model.eval()
 test_loop(test_dataloader, model, loss_fn)
 
 print(model)
 
 example_inputs = (get_example_input(),)
 
-model, guards = torchdynamo.export(
-  model,
+model, guards = torchdynamo.export(model, aten_graph=True)(
   *copy.deepcopy(example_inputs),
-  aten_graph=True,
 )
 
 quantizer = shir.BackendQuantizer()

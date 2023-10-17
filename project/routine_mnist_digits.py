@@ -46,9 +46,6 @@ def train_loop(dataloader, model, loss_fn, optimizer):
       print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
 def test_loop(dataloader, model, loss_fn):
-  # Set the model to evaluation mode - important for batch normalization and dropout layers
-  # Unnecessary in this situation but added for best practices
-  model.eval()
   size = len(dataloader.dataset)
   num_batches = len(dataloader)
   test_loss, correct = 0, 0
