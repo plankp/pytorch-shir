@@ -340,22 +340,23 @@ class SHIRGraphFpgaModule(torch.nn.Module):
         while not fpga.is_complete():
           pass  # spin
 
-        cycles = fpga.read_mmio64(0, 0x88)
-        readreq = fpga.read_mmio64(0, 0xC0)
-        readpending = fpga.read_mmio64(0, 0xD0)
-        readaf = fpga.read_mmio64(0, 0xE0)
-        writereq = fpga.read_mmio64(0, 0xC8)
-        writepending = fpga.read_mmio64(0, 0xD8)
-        writeaf = fpga.read_mmio64(0, 0xE8)
+        if config.FPGA_PRINT_RTINFO:
+          cycles = fpga.read_mmio64(0, 0x88)
+          readreq = fpga.read_mmio64(0, 0xC0)
+          readpending = fpga.read_mmio64(0, 0xD0)
+          readaf = fpga.read_mmio64(0, 0xE0)
+          writereq = fpga.read_mmio64(0, 0xC8)
+          writepending = fpga.read_mmio64(0, 0xD8)
+          writeaf = fpga.read_mmio64(0, 0xE8)
 
-        print(
-          "Execution time (cycles): ", cycles, "\n",
-          "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
-          "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
-          "Read request buffer  ", readaf, " times almost full\n"
-          "Write request buffer ", writeaf, " times almost full",
-          sep="",
-        )
+          print(
+            "Execution time (cycles): ", cycles, "\n"
+            "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
+            "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
+            "Read request buffer  ", readaf, " times almost full\n"
+            "Write request buffer ", writeaf, " times almost full",
+            sep="",
+          )
 
     return self._output
 

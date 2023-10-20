@@ -106,7 +106,7 @@ def apply_shir_ops(gm: GraphModule):
       # use array instead of map due to lack of sparsity for quantized models.
       arg_elt_types = [None] * len(n.args)
       for i, arg in enumerate(n.args):
-        if arg.op == "get_attr":
+        if config.TRY_NARROW_TYPE and arg.op == "get_attr":
           torch_ty = types.get_element_type(arg)
           real_ty = bit_utils.get_narrow_type(getattr(gm, arg.target))
 
@@ -190,7 +190,7 @@ def apply_shir_ops(gm: GraphModule):
         n1_used = False
         for i, arg in enumerate(args):
           # we try to avoid the input copy by handling some common cases.
-          if arg.op == "get_attr":
+          if config.TRY_COPY_AOT and arg.op == "get_attr":
             # this is a weight / bias. we can copy the values into the shared
             # memory buffers AOT.
             dst = submod.get_in_tensor(i)
