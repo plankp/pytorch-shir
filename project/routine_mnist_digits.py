@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToTensor
 from torchvision import datasets, transforms
 from pathlib import Path
+import time
 
 training_data = datasets.MNIST(
   root="data",
@@ -60,7 +61,17 @@ def test_loop(dataloader, model, loss_fn):
 
   test_loss /= num_batches
   correct /= size
-  print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
+  return correct, test_loss
+
+def time_inference(dataloader, model):
+  times = []
+  with torch.no_grad():
+    for X, _ in dataloader:
+      _start = time.perf_counter_ns()
+      model(X)
+      _end = time.perf_counter_ns()
+      times.append(_end - _start)
+  return times
 
 batch_size = 64
 loss_fn = nn.CrossEntropyLoss()

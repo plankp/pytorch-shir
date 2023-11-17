@@ -278,6 +278,7 @@ class SHIRGraphSimModule(torch.nn.Module):
       ).reshape(self._result_shape)
 
 _last_flashed_gbs = None
+_last_opened_fpga = None
 
 # as the FPGA wills it, we actually preallocate memory for input and output
 # data. the caller does not pass data via __call__. instead, they should use
@@ -330,33 +331,45 @@ class SHIRGraphFpgaModule(torch.nn.Module):
   def __call__(self) -> torch.Tensor:
     # reconfigure the fpga if needed
     global _last_flashed_gbs
+    global _last_opened_fpga
     if _last_flashed_gbs is None or not self._gbs_file.samefile(_last_flashed_gbs):
+      # first, close the currently opened FPGA if applicable
+      if _last_opened_fpga is not None:
+        _last_opened_fpga.close()
+        _last_opened_fpga = None
+
+      # reconfigure
       subprocess.run(['fpgaconf', '-v', self._gbs_file])
       _last_flashed_gbs = self._gbs_file
 
-    with self._driver.find_and_open_fpga(config.ACCEL_UUID) as fpga:
-      with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
-        fpga.start_computation()
-        while not fpga.is_complete():
-          pass  # spin
+      # then open a new FPGA
+      _last_opened_fpga = self._driver.find_and_open_fpga(config.ACCEL_UUID)
 
-        if config.FPGA_PRINT_RTINFO:
-          cycles = fpga.read_mmio64(0, 0x88)
-          readreq = fpga.read_mmio64(0, 0xC0)
-          readpending = fpga.read_mmio64(0, 0xD0)
-          readaf = fpga.read_mmio64(0, 0xE0)
-          writereq = fpga.read_mmio64(0, 0xC8)
-          writepending = fpga.read_mmio64(0, 0xD8)
-          writeaf = fpga.read_mmio64(0, 0xE8)
+    fpga = _last_opened_fpga
+    fpga.reset()
 
-          print(
-            "Execution time (cycles): ", cycles, "\n"
-            "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
-            "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
-            "Read request buffer  ", readaf, " times almost full\n"
-            "Write request buffer ", writeaf, " times almost full",
-            sep="",
-          )
+    with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
+      fpga.start_computation()
+      while not fpga.is_complete():
+        pass  # spin
+
+      if config.FPGA_PRINT_RTINFO:
+        cycles = fpga.read_mmio64(0, 0x88)
+        readreq = fpga.read_mmio64(0, 0xC0)
+        readpending = fpga.read_mmio64(0, 0xD0)
+        readaf = fpga.read_mmio64(0, 0xE0)
+        writereq = fpga.read_mmio64(0, 0xC8)
+        writepending = fpga.read_mmio64(0, 0xD8)
+        writeaf = fpga.read_mmio64(0, 0xE8)
+
+        print(
+          "Execution time (cycles): ", cycles, "\n"
+          "Read requests          : ", readreq, " (of which ", readpending, " pending)\n"
+          "Write requests         : ", writereq, " (of which ", writepending, " pending)\n"
+          "Read request buffer  ", readaf, " times almost full\n"
+          "Write request buffer ", writeaf, " times almost full",
+          sep="",
+        )
 
     return self._output
 
