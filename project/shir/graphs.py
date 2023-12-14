@@ -104,7 +104,7 @@ class SHIRProject:
       print("object", self.clname, "extends GeneratedModel {", file=f)
 
       print(file=f)
-      print("  val name: String = \"", self.clname, "\"", sep="", file=f)
+      print("  override val name: String = \"", self.clname, "\"", sep="", file=f)
 
       print(file=f)
       print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
@@ -113,12 +113,15 @@ class SHIRProject:
       self._emit_method_load_data(f, gm)
 
       print(file=f)
+      self._emit_method_extra_rewrites(f, gm, arg_elt_types)
+
+      print(file=f)
       self._emit_method_generate_ir(f, gm, arg_elt_types)
 
       print("}", file=f)
 
   def _emit_method_load_data(self, f, gm):
-    print("  def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
+    print("  override def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
 
     output_node = None
     placeholder_id = 0
@@ -149,8 +152,27 @@ class SHIRProject:
 
     print("  )", file=f)
 
+  def _emit_method_extra_rewrites(self, f, gm, arg_elt_types):
+    print("  override def extraRewrites(): Seq[(core.compile.CompilerPhase, core.rewrite.RewriteStep)] = {", file=f)
+    print("    import core.compile.CompilerPhase", file=f)
+    print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
+    print("    import backend.hdl.arch.{ArchCompiler, MapCompiler}", file=f)
+    print("    import backend.hdl.arch.device.DeviceSpecificCompiler", file=f)
+    print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
+    print("    Seq(", file=f)
+
+    # double buffer every input
+    # the target is a descending sequence of integers...
+    idx = ", ".join((str(x - 1) for x in range(len(arg_elt_types), 0, -1)))
+    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteTargeted({idx}), Seq(", file=f)
+    print("  backend.hdl.arch.rewrite.InputBufferingRules.doubleBufferRead", file=f)
+    print("))),", file=f)
+
+    print("    )", file=f)
+    print("  }", file=f)
+
   def _emit_method_generate_ir(self, f, gm, arg_elt_types):
-    print("  def generateIR(): Expr = {", file=f)
+    print("  override def generateIR(): Expr = {", file=f)
 
     lets_needed = 0
     placeholder_id = 0
