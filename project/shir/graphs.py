@@ -158,6 +158,7 @@ class SHIRProject:
     print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
     print("    import backend.hdl.arch.{ArchCompiler, MapCompiler}", file=f)
     print("    import backend.hdl.arch.device.DeviceSpecificCompiler", file=f)
+    print("    import backend.hdl.arch.rewrite.{InputBufferingRules, ParallelizeDotProductRules}", file=f)
     print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
     print("    Seq(", file=f)
 
@@ -165,8 +166,17 @@ class SHIRProject:
     # the target is a descending sequence of integers...
     idx = ", ".join((str(x - 1) for x in range(len(arg_elt_types), 0, -1)))
     print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteTargeted({idx}), Seq(", file=f)
-    print("  backend.hdl.arch.rewrite.InputBufferingRules.doubleBufferRead", file=f)
+    print("  InputBufferingRules.doubleBufferRead", file=f)
     print("))),", file=f)
+
+    # fully parallelize the dot product for matrix multiplications
+    for n in gm.graph.nodes:
+      if n.op == "call_function" and n.target == torch.ops.shir_intrinsic.int_addmm.default:
+        # for n*k cross m*k, we want to parallelize by k
+        k = n.args[1].meta.get("val").shape[1]
+        print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(),", file=f)
+        print(f"  ParallelizeDotProductRules.all(Some({k}))", file=f)
+        print(")),", file=f)
 
     print("    )", file=f)
     print("  }", file=f)
