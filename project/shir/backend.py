@@ -96,30 +96,48 @@ def apply_shir_ops(gm: GraphModule):
         Path(config.EMIT_OUTPUT_DIR) / f"module{idnum}"
       )
 
+      # a makeshift iterator to yield the next placeholder node
+      # so we can map out the inputs of the submodule.
+      def yield_placeholders():
+        for n in submod.graph.nodes:
+          if n.op == "placeholder":
+            yield n
+      it1 = yield_placeholders()
+
       # at this point, all outer values are passed into the inner graph as
-      # arguments / placeholders. weights and biases are known, and can be
-      # recovered by looking for get_attr nodes.
-      #
-      # we look for them and calculate the narrowest possible SHIR type for
-      # these values.
-      #
-      # use array instead of map due to lack of sparsity for quantized models.
-      arg_elt_types = [None] * len(n.args)
+      # arguments / placeholders. here, we assume they must be placed on
+      # host ram, thus require the type information and an identifier.
+
+      # notes:
+      # - the domain consists of nodes of the submodule!
+      # - this mapping gets updated to include buffered entries!
+      host_mapping = {}
       for i, arg in enumerate(n.args):
+        # XXX:
+        # the trailing _tag in the name makes some rewrites easier to handle
+        # (e.g. input buffering rules use partial matching on host id's!)
+        host_id = f"arg{i}_tag"
+        decl_ty = types.get_element_type(arg)
+        real_ty = decl_ty
+
         if config.TRY_NARROW_TYPE and arg.op == "get_attr":
-          torch_ty = types.get_element_type(arg)
+          # this is a weight or bias (or the like) meaning we have access
+          # to their values. thus we can compute the minimum bits necessary.
           real_ty = bit_utils.get_narrow_type(getattr(gm, arg.target))
 
-          # Avoid differing signedness for now.
-          # (can only happen if the type was signed but tensor was all positive.)
-          if isinstance(torch_ty, types.SI) and isinstance(real_ty, types.UI):
+          # Avoid differing signedness
+          # (say torch declares it as int8, but all values are positive causes
+          # our function to guess an unsigned type)
+          if isinstance(decl_ty, types.SI) and isinstance(real_ty, types.UI):
             real_ty = real_ty.to_signed()
-          arg_elt_types[i] = real_ty
+
+        # recall the domain is the nodes of the submodule
+        host_mapping[next(it1)] = (host_id, real_ty)
 
       # then trigger compilation regardless of active configuration using the
       # bitwidth information
       project.prepare_directory()
-      project.emit_source(submod, arg_elt_types)
+      project.emit_source(submod, host_mapping)
       project.generate_hardware_files()
 
       shir_graph = None

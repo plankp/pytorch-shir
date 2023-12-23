@@ -91,7 +91,7 @@ class SHIRProject:
       check=True, cwd=synth_dir
     )
 
-  def emit_source(self, gm, arg_elt_types):
+  def emit_source(self, gm, host_mapping):
     with (
       self.output_dir / "src" / "main" / "scala" / f"{self.clname}.scala"
     ).open("w", encoding="utf-8") as f:
@@ -110,31 +110,28 @@ class SHIRProject:
       print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
 
       print(file=f)
-      self._emit_method_load_data(f, gm)
+      self._emit_method_load_data(f, gm, host_mapping)
 
       print(file=f)
-      self._emit_method_extra_rewrites(f, gm, arg_elt_types)
+      self._emit_method_extra_rewrites(f, gm, host_mapping)
 
       print(file=f)
-      self._emit_method_generate_ir(f, gm, arg_elt_types)
+      self._emit_method_generate_ir(f, gm, host_mapping)
 
       print("}", file=f)
 
-  def _emit_method_load_data(self, f, gm):
+  def _emit_method_load_data(self, f, gm, host_mapping):
     print("  override def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
 
     output_node = None
-    placeholder_id = 0
     for n in gm.graph.nodes:
       if n.op == "placeholder":
         # only inputs come from csv's
         print(
-          "    \"arg", placeholder_id,
-          "\" -> Util.readIntCSV(Paths.get(folder, \"arg", placeholder_id,
-          ".csv\").toFile()),",
+          "    \"", host_mapping[n][0], "\" -> Util.readIntCSV(Paths.get(folder, \"",
+          host_mapping[n][0], ".csv\").toFile()),",
           sep="", file=f
         )
-        placeholder_id += 1
 
       elif n.op == "output":
         assert output_node is None, f"Multi-output node not supported"
@@ -152,7 +149,7 @@ class SHIRProject:
 
     print("  )", file=f)
 
-  def _emit_method_extra_rewrites(self, f, gm, arg_elt_types):
+  def _emit_method_extra_rewrites(self, f, gm, host_mapping):
     print("  override def extraRewrites(): Seq[(core.compile.CompilerPhase, core.rewrite.RewriteStep)] = {", file=f)
     print("    import core.compile.CompilerPhase", file=f)
     print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
@@ -162,12 +159,6 @@ class SHIRProject:
     print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
     print("    Seq(", file=f)
 
-    # double buffer every input
-    # the target is a descending sequence of integers...
-    idx = ", ".join((str(x - 1) for x in range(len(arg_elt_types), 0, -1)))
-    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteTargeted({idx}), Seq(", file=f)
-    print("  InputBufferingRules.doubleBufferRead", file=f)
-    print("))),", file=f)
 
     # fully parallelize the dot product for matrix multiplications
     for n in gm.graph.nodes:
@@ -178,14 +169,20 @@ class SHIRProject:
         print(f"  ParallelizeDotProductRules.all(Some({k}))", file=f)
         print(")),", file=f)
 
+    # double buffer every input
+    # the target is a descending sequence of integers...
+    idx = ", ".join((str(x - 1) for x in range(len(host_mapping), 0, -1)))
+    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteTargeted({idx}), Seq(", file=f)
+    print("  InputBufferingRules.doubleBufferRead", file=f)
+    print("))),", file=f)
+
     print("    )", file=f)
     print("  }", file=f)
 
-  def _emit_method_generate_ir(self, f, gm, arg_elt_types):
+  def _emit_method_generate_ir(self, f, gm, host_mapping):
     print("  override def generateIR(): Expr = {", file=f)
 
     lets_needed = 0
-    placeholder_id = 0
     for n in gm.graph.nodes:
       # assume every node that has many uses needs to be let-bound,
       # which is definitely the case for tensors (which are SeqType's)
@@ -205,14 +202,14 @@ class SHIRProject:
         # the users can assume input tensors already satisfy these properties
         # and are expected to do the corresponding extension if necessary.
 
-        real_typ = arg_elt_types[placeholder_id] or types.get_element_type(n)
+        host_id, real_typ = host_mapping[n]
         shape = ", ".join((str(d) for d in n.meta.get("val").shape))
 
         if many_uses:
           print(
             "  { val _init = core.TypeChecker.check(",
             "algo.torch.Input(", real_typ.name(),
-            ", \"arg", placeholder_id, "\", Seq(", shape, "))",
+            ", \"", host_id, "\", Seq(", shape, "))",
             ")\n",
             "    val _param = core.ParamDef(_init.t)\n",
             "    core.Let(_param,\n",
@@ -223,11 +220,10 @@ class SHIRProject:
           print(
             "    val ", n.name, " = core.TypeChecker.check(",
             "algo.torch.Input(", real_typ.name(),
-            ", \"arg", placeholder_id, "\", Seq(", shape, "))",
+            ", \"", host_id, "\", Seq(", shape, "))",
             ")",
             sep="", file=f
           )
-        placeholder_id += 1
 
       elif n.op == "output":
         # sometimes, due to unfortunate graph slicing, we may end up with
