@@ -159,6 +159,49 @@ class SHIRProject:
     print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
     print("    Seq(", file=f)
 
+    # decide on the buffering strategy for inputs.
+    # here we "guess" by its usage.
+    buffer_strategy = {}
+    for n in gm.graph.nodes:
+      if n.op != "call_function":
+        continue
+      if n.target == torch.ops.shir_intrinsic.int_addmm.default:
+        node_bias = n.args[0]
+        node_matrix = n.args[1]
+        node_weight = n.args[2]
+
+        if isinstance(node_matrix, torch.fx.Node):
+          buffer_strategy[node_matrix] = buffer_strategy.get(node_matrix, False)
+        if isinstance(node_weight, torch.fx.Node):
+          buffer_strategy[node_weight] = True
+        if isinstance(node_bias, torch.fx.Node):
+          buffer_strategy[node_bias] = True
+
+    # and we emit the rewrite rules based on the collected hints.
+    #
+    # XXX:
+    # the buffering rewrites MUST be applied inside out. so for a graph
+    # of { tmp = input1 * input2; result = tmp * input3 }, input1 and input2
+    # must be buffered before tmp.
+    #
+    # (and the current implementation is obeys that by walking the
+    # dependency graph)
+    for n in gm.graph.nodes:
+      if n not in host_mapping or n not in buffer_strategy:
+        continue
+
+      host_id, real_typ = host_mapping[n]
+      strat = buffer_strategy[n]
+
+      # buffering is based on cachelines, so estimate it.
+      # (the rewrite will crash later if there's a mismatch...)
+      _, lines = layout.guess_line_layout(n.meta.get("val").shape, real_typ)
+      print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(", file=f)
+      if strat:
+        print(f"  InputBufferingRules.bufferInputMatrix(\"{host_id}\", {lines})", file=f)
+      else:
+        print(f"  InputBufferingRules.bufferInputRow(\"{host_id}\", {lines})", file=f)
+      print("))),", file=f)
 
     # fully parallelize the dot product for matrix multiplications
     for n in gm.graph.nodes:
