@@ -32,6 +32,16 @@ def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
     return t.reshape((t.size(0), -1))
   return t
 
+def max_entries_per_line(t):
+  return config.CACHELINE_BITS // t.bits
+
+def guess_line_layout(t: torch.Size, ty) -> Tuple[int, int]:
+  outer, inner = reshape_size_to_matrix(t)
+  per_line = max_entries_per_line(ty)
+
+  # double negation makes division rounds up
+  return outer, -(-inner // per_line)
+
 """
 Our representation of SHIR's MemoryLayout class.
 """
