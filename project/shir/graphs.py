@@ -165,17 +165,19 @@ class SHIRProject:
     for n in gm.graph.nodes:
       if n.op != "call_function":
         continue
-      if n.target == torch.ops.shir_intrinsic.int_addmm.default:
-        node_bias = n.args[0]
-        node_matrix = n.args[1]
-        node_weight = n.args[2]
 
-        if isinstance(node_matrix, torch.fx.Node):
-          buffer_strategy[node_matrix] = buffer_strategy.get(node_matrix, False)
-        if isinstance(node_weight, torch.fx.Node):
-          buffer_strategy[node_weight] = True
-        if isinstance(node_bias, torch.fx.Node):
-          buffer_strategy[node_bias] = True
+      obj = lowering.fetch_lowering(n.target)
+      try:
+        if callable(obj.should_buffer):
+          hint = obj.should_buffer(*n.args, **n.kwargs)
+          for node, flag in hint.items():
+            original_flag = buffer_strategy.get(node, None)
+            if original_flag is not None and flag != original_flag:
+              # make sure we continue to buffer matrix
+              flag = True
+            buffer_strategy[node] = flag
+      except:
+        pass
 
     # and we emit the rewrite rules based on the collected hints.
     #
@@ -192,25 +194,32 @@ class SHIRProject:
 
       host_id, real_typ = host_mapping[n]
       strat = buffer_strategy[n]
+      if strat is None:
+        continue
 
       # buffering is based on cachelines, so estimate it.
       # (the rewrite will crash later if there's a mismatch...)
       _, lines = layout.guess_line_layout(n.meta.get("val").shape, real_typ)
-      print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(", file=f)
+      print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(", end='', file=f)
       if strat:
-        print(f"  InputBufferingRules.bufferInputMatrix(\"{host_id}\", {lines})", file=f)
+        print("InputBufferingRules.bufferInputMatrix(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
       else:
-        print(f"  InputBufferingRules.bufferInputRow(\"{host_id}\", {lines})", file=f)
+        print("InputBufferingRules.bufferInputRow(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
       print("))),", file=f)
 
-    # fully parallelize the dot product for matrix multiplications
+    # add other operation specific rewrites
     for n in gm.graph.nodes:
-      if n.op == "call_function" and n.target == torch.ops.shir_intrinsic.int_addmm.default:
-        # for n*k cross m*k, we want to parallelize by k
-        k = n.args[1].meta.get("val").shape[1]
-        print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(),", file=f)
-        print(f"  ParallelizeDotProductRules.all(Some({k}))", file=f)
-        print(")),", file=f)
+      if n.op != "call_function":
+        continue
+
+      obj = lowering.fetch_lowering(n.target)
+      try:
+        if callable(obj.should_rewrite):
+          hint = obj.should_rewrite(*n.args, **n.kwargs)
+          if hint is not None:
+            print(hint, ",", sep="", file=f)
+      except:
+        pass
 
     # double buffer every input
     # the target is a descending sequence of integers...

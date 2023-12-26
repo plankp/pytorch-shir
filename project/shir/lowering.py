@@ -3,7 +3,7 @@ Where the lowering of each supported operator actually happens
 """
 
 import torch
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 from functools import reduce
 from itertools import chain
 from . import bit_utils, types
@@ -26,6 +26,26 @@ def fetch_lowering(key):
 
 """
 Registration of the supported operators
+
+Each "operator handler" needs a few methods, some optional:
+
+-  supports(args...) -> bool:
+   whether the operator handler supports lowering the set of arguments
+
+-  lower(args...) -> str:
+   lowers the operation into SHIR code and returns that.
+   supports(xs...) implies lower(xs...) works
+
+-  should_buffer(args...) -> Dict[fx.node, bool]:  {optional}
+   returns a mapping of nodes that should be buffered.
+   currently uses a confusing 3VL where:
+     (absence) - no need to buffer
+     False - buffer row
+     True - buffer matrix
+
+-  should_rewrite(args...) -> Optional[str]:  {optional}
+   returns None or a string representing a rewrite pass in SHIR
+   (which means "(SomeCompiler.phaseAfter, RewriteWhatever(...))")
 """
 
 shin = torch.ops.shir_intrinsic
@@ -415,6 +435,16 @@ class LowerShirIntAddmm:
       f"algo.Map(2, algo.torch.MaybeTruncInt.signed(32),"
       f" algo.torch.AddMMInt({acc.name}, {lhs.name}, {rhs.name}))"
     )
+
+  @staticmethod
+  def should_buffer(acc, lhs, rhs) -> Dict[torch.fx.Node, bool]:
+    return { acc: True, lhs: False, rhs: True }
+
+  @staticmethod
+  def should_rewrite(acc, lhs, rhs) -> Optional[str]:
+    # for n*k cross m*k, we want to parallelize by k
+    k = lhs.meta.get("val").shape[1]
+    return f"(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), ParallelizeDotProductRules.all(Some({k}))))"
 
 @register_lowering(shin.qconv.default)
 class LowerQConv:
