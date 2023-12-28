@@ -208,13 +208,13 @@ class SHIRProject:
     # and we emit the rewrite rules based on the collected hints.
     #
     # XXX:
-    # the buffering rewrites MUST be applied inside out. so for a graph
-    # of { tmp = input1 * input2; result = tmp * input3 }, input1 and input2
-    # must be buffered before tmp.
+    # the buffering rewrites MUST be applied outside in. so for a graph
+    # of { tmp = input1 * input2; result = tmp * input3 }, tmp must be
+    # buffered before input1 and input2.
     #
     # (and the current implementation is obeys that by walking the
-    # dependency graph)
-    for n in gm.graph.nodes:
+    # dependency graph backwards)
+    for n in reversed(gm.graph.nodes):
       if n not in host_mapping or n not in buffer_strategy:
         continue
 
