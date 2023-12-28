@@ -109,58 +109,24 @@ class SHIRProject:
       print(file=f)
       print("  def main(args: Array[String]): Unit = Util.drive(this, args)", file=f)
 
+      # determine the buffering strategy here.
+      # it's needed because doing so might uncover extra host mappings
+      # (due to buffering on host).
+      buffer_strategy = self._determine_buffering(gm, host_mapping)
+
       print(file=f)
       self._emit_method_load_data(f, gm, host_mapping)
 
       print(file=f)
-      self._emit_method_extra_rewrites(f, gm, host_mapping)
+      self._emit_method_extra_rewrites(f, gm, buffer_strategy, host_mapping)
 
       print(file=f)
       self._emit_method_generate_ir(f, gm, host_mapping)
 
       print("}", file=f)
 
-  def _emit_method_load_data(self, f, gm, host_mapping):
-    print("  override def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
-
-    output_node = None
-    for n in gm.graph.nodes:
-      if n.op == "placeholder":
-        # only inputs come from csv's
-        print(
-          "    \"", host_mapping[n][0], "\" -> Util.readIntCSV(Paths.get(folder, \"",
-          host_mapping[n][0], ".csv\").toFile()),",
-          sep="", file=f
-        )
-
-      elif n.op == "output":
-        assert output_node is None, f"Multi-output node not supported"
-        assert isinstance(n.args[0], Node), "Multi-valued output node not supported"
-        output_node = n.args[0].meta.get("val")
-
-    # for the result, we still need to give it some dummy value for simulation
-    # to determine the RAM size.
-    (outer, inner) = layout.reshape_size_to_matrix(output_node.shape)
-    print(
-      "    \"result\" -> new UniformSeq(new UniformSeq(0, ",
-      inner, "), ", outer, ")",
-      sep="", file=f
-    )
-
-    print("  )", file=f)
-
-  def _emit_method_extra_rewrites(self, f, gm, host_mapping):
-    print("  override def extraRewrites(): Seq[(core.compile.CompilerPhase, core.rewrite.RewriteStep)] = {", file=f)
-    print("    import core.compile.CompilerPhase", file=f)
-    print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
-    print("    import backend.hdl.arch.{ArchCompiler, MapCompiler}", file=f)
-    print("    import backend.hdl.arch.device.DeviceSpecificCompiler", file=f)
-    print("    import backend.hdl.arch.rewrite.{InputBufferingRules, ParallelizeDotProductRules}", file=f)
-    print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
-    print("    Seq(", file=f)
-
-    # decide on the buffering strategy for inputs.
-    # here we "guess" by its usage.
+  def _determine_buffering(self, gm, host_mapping):
+    buffer_id = 0
     buffer_strategy = {}
     for n in gm.graph.nodes:
       if n.op != "call_function":
@@ -176,8 +142,68 @@ class SHIRProject:
               # make sure we continue to buffer matrix
               flag = True
             buffer_strategy[node] = flag
+
+            # right now, assume that we really want it buffered on host.
+            # so add a new entry if it wasn't there already
+            if node not in host_mapping:
+              host_mapping[node] = (f"buffer{buffer_id}_tag", types.get_element_type(node))
+              buffer_id += 1
       except:
         pass
+    return buffer_strategy
+
+  def _emit_method_load_data(self, f, gm, host_mapping):
+    print("  override def loadData(folder: String): Predef.Map[String, Seq[Seq[Int]]] = Predef.Map(", file=f)
+
+    output_node = None
+    for n in gm.graph.nodes:
+      if n.op == "output":
+        assert output_node is None, f"Multi-output node not supported"
+        assert isinstance(n.args[0], Node), "Multi-valued output node not supported"
+        output_node = n.args[0].meta.get("val")
+        continue
+
+      # it is either a placeholder or a intermediate node.
+      # in either case, consult the host_mapping table.
+      if n in host_mapping:
+        host_id = host_mapping[n][0]
+
+        # if it is an input, read the values from csv files.
+        # otherwise, just create a bunch of 0's (like in the result case)
+        if n.op == "placeholder":
+          print(
+            "    \"", host_id, "\" -> Util.readIntCSV(Paths.get(folder, \"",
+            host_id, ".csv\").toFile()),",
+            sep="", file=f
+          )
+        else:
+          (outer, inner) = layout.reshape_size_to_matrix(n.meta.get("val").shape)
+          print(
+            "    \"", host_id, "\" -> new UniformSeq(new UniformSeq(0, ",
+            inner, "), ", outer, ")",
+            sep="", file=f
+          )
+
+    # for the result, we still need to give it some dummy value for simulation
+    # to determine the RAM size.
+    (outer, inner) = layout.reshape_size_to_matrix(output_node.shape)
+    print(
+      "    \"result\" -> new UniformSeq(new UniformSeq(0, ",
+      inner, "), ", outer, ")",
+      sep="", file=f
+    )
+
+    print("  )", file=f)
+
+  def _emit_method_extra_rewrites(self, f, gm, buffer_strategy, host_mapping):
+    print("  override def extraRewrites(): Seq[(core.compile.CompilerPhase, core.rewrite.RewriteStep)] = {", file=f)
+    print("    import core.compile.CompilerPhase", file=f)
+    print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
+    print("    import backend.hdl.arch.{ArchCompiler, MapCompiler}", file=f)
+    print("    import backend.hdl.arch.device.DeviceSpecificCompiler", file=f)
+    print("    import backend.hdl.arch.rewrite.{InputBufferingRules, ParallelizeDotProductRules}", file=f)
+    print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
+    print("    Seq(", file=f)
 
     # and we emit the rewrite rules based on the collected hints.
     #
@@ -304,6 +330,10 @@ class SHIRProject:
       elif n.op == "call_function":
         obj = lowering.fetch_lowering(n.target)
         expr = obj.lower(*n.args, **n.kwargs)
+        if n in host_mapping:
+          # add buffering if necessary.
+          expr = f"algo.BufferHost({expr}, core.TextType(\"{host_mapping[n][0]}\"))"
+
         if many_uses:
           print(
             "    val _init = core.TypeChecker.check(", expr, ")\n",
