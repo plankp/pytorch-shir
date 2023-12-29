@@ -11,9 +11,6 @@ PERFORM_SYNTHESIS = False
 # only relevant if PERFORM_SYNTHESIS
 ACCEL_UUID = None
 
-# if we should simulate the hardware
-PERFORM_SIMULATION = False
-
 # the number of bits in each cacheline (of the target / simulated hardware)
 CACHELINE_BITS = 512
 
@@ -26,9 +23,8 @@ TRY_NARROW_TYPE = True
 # if we should copy the known tensor values ahead of time
 TRY_COPY_AOT = True
 
-# the output directory:
-# each model will get its own subdir here
-EMIT_OUTPUT_DIR = "./data/generated"
+# the model cache directory:
+MODEL_CACHE_DIR = "./data/cache"
 
 """ Settings that you normally wouldn't touch """
 

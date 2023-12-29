@@ -16,6 +16,7 @@ from itertools import count
 from pathlib import Path
 from typing import List, Callable
 from . import types, lowering, graphs, rewrites, config, bit_utils
+import shutil
 
 # some aliases
 aten = torch.ops.aten
@@ -77,24 +78,20 @@ def may_avoid_output_copy(original_node: Node) -> bool:
 
   return True
 
-# a global counter used to (hopefully) avoid clashing module names when
-# generating the SHIR projects
-_instance_counter = count()
-
 def apply_shir_ops(gm: GraphModule):
   # look for call_modules which point to a submodule containing only the
   # supported operators. we swap them out with our custom submodules depending
   # on the active configuration.
   for n in gm.graph.nodes:
-    if n.op == "call_module":
-      assert not n.kwargs
-      submod = gm.get_submodule(n.target)
+    if n.op != "call_module":
+      continue
 
-      idnum = next(_instance_counter)
-      project = graphs.SHIRProject(
-        f"Module{idnum}",
-        Path(config.EMIT_OUTPUT_DIR) / f"module{idnum}"
-      )
+    assert not n.kwargs
+    submod = gm.get_submodule(n.target)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tempdir:
+      project = graphs.SHIRProject("Module0", Path(tempdir))
 
       # a makeshift iterator to yield the next placeholder node
       # so we can map out the inputs of the submodule.
@@ -134,33 +131,38 @@ def apply_shir_ops(gm: GraphModule):
         # recall the domain is the nodes of the submodule
         host_mapping[next(it1)] = (host_id, real_ty)
 
-      # then trigger compilation regardless of active configuration using the
-      # bitwidth information
-      project.prepare_directory()
+      # emit the source code and use that to derive the cache directory
       project.emit_source(submod, host_mapping)
-      project.generate_hardware_files()
+      cache_dir = project.consult_cache()
 
-      shir_graph = None
+      # if the cached directory does not exist, then we perform synthesis
+      # then cache the results.
+      if not cache_dir.exists():
+        print("CACHING AT ", cache_dir, " PROJECT ", project.output_dir)
+        project.prepare_directory()
+        project.generate_hardware_files()
+
+        if config.PERFORM_SYNTHESIS:
+          from . import driver
+          project.synthesize()
+
+          cache_dir.mkdir()
+          shutil.copyfile(project.get_source_file(), cache_dir / "Module0.scala")
+          shutil.copyfile(project.get_layout_file(), cache_dir / "memory.layout")
+          shutil.copyfile(project.get_gbs_file(), cache_dir / "hello_afu_unsigned_ssl.gbs")
+
+      # then construct the graph as necessary
       if config.PERFORM_SYNTHESIS:
         from . import driver
-        project.synthesize()
-        shir_graph = graphs.SHIRGraphFpgaModule(submod, project, driver)
-      elif config.PERFORM_SIMULATION:
-        shir_graph = graphs.SHIRGraphSimModule(submod, project)
-
-      if shir_graph:
         gm.delete_submodule(n.target)
-        gm.add_submodule(n.target, shir_graph)
+        gm.add_submodule(n.target, graphs.SHIRGraphFpgaModule(
+          submod, driver,
+          cache_dir / "memory.layout",
+          cache_dir / "hello_afu_unsigned_ssl.gbs"
+        ))
 
-  # now is the tricky part.
+  # the problems with SHIRGraphFpgaModule are as follows:
   #
-  # both SHIR graphs may be expecting inputs of reduced bitwidth (see above).
-  #
-  # for SHIRGraphSimModule, this is (presently) not a problem since it always
-  # passes values by serializing the tensors into csv's, and the
-  # deserialization business is done in layout.py.
-  #
-  # for SHIRGraphFpgaModule, however, we have two problems:
   # 1.  it preallocates memory for the input and output, so we need to make
   #     the values go to where it expects it to be.
   # 2.  PyTorch does not support variable bitwidth values, so naive copy is
