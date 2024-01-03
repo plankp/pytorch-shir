@@ -444,7 +444,11 @@ class LowerShirIntAddmm:
   def should_rewrite(acc, lhs, rhs) -> Optional[str]:
     # for n*k cross m*k, we want to parallelize by k
     k = lhs.meta.get("val").shape[1]
-    return f"(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), ParallelizeDotProductRules.all(Some({k}))))"
+
+    # XXX:
+    # here we DON'T use ParallelizeDotProductRules.get because it brings
+    # in other rewrites that screw up other dotp parallelization oppurtunities.
+    return f"(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(ParallelizeDotProductRules.parallelizeDotProduct({k}))))"
 
 @register_lowering(shin.qconv.default)
 class LowerQConv:
