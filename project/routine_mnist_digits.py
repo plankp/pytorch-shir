@@ -76,8 +76,8 @@ def time_inference(dataloader, model):
 batch_size = 64
 loss_fn = nn.CrossEntropyLoss()
 
-train_dataloader = DataLoader(training_data, batch_size=batch_size, shuffle=True)
-test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
+train_dataloader = DataLoader(training_data, batch_size=batch_size)
+test_dataloader = DataLoader(test_data, batch_size=batch_size)
 
 def reload_cached(
   file_saved_weights: str, model_ctor,

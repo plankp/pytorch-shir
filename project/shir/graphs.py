@@ -65,9 +65,18 @@ class SHIRProject:
     self.output_dir = output_dir
 
   def consult_cache(self):
+    # XXX: Newer Python platforms have file_digest.
+    # but the server uses an older one that doesn't...
+    # so we use the one suggested here:
+    # https://stackoverflow.com/a/44873382/11416644
     import hashlib
-    with (self.output_dir / f"{self.clname}.scala").open("rb") as f:
-      digest = hashlib.file_digest(f, "sha256").hexdigest()
+    with (self.output_dir / f"{self.clname}.scala").open("rb", buffering=0) as f:
+      h = hashlib.sha256()
+      b = bytearray(128*1024)
+      mv = memoryview(b)
+      while n := f.readinto(mv):
+        h.update(mv[:n])
+      digest = h.hexdigest()
       return Path(config.MODEL_CACHE_DIR) / digest
 
   def prepare_directory(self):
