@@ -382,7 +382,7 @@ class SHIRGraphFpgaModule(torch.nn.Module):
   _inputs: List[torch.Tensor]
   _output: torch.Tensor
 
-  def __init__(self, gm: GraphModule, driver, layout_file, gbs_file):
+  def __init__(self, input_mapping, output_shape, driver, layout_file, gbs_file):
     super().__init__()
     self._driver = driver
     self._layout = layout.read_layout_file(layout_file)
@@ -393,9 +393,7 @@ class SHIRGraphFpgaModule(torch.nn.Module):
     meminfo = self._driver.alloc_buffer(sz)
     self._buffer = meminfo
 
-    (in_nodes, out_node) = _collect_inout_nodes(gm)
-    arg_mapping = {f"arg{i}": (i, arg) for i, arg in enumerate(in_nodes)}
-    inputs = [None] * len(in_nodes)
+    inputs = [None] * len(input_mapping)
     output = None
 
     for entry in self._layout._entries:
@@ -410,10 +408,10 @@ class SHIRGraphFpgaModule(torch.nn.Module):
         region = entry.from_buffer(meminfo)
 
       if entry.name == "result":
-        output = _reshape_region(region, out_node.meta.get("val").shape)
+        output = _reshape_region(region, output_shape)
       elif region is not None:
-        (id, node) = arg_mapping[entry.name]
-        inputs[id] = _reshape_region(region, node.meta.get("val").shape)
+        (node_id, node_shape) = input_mapping[entry.name]
+        inputs[node_id] = _reshape_region(region, node_shape)
 
     self._inputs = inputs
     self._output = output

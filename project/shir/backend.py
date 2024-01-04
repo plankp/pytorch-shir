@@ -109,6 +109,8 @@ def apply_shir_ops(gm: GraphModule):
       # - the domain consists of nodes of the submodule!
       # - this mapping gets updated to include buffered entries!
       host_mapping = {}
+      input_mapping = {}
+      output_mapping = n.meta.get("val").shape
       for i, arg in enumerate(n.args):
         # XXX:
         # the trailing _tag in the name makes some rewrites easier to handle
@@ -130,6 +132,7 @@ def apply_shir_ops(gm: GraphModule):
 
         # recall the domain is the nodes of the submodule
         host_mapping[next(it1)] = (host_id, real_ty)
+        input_mapping[host_id] = (i, arg.meta.get("val").shape)
 
       # emit the source code and use that to derive the cache directory
       project.emit_source(submod, host_mapping)
@@ -156,7 +159,7 @@ def apply_shir_ops(gm: GraphModule):
         from . import driver
         gm.delete_submodule(n.target)
         gm.add_submodule(n.target, graphs.SHIRGraphFpgaModule(
-          submod, driver,
+          input_mapping, output_mapping, driver,
           cache_dir / "memory.layout",
           cache_dir / "hello_afu_unsigned_ssl.gbs"
         ))
@@ -220,7 +223,7 @@ def apply_shir_ops(gm: GraphModule):
             else:
               # reaching here means the weights have reduced to a bitwidth that is
               # not supported by PyTorch. example: int32 bias reduced as s20.
-              entry = submod._layout.get_entry(f"arg{i}")
+              entry = submod._layout.get_entry(f"arg{i}_tag")
               entry.to_buffer(submod._buffer, src)
 
           else:
