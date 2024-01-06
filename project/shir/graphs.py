@@ -191,7 +191,7 @@ class SHIRProject:
           (outer, inner) = layout.reshape_size_to_matrix(n.meta.get("val").shape)
           print(
             "    \"", host_id, "\" -> new UniformSeq(new UniformSeq(0, ",
-            inner, "), ", outer, ")",
+            inner, "), ", outer, "),",
             sep="", file=f
           )
 
