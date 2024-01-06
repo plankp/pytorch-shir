@@ -1,0 +1,24 @@
+flowchart
+  float_model{{Float model}}
+  torch_export[[torch export]]
+  fx_graph{{FX graph}}
+  shir_quantizer([SHIR quantizer])
+  calib_input[Calibration input]
+  torch_quant[[torch quantization]]
+  quant_model{{Quantized model}}
+  shir_backend([SHIR backend])
+  torch_compile[[torch compile]]
+  end_model{{Converted model}}
+  
+  float_model --> torch_export
+  torch_export -.-> fx_graph
+  
+  fx_graph --> torch_quant
+  shir_quantizer --> torch_quant
+  calib_input --> torch_quant
+  torch_quant -.-> quant_model
+  
+  quant_model --> torch_compile
+  shir_backend --> torch_compile
+  torch_compile -.-> end_model
+

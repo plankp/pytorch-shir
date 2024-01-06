@@ -1,0 +1,34 @@
+flowchart
+    subgraph Python
+        py_float_model[Float model]
+        subgraph FX
+            fx_float_model[FX graph]
+            fx_quantized_model[Quantized graph]
+            fx_lowered_model[Lowered model]
+            fx_supported_subgraph[SHIR supported graph]
+            fx_remainder_subgraph[Fallback graph]
+        end
+    end
+    subgraph SHIR
+        shir_algo_expr[algo + algo.torch nodes]
+        shir_arch_expr[arch nodes]
+        shir_graph_ir[graph IR]
+    end
+    subgraph Synthesis
+        vhdl[VHDL]
+        gbs[Reconfiguration bitstream]
+    end
+    mem_layout[Memory layout]
+
+    py_float_model -->|torch export| fx_float_model
+    fx_float_model -->|torch quantization| fx_quantized_model
+    fx_quantized_model -->|torch compile| fx_lowered_model
+    fx_lowered_model -->|partitioner| fx_supported_subgraph
+    fx_lowered_model -->|partitioner| fx_remainder_subgraph
+    fx_supported_subgraph -->|SHIR backend| shir_algo_expr
+    shir_algo_expr -->|ArchCompiler| shir_arch_expr
+    shir_arch_expr -->|rewrites + lowering| shir_arch_expr
+    shir_arch_expr -->|GraphGenerator| shir_graph_ir
+    shir_graph_ir -->|VhdlGenerator| vhdl
+    shir_graph_ir -->|MemoryLayout| mem_layout
+    vhdl -->|synthesis| gbs
