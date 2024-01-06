@@ -409,7 +409,8 @@ class SHIRGraphFpgaModule(torch.nn.Module):
 
       if entry.name == "result":
         output = _reshape_region(region, output_shape)
-      elif region is not None:
+      elif region is not None and entry.name in input_mapping:
+        # then this must be an input (not host-buffered intermediate data)
         (node_id, node_shape) = input_mapping[entry.name]
         inputs[node_id] = _reshape_region(region, node_shape)
 
