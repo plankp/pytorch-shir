@@ -90,79 +90,81 @@ def apply_shir_ops(gm: GraphModule):
     submod = gm.get_submodule(n.target)
 
     import tempfile
-    with tempfile.TemporaryDirectory() as tempdir:
-      project = graphs.SHIRProject("Module0", Path(tempdir))
+    tempdir = tempfile.mkdtemp()
+    project = graphs.SHIRProject("Module0", Path(tempdir))
 
-      # a makeshift iterator to yield the next placeholder node
-      # so we can map out the inputs of the submodule.
-      def yield_placeholders():
-        for n in submod.graph.nodes:
-          if n.op == "placeholder":
-            yield n
-      it1 = yield_placeholders()
+    # a makeshift iterator to yield the next placeholder node
+    # so we can map out the inputs of the submodule.
+    def yield_placeholders():
+      for n in submod.graph.nodes:
+        if n.op == "placeholder":
+          yield n
+    it1 = yield_placeholders()
 
-      # at this point, all outer values are passed into the inner graph as
-      # arguments / placeholders. here, we assume they must be placed on
-      # host ram, thus require the type information and an identifier.
+    # at this point, all outer values are passed into the inner graph as
+    # arguments / placeholders. here, we assume they must be placed on
+    # host ram, thus require the type information and an identifier.
 
-      # notes:
-      # - the domain consists of nodes of the submodule!
-      # - this mapping gets updated to include buffered entries!
-      host_mapping = {}
-      input_mapping = {}
-      output_mapping = n.meta.get("val").shape
-      for i, arg in enumerate(n.args):
-        # XXX:
-        # the trailing _tag in the name makes some rewrites easier to handle
-        # (e.g. input buffering rules use partial matching on host id's!)
-        host_id = f"arg{i}_tag"
-        decl_ty = types.get_element_type(arg)
-        real_ty = decl_ty
+    # notes:
+    # - the domain consists of nodes of the submodule!
+    # - this mapping gets updated to include buffered entries!
+    host_mapping = {}
+    input_mapping = {}
+    output_mapping = n.meta.get("val").shape
+    for i, arg in enumerate(n.args):
+      # XXX:
+      # the trailing _tag in the name makes some rewrites easier to handle
+      # (e.g. input buffering rules use partial matching on host id's!)
+      host_id = f"arg{i}_tag"
+      decl_ty = types.get_element_type(arg)
+      real_ty = decl_ty
 
-        if config.TRY_NARROW_TYPE and arg.op == "get_attr":
-          # this is a weight or bias (or the like) meaning we have access
-          # to their values. thus we can compute the minimum bits necessary.
-          real_ty = bit_utils.get_narrow_type(getattr(gm, arg.target))
+      if config.TRY_NARROW_TYPE and arg.op == "get_attr":
+        # this is a weight or bias (or the like) meaning we have access
+        # to their values. thus we can compute the minimum bits necessary.
+        real_ty = bit_utils.get_narrow_type(getattr(gm, arg.target))
 
-          # Avoid differing signedness
-          # (say torch declares it as int8, but all values are positive causes
-          # our function to guess an unsigned type)
-          if isinstance(decl_ty, types.SI) and isinstance(real_ty, types.UI):
-            real_ty = real_ty.to_signed()
+        # Avoid differing signedness
+        # (say torch declares it as int8, but all values are positive causes
+        # our function to guess an unsigned type)
+        if isinstance(decl_ty, types.SI) and isinstance(real_ty, types.UI):
+          real_ty = real_ty.to_signed()
 
-        # recall the domain is the nodes of the submodule
-        host_mapping[next(it1)] = (host_id, real_ty)
-        input_mapping[host_id] = (i, arg.meta.get("val").shape)
+      # recall the domain is the nodes of the submodule
+      host_mapping[next(it1)] = (host_id, real_ty)
+      input_mapping[host_id] = (i, arg.meta.get("val").shape)
 
-      # emit the source code and use that to derive the cache directory
-      project.emit_source(submod, host_mapping)
-      cache_dir = project.consult_cache()
+    # emit the source code and use that to derive the cache directory
+    project.emit_source(submod, host_mapping)
+    cache_dir = project.consult_cache()
 
-      # if the cached directory does not exist, then we perform synthesis
-      # then cache the results.
-      if not cache_dir.exists():
-        print("CACHING AT ", cache_dir, " PROJECT ", project.output_dir)
-        project.prepare_directory()
-        project.generate_hardware_files()
+    # if the cached directory does not exist, then we perform synthesis
+    # then cache the results.
+    if not cache_dir.exists():
+      print("CACHING AT ", cache_dir, " PROJECT ", project.output_dir)
+      project.prepare_directory()
+      project.generate_hardware_files()
 
-        if config.PERFORM_SYNTHESIS:
-          from . import driver
-          project.synthesize()
-
-          cache_dir.mkdir()
-          shutil.copyfile(project.get_source_file(), cache_dir / "Module0.scala")
-          shutil.copyfile(project.get_layout_file(), cache_dir / "memory.layout")
-          shutil.copyfile(project.get_gbs_file(), cache_dir / "hello_afu_unsigned_ssl.gbs")
-
-      # then construct the graph as necessary
       if config.PERFORM_SYNTHESIS:
         from . import driver
-        gm.delete_submodule(n.target)
-        gm.add_submodule(n.target, graphs.SHIRGraphFpgaModule(
-          input_mapping, output_mapping, driver,
-          cache_dir / "memory.layout",
-          cache_dir / "hello_afu_unsigned_ssl.gbs"
-        ))
+        project.synthesize()
+
+        cache_dir.mkdir()
+        shutil.copyfile(project.get_source_file(), cache_dir / "Module0.scala")
+        shutil.copyfile(project.get_layout_file(), cache_dir / "memory.layout")
+        shutil.copyfile(project.get_gbs_file(), cache_dir / "hello_afu_unsigned_ssl.gbs")
+
+    # then construct the graph as necessary
+    if config.PERFORM_SYNTHESIS:
+      from . import driver
+      gm.delete_submodule(n.target)
+      gm.add_submodule(n.target, graphs.SHIRGraphFpgaModule(
+        input_mapping, output_mapping, driver,
+        cache_dir / "memory.layout",
+        cache_dir / "hello_afu_unsigned_ssl.gbs"
+      ))
+
+    shutil.rmtree(tempdir)
 
   # the problems with SHIRGraphFpgaModule are as follows:
   #
