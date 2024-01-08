@@ -1,13 +1,14 @@
 flowchart
     subgraph Python
         py_float_model[Float model]
-        subgraph FX
-            fx_float_model[FX graph]
-            fx_quantized_model[Quantized graph]
-            fx_lowered_model[Lowered model]
-            fx_supported_subgraph[SHIR supported graph]
-            fx_remainder_subgraph[Fallback graph]
-        end
+
+        fx_float_model[FX graph]
+        fx_quantized_model[Quantized graph]
+
+        %% Note: fx_lowered_model wraps over (but is not) a fx graph.
+        fx_lowered_model[Lowered model]
+        fx_supported_subgraph[SHIR supported graph]
+        fx_remainder_subgraph[Fallback graph]
     end
     subgraph SHIR
         shir_algo_expr[algo + algo.torch nodes]

@@ -1,0 +1,193 @@
+Here, we use a very simple example:
+
+Float model:
+
+  import torch
+
+  class Net(torch.nn.Module):
+    def __init__(self):
+      super().__init__()
+      self.a = torch.nn.Linear(28 * 28, 10)
+
+    def forward(self, x):
+      x = torch.flatten(x, 1)
+      x = self.a(x)
+      return x
+
+FX graph:
+
+  class GraphModule(torch.nn.Module):
+    def forward(self, x):
+      arg0: f32[s0, 1, s1, s1], = fx_pytree.tree_flatten_spec(([x], {}), self._in_spec)
+
+      sym_size: Sym(s0) = torch.ops.aten.sym_size(arg0, 0)
+      sym_size1: Sym(s1) = torch.ops.aten.sym_size(arg0, 2)
+      sym_size2: Sym(s1) = torch.ops.aten.sym_size(arg0, 3)
+      mul: Sym(s1**2) = sym_size_1 * sym_size_2;  sym_size_1 = sym_size_2 = None
+      view_default: few[s0, s1**2] = torch.ops.aten.view.default(arg0, [sym_size, mul]);  arg0 = sym_size = mul = None
+
+      _param_constant0 = self._param_constant0
+      t_default: f32[784, 10] = torch.ops.aten.t.default(_param_constant0);  _param_constant0 = None
+      _param_constant1 = self._param_constant1
+      addmm_default: f32[s0, 10] = torch.ops.aten.addmm.default(_param_constant1, view_default, t_default);  _param_constant1 = view_default = t_default = None
+      return pytree.tree_unflatten([addmm_default], self._out_spec)
+
+Quantized graph (prepared):
+
+  class GraphModule(torch.nn.Module):
+    def forward(self, x):
+      arg0: f32[s0, 1, s1, s1], = fx_pytree.tree_flatten_spec(([x], {}), self._in_spec)
+
+      sym_size: Sym(s0) = torch.ops.aten.sym_size(arg0, 0)
+      sym_size1: Sym(s1) = torch.ops.aten.sym_size(arg0, 2)
+      sym_size2: Sym(s1) = torch.ops.aten.sym_size(arg0, 3)
+      mul: Sym(s1**2) = sym_size_1 * sym_size_2;  sym_size_1 = sym_size_2 = None
+      view_default: few[s0, s1**2] = torch.ops.aten.view.default(arg0, [sym_size, mul]);  arg0 = sym_size = mul = None
+
+      activation_post_process_1 = self.activation_post_process_1(view_default);  view_default = None
+
+      _param_constant0 = self._param_constant0
+
+      activation_post_process_0 = self.activation_post_process_0(_param_constant0);  _param_constant0 = None
+
+      t_default: f32[784, 10] = torch.ops.aten.t.default(activation_post_process_0);  activation_post_process_0 = None
+      _param_constant1 = self._param_constant1
+      addmm_default: f32[s0, 10] = torch.ops.aten.addmm.default(_param_constant1, activation_post_process_1, t_default);  _param_constant1 = activation_post_process_1 = t_default = None
+
+      activation_post_process_2 = self.activation_post_process_2(addmm_default);  addmm_default = None
+      return pytree.tree_unflatten([activation_post_process_2], self._out_spec)
+
+Quantized graph (converted):
+
+  class GraphModule(torch.nn.Module):
+    def forward(self, x):
+      arg0: f32[s0, 1, s1, s1], = fx_pytree.tree_flatten_spec(([x], {}), self._in_spec)
+
+      sym_size: Sym(s0) = torch.ops.aten.sym_size(arg0, 0)
+      sym_size1: Sym(s1) = torch.ops.aten.sym_size(arg0, 2)
+      sym_size2: Sym(s1) = torch.ops.aten.sym_size(arg0, 3)
+      mul: Sym(s1**2) = sym_size_1 * sym_size_2;  sym_size_1 = sym_size_2 = None
+      view_default: few[s0, s1**2] = torch.ops.aten.view.default(arg0, [sym_size, mul]);  arg0 = sym_size = mul = None
+
+      quantize_per_tensor_default = torch.ops.quantized_decomposed.quantize_per_tensor.default(view_default, 0.003919653594493866, -128, -128, 127, torch.int8);  view_default = None
+      dequantize_per_tensor_default = torch.ops.quantized_decomposed.dequantize_per_tensor.default(quantize_per_tensor_default, 0.003919653594493866, -128, -128, 127, torch.int8);  quantize_per_tensor_default = None
+
+      _param_constant0 = self._param_constant0
+
+      quantize_per_tensor_default_1 = torch.ops.quantized_decomposed.quantize_per_tensor.default(_param_constant0, 0.0019224989227950573, 0, -127, 127, torch.int8);  _param_constant0 = None
+      dequantize_per_tensor_default_1 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(quantize_per_tensor_default, 0.0019224989227950573, 0, -127, 127, torch.int8);  quantize_per_tensor_default_1 = None
+
+      t_default: f32[784, 10] = torch.ops.aten.t.default(dequantize_per_tensor_default_1);  dequantize_per_tensor_default_1 = None
+      _param_constant1 = self._param_constant1
+      addmm_default: f32[s0, 10] = torch.ops.aten.addmm.default(_param_constant1, dequantize_per_tensor_default, t_default);  _param_constant1 = dequantize_per_tensor_default = t_default = None
+
+      quantize_per_tensor_default_2 = torch.ops.quantized_decomposed.quantize_per_tensor.default(addmm_default, 0.043446850031614304, -20, -128, 127, torch.int8);  addmm_default = None
+      dequantize_per_tensor_default_2 = torch.ops.quantized_decomposed.dequantize_per_tensor.default(quantize_per_tensor_default, 0.043446850031614304, -20, -128, 127, torch.int8);  quantize_per_tensor_default_2 = None
+      return pytree.tree_unflatten([dequantize_per_tensor_default_2], self._out_spec)
+
+Lowered model:
+
+  OptimizedModule (wraps over the quantized model)
+
+Post-Quantized-Rewrite:
+
+  class GraphModule(torch.nn.Module):
+    def forward(self, L_x_: f32[16, 1, 28, 28]):
+      l_x_ = L_x_
+
+      view_default: f32[16, 784] = torch.ops.aten.view.default(l_x_, [16, 784]);  l_x_ = None
+
+      quantize_per_tensor_default: i8[16, 784] = torch.ops.quantized_decomposed.quantize_per_tensor.default(view_default, 0.003919653594493866,-128, -128, 127, torch.int8);  view_default = None
+
+      l__self____param_constant0_1 = self.L__self____param_constant0
+      l__self____param_constant1_1 = self.L__self____param_constant1
+      int_addmm = torch.ops.shir_intrinsic.int_addmm(l__self____param_constant1_1, quantize_per_tensor_default, l__self____param_constant0_1);  l__self____param_constant1_1 = quantize_per_tensor_default = l__self____param_constant0_1 = None
+      requantize = torch.ops.shir_intrinsic.requantize(int_addmm, 0.00017344248910245434, -20);  int_addmm = None
+
+      dequantize_per_tensor_default_2: f32[16, 10] = torch.ops.quantized_decomposed.dequantize_per_tensor.default(requantize, 0.043446850031614304, -20, -128, 127, torch.int8);  requantize = None
+      return (dequantize_per_tensor_default_2,)
+
+AOT-Autograd decomposition:
+
+  class<lambda>(torch.nn.Module):
+    def forward(self, arg2_1: f32[16, 1, 28, 28]):
+      l__self____param_constant0: i8[10, 784] = self.L__self____param_constant0
+      l__self____param_constant1: i32[10] = self.L__self____param_constant1
+
+      view: f32[16, 784] = torch.ops.aten.view.default(arg2_1, [16, 784]);  arg2_1 = None
+
+      quantize_per_tensor: i8[16, 784] = torch.ops.quantized_decomposed.quantize_per_tensor.default(view, 0.003919653594493866, -128, -128, 127, torch.int8);  view = None
+
+      int_addmm: i32[16, 10] = torch.ops.shir_intrinsic.int_addmm.default(l__self____param_constant1, quantize_per_tensor, l__self____param_constant0);  l__self____param_constant1 = quantize_per_tensor = l__self____param_constant0 = None
+      requantize: i8[16, 10] = torch.ops.shir_intrinsic.requantize.default(int_addmm, 0.00017344248910245434, -20);  int_addmm = None
+
+      dequantize_per_tensor: f32[16, 10] = torch.ops.quantized_decomposed.dequantize_per_tensor.default(requantize, 0.043446850031614304, -20, -128, 127, torch.int8);  requantize = None
+      return (dequantize_per_tensor,)
+
+Initial Fallback graph:
+
+  class <lambda>(torch.nn.Module):
+    def forward(self, arg2_1: f32[16, 1, 28, 28]):
+      l__self____param_constant0: i8[10, 784] = self.L__self____param_constant0
+      l__self____param_constant1: i32[10] = self.L__self____param_constant1
+
+      view: f32[16, 784] = torch.ops.aten.view.default(arg2_1, [16, 784]);  arg2_1 = None
+
+      quantize_per_tensor: i8[16, 784] = torch.ops.quantized_decomposed.quantize_per_tensor.default(view, 0.003919653594493866, -128, -128, 127, torch.int8);  view = None
+
+      fused_0: i8[16, 10] = self.fused_0(l__self____param_constant1,quantize_per_tensor, l__self____param_constant0);  l__self____param_constant1 = quantize_per_tensor = l__self____param_constant0 = None
+
+      dequantize_per_tensor: f32[16, 10] = torch.ops.quantized_decomposed.dequantize_per_tensor.default(fused_0, 0.043446850031614304, -20, -128, 127, torch.int8);  fused_0 = None
+      return (dequantize_per_tensor,)
+
+SHIR Compatible Subgraph:
+
+  class fused_0(torch.nn.Module):
+    def forward(self, l__self____param_constant1: i32[10], quantize_per_tensor: i8[16, 784], l__self____param_constant0: i8[10, 784]):
+      int_addmm: i32[16, 10] = torch.ops.shir_intrinsic.int_addmm.default(l__self____param_constant1, quantize_per_tensor, l__self____param_constant0);  l__self____param_constant1 = quantize_per_tensor = l__self____param_constant0 = None
+      requantize: i8[16, 10] = torch.ops.shir_intrinsic.requantize.default(int_addmm, 0.00017344248910245434, -20);  int_addmm = None
+      return requantize
+
+Final fallback graph:
+
+  class <lambda>(torch.nn.Module):
+    def forward(self, arg2_1: f32[16, 1, 28, 28]):
+      l__self____param_constant0: i8[10, 784] = self.L__self____param_constant0
+      l__self____param_constant1: i32[10] = self.L__self____param_constant1
+
+      view: f32[16, 784] = torch.ops.aten.view.default(arg2_1, [16, 784]);  arg2_1 = None
+
+      quantize_per_tensor_1: i8[16, 784] = torch.quantize_per_tensor(view, 0.003919653594493866, -128, torch.qint8);  view = None
+      int_repr = quantize_per_tensor_1.int_repr();  quantize_per_tensor_1 = None
+      fused_1 = self.fused_0
+      get_in_tensor = fused_1.get_in_tensor(1);  fused_1 = None
+      fused_2 = self.fused_0()
+      _make_per_tensor_quantized_tensor = torch._make_per_tensor_quantized_tensor(fused_0, 0.043446850031614304, -20);  fused_2 = None
+      dequantize = _make_per_tensor_quantized_tensor.dequantize();  _make_per_tensor_quantized_tensor = None
+      return (dequantize,)
+
+enabled rewrites:
+
+  ArchCompiler.phaseAfter RewriteAll - InputBufferingRules.bufferInputMatrix("arg2_tag", 13)
+  ArchCompiler.phaseAfter RewriteAll - InputBufferingRules.bufferInputRow("arg1_tag", 13)
+  ArchCompiler.phaseAfter RewriteAll - InputBufferingRules.bufferInputMatrix("arg0_tag", 1)
+  ArchCompiler.phaseAfter RewriteAll - ParallelizeDotProductRules.parallelizeDotProduct(784)
+  MemFunctionsCompiler.phaseAfter RewriteTargeted(2, 1, 0) - InputBufferingRules.doubleBufferRead
+
+algo + algo.torch nodes:
+
+  val l__self____param_constant1 = core.TypeChecker.check(algo.torch.Input(algo.SignedIntType(20), "arg0_tag", Seq(10)))
+  val quantize_per_tensor = core.TypeChecker.check(algo.torch.Initial(algo.SignedIntType(8), "arg1_tag", Seq(16, 784)))
+  val l__self____param_constant0 = core.TypeChecker.check(algo.torch.Input(algo.SignedIntType(8), "arg2_tag", Seq(10, 784)))
+  val int_addmm = core.TypeChecker.check(algo.Map(2, algo.torch.MaybeTruncInt.signed(32), algo.torch.AddMMInt(l__self____param_constant1, quantize_per_tensor, l__self____param_constant0)))
+  val requantize = core.TypeChecker.check(algo.Map(2, algo.torch.RequantFixedInt.asFunction(Seq(None, Some(algo.ConstantInteger(11918877, Some(algo.IntType(24))))), Seq(36, -20)), int_addmm))
+  core.TypeChecker.check(algo.Map(2, algo.ResizeInteger.asFunction(types = Seq(8)), requantize))
+
+arch nodes:
+
+graph IR:
+
+VHDL:
+
+Memory layout:
+
