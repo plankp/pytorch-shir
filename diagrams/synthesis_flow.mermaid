@@ -1,13 +1,19 @@
 flowchart
-    model{{Mixed ATen and SHIR Graph}}
+    model{{FX Graph with ATen ops}}
+    early_rewrite[[Apply SHIR Intrinsics]]
+    mixed_model{{FX Graph with ATen + SHIR ops}}
+    aten_decomp[[ATen Decomposition]]
+    decomp_model{{FX Graph with Core ATen + prims + SHIR ops}}
     partitioner[[Operator Partitioner]]
     outer_graph{{Fallback Graph}}
+    final_graph{{Final Graph}}
     inner_graph{{SHIR Supported Graph}}
     opt_info[[Operator Info]]
     isel[[Operator Selection]]
     alloc_hint([Allocation hint])
     enabled_passes([SHIR Rewrites])
     lowered_ops([SHIR Expression])
+    apply_outer[[Insert driver logic]]
     compilation_unit>Scala Code]
     subgraph "Synthesis Cache"
         shir_lib>SHIR Compiler Library]
@@ -31,7 +37,11 @@ flowchart
         fpga_compute[[FPGA Compute]]
     end
 
-    model --> partitioner
+    model --> early_rewrite
+    early_rewrite -.-> mixed_model
+    mixed_model --> aten_decomp
+    aten_decomp -.-> decomp_model
+    decomp_model --> partitioner
     partitioner -.-> inner_graph
     partitioner -.-> outer_graph
     inner_graph --> isel
@@ -52,10 +62,14 @@ flowchart
     host_mem_alloc -.-> host_mem
     gbs --> fpga_reconf
     fpga_reconf --> fpga_reset
-    Input --> outer_graph
-    outer_graph --> fpga_reset & fpga_compute
+    alloc_hint --> apply_outer
+    outer_graph --> apply_outer
+    apply_outer -.-> final_graph
+    Input --> final_graph
+    final_graph --> fpga_reset & fpga_compute
     fpga_reset -.-> fpga_compute
     host_mem --> host_mem_incopy
-    outer_graph --> host_mem_incopy
+    final_graph --> host_mem_incopy
     host_mem_incopy -.-> fpga_compute
     fpga_compute --> host_mem_outcopy -.-> Output
+
