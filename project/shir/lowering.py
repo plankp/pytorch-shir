@@ -6,7 +6,7 @@ import torch
 from typing import Tuple, Optional, Dict
 from functools import reduce
 from itertools import chain
-from . import bit_utils, types
+from . import bit_utils, types, layout
 
 """
 Registration magic
@@ -36,12 +36,9 @@ Each "operator handler" needs a few methods, some optional:
    lowers the operation into SHIR code and returns that.
    supports(xs...) implies lower(xs...) works
 
--  should_buffer(args...) -> Dict[fx.node, bool]:  {optional}
+-  should_buffer(args...) -> Dict[fx.node, BufferMatrix | BufferRow]:  {optional}
    returns a mapping of nodes that should be buffered.
-   currently uses a confusing 3VL where:
-     (absence) - no need to buffer
-     False - buffer row
-     True - buffer matrix
+   (absence) indicates no need to buffer
 
 -  should_rewrite(args...) -> Optional[str]:  {optional}
    returns None or a string representing a rewrite pass in SHIR
@@ -438,17 +435,21 @@ class LowerShirIntAddmm:
 
   @staticmethod
   def should_buffer(acc, lhs, rhs) -> Dict[torch.fx.Node, bool]:
-    return { acc: True, lhs: False, rhs: True }
+    return {
+      acc: layout.BufferMatrix(None),
+      lhs: layout.BufferRow(1),
+      rhs: layout.BufferMatrix(1),
+    }
 
   @staticmethod
   def should_rewrite(acc, lhs, rhs) -> Optional[str]:
-    # for n*k cross m*k, we want to parallelize by k
-    k = lhs.meta.get("val").shape[1]
+    t = types.get_element_type(lhs)
+    elts_per_line = layout.max_entries_per_line(t)
 
     # XXX:
     # here we DON'T use ParallelizeDotProductRules.get because it brings
     # in other rewrites that screw up other dotp parallelization oppurtunities.
-    return f"(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(ParallelizeDotProductRules.parallelizeDotProduct({k}))))"
+    return f"(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(ParallelizeDotProductRules.parallelizeDotProduct({elts_per_line}))))"
 
 @register_lowering(shin.qconv.default)
 class LowerQConv:

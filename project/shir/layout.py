@@ -43,6 +43,36 @@ def guess_line_layout(t: torch.Size, ty) -> Tuple[int, int]:
   return outer, -(-inner // per_line)
 
 """
+Some types used to decide how to buffer inputs
+"""
+
+@dataclass(frozen=True)
+class BufferMatrix:
+  lines : Optional[int]
+
+@dataclass(frozen=True)
+class BufferRow:
+  lines : Optional[int]
+
+def merge_buffer_info(a, b):
+  match (a, b):
+    case (None, u) | (u, None):
+      return u
+
+    case (BufferMatrix(a), BufferMatrix(b)):
+      return BufferMatrix(a if a == b else None)
+    case (BufferMatrix(a), _) | (_, BufferMatrix(a)):
+      return BufferMatrix(a)
+
+    case (BufferRow(a), BufferRow(b)):
+      return BufferRow(a if a == b else None)
+    case (BufferRow(a), _) | (_, BufferRow(a)):
+      return BufferRow(a)
+
+    case _:
+      return None
+
+"""
 Our representation of SHIR's MemoryLayout class.
 """
 

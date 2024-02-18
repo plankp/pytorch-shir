@@ -149,10 +149,7 @@ class SHIRProject:
           hint = obj.should_buffer(*n.args, **n.kwargs)
           for node, flag in hint.items():
             original_flag = buffer_strategy.get(node, None)
-            if original_flag is not None and flag != original_flag:
-              # make sure we continue to buffer matrix
-              flag = True
-            buffer_strategy[node] = flag
+            buffer_strategy[node] = layout.merge_buffer_info(original_flag, flag)
 
             # right now, assume that we really want it buffered on host.
             # so add a new entry if it wasn't there already
@@ -238,10 +235,16 @@ class SHIRProject:
       # (the rewrite will crash later if there's a mismatch...)
       _, lines = layout.guess_line_layout(n.meta.get("val").shape, real_typ)
       print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(", end='', file=f)
-      if strat:
-        print("InputBufferingRules.bufferInputMatrix(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
-      else:
-        print("InputBufferingRules.bufferInputRow(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
+
+      match strat:
+        case layout.BufferMatrix(u):
+          lines = u if u else lines
+          print("InputBufferingRules.bufferInputMatrix(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
+
+        case layout.BufferRow(u):
+          lines = u if u else lines
+          print("InputBufferingRules.bufferInputRow(\"", host_id, "\", ", lines, ")", sep='', end='', file=f)
+
       print("))),", file=f)
 
     # add other operation specific rewrites
@@ -259,11 +262,7 @@ class SHIRProject:
         pass
 
     # double buffer every input
-    # the target is a descending sequence of integers...
-    idx = ", ".join((str(x - 1) for x in range(len(host_mapping), 0, -1)))
-    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteTargeted({idx}), Seq(", file=f)
-    print("  InputBufferingRules.doubleBufferRead", file=f)
-    print("))),", file=f)
+    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(InputBufferingRules.doubleBufferRead))),", file=f)
 
     print("    )", file=f)
     print("  }", file=f)

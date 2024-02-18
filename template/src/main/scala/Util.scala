@@ -70,6 +70,7 @@ Allowed switches and arguments:
           // also generate the memory layout file so that the Python
           // side can use this information to generate memory images.
           val project = HDLProject(model.name, model.generateIR(), CompilerPhase.first(), model.extraRewrites() ++ Seq(
+            (ArchCompiler.phaseBefore, RewriteStep(RewriteAll(), Seq(algo.torch.rewrite.Rules.padInputToCacheline(512)))),
             (ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(CleanupRules.removeIdentityResizes))),
 
             (MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), CleanupRules.get())),
