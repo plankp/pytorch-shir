@@ -262,7 +262,7 @@ class SHIRProject:
         pass
 
     # double buffer every input
-    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(InputBufferingRules.doubleBufferRead))),", file=f)
+    print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), InputBufferingRules.readDoubleBuffering)),", file=f)
 
     print("    )", file=f)
     print("  }", file=f)
