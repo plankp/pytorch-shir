@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import Optional
 import ctypes as C
 import weakref
+import subprocess
 from . import config
 
 _impl = C.cdll.LoadLibrary(config.DRIVER_LIB)
@@ -88,3 +89,30 @@ def alloc_buffer(length: int):
 
 def free_buffer(buf):
   _impl.free_buffer(buf, len(buf))
+
+_last_flashed_gbs = None
+_last_opened_fpga = None
+
+def release_fpga():
+  global _last_opened_fpga, _last_flashed_gbs
+  if _last_opened_fpga is None:
+    return
+  _last_opened_fpga.close()
+  _last_opened_fpga = None
+  _last_flashed_gbs = None
+
+def configure_gbs(gbs_file):
+  global _last_opened_fpga, _last_flashed_gbs
+  if _last_opened_fpga is not None and _last_flashed_gbs is not None and _last_flashed_gbs.samefile(gbs_file):
+    return _last_opened_fpga
+
+  # otherwise, since we noly have one FPGA on our server, release the old one
+  release_fpga()
+
+  # and then reconfigure it
+  subprocess.run(['fpgaconf', '-v', gbs_file])
+
+  inst = find_and_open_fpga(config.ACCEL_UUID)
+  _last_flashed_gbs = gbs_file
+  _last_opened_fpga = inst
+  return inst

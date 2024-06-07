@@ -366,9 +366,6 @@ class SHIRProject:
 
     print("  }", file=f)
 
-_last_flashed_gbs = None
-_last_opened_fpga = None
-
 # as the FPGA wills it, we actually preallocate memory for input and output
 # data. the caller does not pass data via __call__. instead, they should use
 # get_in_tensor to copy the values. for outputs, it will always return the
@@ -418,22 +415,7 @@ class SHIRGraphFpgaModule(torch.nn.Module):
 
   def __call__(self) -> torch.Tensor:
     # reconfigure the fpga if needed
-    global _last_flashed_gbs
-    global _last_opened_fpga
-    if _last_flashed_gbs is None or not self._gbs_file.samefile(_last_flashed_gbs):
-      # first, close the currently opened FPGA if applicable
-      if _last_opened_fpga is not None:
-        _last_opened_fpga.close()
-        _last_opened_fpga = None
-
-      # reconfigure
-      subprocess.run(['fpgaconf', '-v', self._gbs_file])
-      _last_flashed_gbs = self._gbs_file
-
-      # then open a new FPGA
-      _last_opened_fpga = self._driver.find_and_open_fpga(config.ACCEL_UUID)
-
-    fpga = _last_opened_fpga
+    fpga = self._driver.configure_gbs(self._gbs_file)
     fpga.reset()
 
     with fpga.prepare_buffer(self._buffer, len(self._buffer)) as wsid:
