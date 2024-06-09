@@ -209,6 +209,7 @@ class SHIRProject:
     print("    import core.rewrite.{RewriteAll, RewriteStep, RewriteTargeted}", file=f)
     print("    import backend.hdl.arch.{ArchCompiler, MapCompiler}", file=f)
     print("    import backend.hdl.arch.device.DeviceSpecificCompiler", file=f)
+    print("    import backend.hdl.arch.tiling.PaddingCompiler", file=f)
     print("    import backend.hdl.arch.rewrite.{InputBufferingRules, ParallelizeDotProductRules}", file=f)
     print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
     print("    Seq(", file=f)
@@ -260,6 +261,9 @@ class SHIRProject:
             print(hint, ",", sep="", file=f)
       except:
         pass
+
+    # try to increase the number of parallel read requests
+    print(f"(PaddingCompiler.phaseBefore, RewriteStep(RewriteAll(), Seq(InputBufferingRules.increaseParallelReadRequests(64)))),", file=f)
 
     # double buffer every input
     print(f"(MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), InputBufferingRules.readDoubleBuffering)),", file=f)
