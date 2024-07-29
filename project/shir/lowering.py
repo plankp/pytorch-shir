@@ -454,7 +454,7 @@ class LowerShirIntAddmm:
 @register_lowering(shin.qconv.default)
 class LowerQConv:
   @staticmethod
-  def supports(input, zp, weight, stride, padding, dilation, groups) -> bool:
+  def supports(input, zp, weight, bias, stride, padding, dilation, groups) -> bool:
     # sanity check: the underlying aten.convolution supports them,
     # but the normal nn.ConvNd doesn't seem to generate these cases.
     # we could handle them, but we disable for now.
@@ -470,16 +470,24 @@ class LowerQConv:
     return True
 
   @staticmethod
-  def lower(input, zp, weight, stride, padding, dilation, groups) -> str:
+  def lower(input, zp, weight, bias, stride, padding, dilation, groups) -> str:
     stride = ", ".join((str(d) for d in stride))
     padding = ", ".join((str(d) for d in padding))
     dilation = ", ".join((str(d) for d in dilation))
     rank = len(input.meta.get("val").shape)
+    if bias is None:
+      return (
+        f"algo.Map({rank}, algo.torch.MaybeTruncInt.signed(32),"
+        f" algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
+        f" Seq({stride}), Seq({padding}), Seq({dilation}),"
+        f" {groups}))"
+      )
     return (
-      f"algo.Map({rank}, algo.torch.MaybeTruncInt.signed(32),"
+      f"algo.torch.MapZippedChannel("
+      f"algo.torch.CappedAddInt.asFunction(types = Seq(algo.SignedIntType(32))),"
       f" algo.torch.SIConv8({input.name}, {zp}, {weight.name},"
-      f" Seq({stride}), Seq({padding}), Seq({dilation}),"
-      f" {groups}))"
+      f" Seq({stride}), Seq({padding}), Seq({dilation}), {groups}),"
+      f" {bias.name})"
     )
 
 @register_lowering(shin.int_max_pool2d.default)

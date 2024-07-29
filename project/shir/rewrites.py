@@ -395,11 +395,10 @@ class QuantOpRewrite:
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.get_attr(kernel_attr)
-      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, *conv_params))
+      n3 = None
       if b is not None:
         n3 = graph.get_attr(bias_attr)
-        n3 = graph.call_function(aten.view, (n3, [-1] + [1] * (kernel_q.ndim - 2)))
-        n2 = graph.call_function(aten.add, (n2, n3))
+      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, n3, *conv_params))
       if needs_relu:
         n2 = graph.call_function(aten.relu, (n2,))
       n3 = graph.call_function(shin.requantize, (n2, k / s_out, z_out))
@@ -511,11 +510,10 @@ class QuantOpRewrite:
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = graph.get_attr(kernel_attr)
-      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, *conv_params))
+      n3 = None
       if b is not None:
         n3 = graph.get_attr(bias_attr)
-        n3 = graph.call_function(aten.view, (n3, [-1] + [1] * (kernel_q.ndim - 2)))
-        n2 = graph.call_function(aten.add, (n2, n3))
+      n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, n3, *conv_params))
       if needs_relu:
         n2 = graph.call_function(aten.relu, (n2,))
       n3 = graph.call_function(shin.requantize_channel, (n2, scales, z_out))
