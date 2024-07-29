@@ -350,7 +350,7 @@ class BackendQuantizer(Quantizer):
     for p in partitions:
       (inp_use, inp, weight, bias, out) = _extract_linear_fields(gm, p)
 
-      if _is_annotated([inp_use, bias, weight, out]):
+      if _is_annotated([inp_use, weight, out]):
         continue
 
       _annotate_input_qspec_map(inp_use, inp, input_qspec)

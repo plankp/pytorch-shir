@@ -271,7 +271,7 @@ class QuantOpRewrite:
     weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is None:
-      bias_q = torch.zero([], dtype=torch.int32)
+      bias_q = torch.zeros([], dtype=torch.int32)
     else:
       bias_q = torch.round(b / k).int()
     bias_q = bias_q - z_x * torch.sum(weight_q, dim=1, dtype=torch.int32)
