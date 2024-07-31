@@ -23,6 +23,9 @@ TRY_NARROW_TYPE = True
 # if we should copy the known tensor values ahead of time
 TRY_COPY_AOT = True
 
+# if we should enforce channel last order (only for rank 3 and above)
+USE_CHANNEL_LAST = True
+
 # the model cache directory:
 MODEL_CACHE_DIR = "./data/cache"
 

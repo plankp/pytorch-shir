@@ -50,10 +50,25 @@ def has_many_uses(node: Node) -> bool:
   return False
 
 def _reshape_region(t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-  return t.as_strided(
+  t = t.as_strided(
     layout.reshape_size_to_matrix(shape),
     (t.stride(0), 1)
   ).view(shape)
+
+  if config.USE_CHANNEL_LAST and t.ndim > 2:
+    # compute the new stride with C pushed inwards.
+    acc = t.shape[1] # C
+    lst = []
+    for y in reversed(t.shape):
+      lst.append(acc)
+      acc = y * acc
+
+    lst[-2] = 1           # C has stride 1 (it's "contiguous")
+    lst[-1] = t.stride(0) # N has retains the original stride
+
+    t = t.as_strided(shape, tuple(reversed(lst)))
+
+  return t
 
 # a helper class that deals with interacting with sbt project being generated.
 class SHIRProject:
@@ -295,14 +310,24 @@ class SHIRProject:
         # and are expected to do the corresponding extension if necessary.
 
         host_id, real_typ = host_mapping[n]
-        shape = ", ".join((str(d) for d in n.meta.get("val").shape))
+        ndim = n.meta.get("val").ndim
+        shape = [*n.meta.get("val").shape]
+
+        transpose = None
+        if config.USE_CHANNEL_LAST and ndim > 2:
+          shape = [shape[0]] + shape[2:] + [shape[1]]
+          transpose = [*range(1, ndim - 1), 0, ndim - 1]
+
+        node = (
+          f"algo.torch.Input({real_typ.name()}, \"{host_id}\","
+          f" Seq({', '.join((str(d) for d in shape))}))"
+        )
+        if transpose is not None:
+          node = f"algo.TransposeND({node}, Seq({', '.join((str(d) for d in transpose))}))"
 
         if many_uses:
           print(
-            "  { val _init = core.TypeChecker.check(",
-            "algo.torch.Input(", real_typ.name(),
-            ", \"", host_id, "\", Seq(", shape, "))",
-            ")\n",
+            "  { val _init = core.TypeChecker.check(", node, ")\n",
             "    val _param = core.ParamDef(_init.t)\n",
             "    core.Let(_param,\n",
             "  { val ", a.name, " = core.ParamUse(_param)",
@@ -310,10 +335,7 @@ class SHIRProject:
           )
         else:
           print(
-            "    val ", n.name, " = core.TypeChecker.check(",
-            "algo.torch.Input(", real_typ.name(),
-            ", \"", host_id, "\", Seq(", shape, "))",
-            ")",
+            "    val ", n.name, " = core.TypeChecker.check(", node, ")",
             sep="", file=f
           )
 
@@ -325,7 +347,7 @@ class SHIRProject:
         assert not many_uses  # not sure what this failing would mean...
 
         annot_typ = types.get_element_type(retv)
-        dims = len(retv.meta.get("val").shape)
+        dims = retv.meta.get("val").ndim
         v = retv.name
 
         if dims < 1:
@@ -333,7 +355,11 @@ class SHIRProject:
         if dims < 2:
           v = f"algo.Repeat({v}, 1)"
         if dims > 2:
+          if config.USE_CHANNEL_LAST:
+            transpose = [dims - 2, *range(0, dims - 2), dims - 1]
+            v = f"algo.TransposeND({v}, Seq({', '.join((str(d) for d in transpose))}))"
           v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
+
         print(
           "    core.TypeChecker.check(algo.Map(2,",
           " algo.ResizeInteger.asFunction(types = Seq(", annot_typ.bits, ")),",
