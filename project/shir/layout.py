@@ -17,20 +17,28 @@ _SUPPORTED_TORCH_TYPES = {
 
 def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
   ndim = len(t)
-  inner = outer = 1
   if ndim == 1:
-    inner = t[0]
-  elif ndim > 1:
-    outer = t[0]
-    inner = reduce(lambda x, y: x * y, t[1:])
-  return (outer, inner)
+    return (1, t[0])
+
+  if ndim == 4:
+    if config.USE_CHANNEL_LAST:
+      return (t[0] * t[2], t[3] * t[1])
+    return (t[0] * t[1], t[2] * t[3])
+
+  return (t[0], reduce(lambda x, y: x * y, t[1:]))
 
 def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
   if t.ndim < 2:
     return t.reshape((1, -1))
-  if t.ndim > 2:
-    return t.reshape((t.size(0), -1))
-  return t
+  if t.ndim == 2:
+    return t
+
+  if config.USE_CHANNEL_LAST:
+    t = t.transpose([0, *range(2, t.ndim), 1])
+
+  if t.ndim == 4:
+    return t.reshape((t.size(0) * t.size(1), -1))
+  return t.reshape((t.size(0), -1))
 
 def max_entries_per_line(t):
   return config.CACHELINE_BITS // t.bits

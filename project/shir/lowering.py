@@ -490,6 +490,11 @@ class LowerQConv:
       f" {bias.name})"
     )
 
+  @staticmethod
+  def should_buffer(input, zp, weight, bias, stride, padding, dilation, groups) -> str:
+    # input and kernel are already buffered by the template
+    return { bias: layout.BufferMatrix(None) }
+
 @register_lowering(shin.int_max_pool2d.default)
 class LowerMaxPool2D:
   @staticmethod

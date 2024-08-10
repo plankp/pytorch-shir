@@ -50,25 +50,46 @@ def has_many_uses(node: Node) -> bool:
   return False
 
 def _reshape_region(t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-  t = t.as_strided(
-    layout.reshape_size_to_matrix(shape),
-    (t.stride(0), 1)
-  ).view(shape)
+  row_stride = t.stride(0)
+  ndims = len(shape)
 
-  if config.USE_CHANNEL_LAST and t.ndim > 2:
-    # compute the new stride with C pushed inwards.
-    acc = t.shape[1] # C
-    lst = []
-    for y in reversed(t.shape):
-      lst.append(acc)
+  if ndims == 0:
+    # scalars have no stride
+    stride = ()
+  elif ndims == 1:
+    # it is contiguous along the row
+    stride = (1,)
+  elif ndims == 2:
+    # the column is contiguous along each row
+    stride = (row_stride, 1)
+  else:
+    # decide how many (inner) dimensions are allocated on a single column.
+    dims_on_col = 2 if ndims == 4 else ndims - 1
+
+    # compute the physical shape,
+    # which may be different when channel-last format is used.
+    phys_shape = shape
+    if config.USE_CHANNEL_LAST:
+      phys_shape = [shape[0], *shape[2:], shape[1]]
+
+    # compute the strides in reverse
+    acc = 1
+    stride = []
+    for i, y in enumerate(reversed(phys_shape)):
+      if i == dims_on_col:
+        # beyond this point, we are skipping over rows
+        acc = row_stride
+
+      stride.append(acc)
       acc = y * acc
 
-    lst[-2] = 1           # C has stride 1 (it's "contiguous")
-    lst[-1] = t.stride(0) # N has retains the original stride
+    # then reverse and realign with the logical shape as needed
+    if config.USE_CHANNEL_LAST:
+      stride = (stride[-1], stride[0], *stride[-2:0:-1])
+    else:
+      stride = tuple(reversed(stride))
 
-    t = t.as_strided(shape, tuple(reversed(lst)))
-
-  return t
+  return t.as_strided(shape, stride)
 
 # a helper class that deals with interacting with sbt project being generated.
 class SHIRProject:
@@ -229,6 +250,10 @@ class SHIRProject:
     print("    import backend.hdl.arch.mem.MemFunctionsCompiler", file=f)
     print("    Seq(", file=f)
 
+    print("(ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(", file=f)
+    print("  ParallelizeDotProductRules.targetTorchConvKernel,", file=f)
+    print("  ParallelizeDotProductRules.targetZipmapChannel))),", file=f)
+
     # and we emit the rewrite rules based on the collected hints.
     #
     # XXX:
@@ -358,7 +383,10 @@ class SHIRProject:
           if config.USE_CHANNEL_LAST:
             transpose = [dims - 2, *range(0, dims - 2), dims - 1]
             v = f"algo.TransposeND({v}, Seq({', '.join((str(d) for d in transpose))}))"
-          v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
+          if dims == 4:
+            v = f"algo.Join(algo.torch.Flatten({v}, 2, 3))"
+          else:
+            v = f"algo.torch.Flatten({v}, 1, {dims - 1})"
 
         print(
           "    core.TypeChecker.check(algo.Map(2,",
