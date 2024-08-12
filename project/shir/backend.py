@@ -149,10 +149,19 @@ def apply_shir_ops(gm: GraphModule):
         from . import driver
         project.synthesize()
 
-        cache_dir.mkdir()
-        shutil.copyfile(project.get_source_file(), cache_dir / "Module0.scala")
-        shutil.copyfile(project.get_layout_file(), cache_dir / "memory.layout")
-        shutil.copyfile(project.get_gbs_file(), cache_dir / "hello_afu_unsigned_ssl.gbs")
+        # copy into a dummy directory (just in case the files gbs file is missing!)
+        import uuid
+        precopy_dir = cache_dir.with_name(cache_dir.name[:2] + "." + uuid.uuid4().hex + ".tmp")
+        precopy_dir.mkdir()
+        shutil.copyfile(project.get_source_file(), precopy_dir / "Module0.scala")
+        shutil.copyfile(project.get_layout_file(), precopy_dir / "memory.layout")
+        shutil.copyfile(project.get_gbs_file(), precopy_dir / "hello_afu_unsigned_ssl.gbs")
+
+        # at this point, the the contents of precopy_dir is valid.
+        # use rename, which is atomic (at least on Unix).
+        precopy_dir.rename(cache_dir)
+
+    shutil.rmtree(tempdir)
 
     # then construct the graph as necessary
     if config.PERFORM_SYNTHESIS:
@@ -163,8 +172,6 @@ def apply_shir_ops(gm: GraphModule):
         cache_dir / "memory.layout",
         cache_dir / "hello_afu_unsigned_ssl.gbs"
       ))
-
-    shutil.rmtree(tempdir)
 
   # the problems with SHIRGraphFpgaModule are as follows:
   #
