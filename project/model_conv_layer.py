@@ -15,6 +15,7 @@ from routine_mnist_digits import (
 )
 import copy
 import torch._dynamo as torchdynamo
+import torch.export
 import shir
 import torch.ao.quantization.quantizer.x86_inductor_quantizer as xiq
 from torch.utils.data import DataLoader, TensorDataset
@@ -65,9 +66,7 @@ elif PROFILE == "x86":
   quantizer.set_global(xiq.get_default_x86_inductor_quantization_config())
 
 with torch.no_grad():
-  model, guards = torchdynamo.export(model, aten_graph=True)(
-    *copy.deepcopy(example_inputs),
-  )
+  model = torch.export.export(model, example_inputs).module()
 
   if PROFILE in ["shir", "x86"]:
     model = prepare_pt2e(model, quantizer)

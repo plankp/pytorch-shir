@@ -146,28 +146,6 @@ def _mark_nodes_as_annotated(nodes: List[torch.fx.Node]):
         node.meta["quantization_annotation"] = QuantizationAnnotation()
       node.meta["quantization_annotation"]._annotated = True
 
-def _extract_linear_fields(gm: torch.fx.GraphModule, p: SourcePartition):
-  input_node = p.input_nodes[0]
-  output_node = p.output_nodes[0]
-  weight_node = None
-  bias_node = None
-  for param in p.params:
-    weight_or_bias = getattr(gm, param.target)
-    if weight_or_bias.ndim == 2:
-      weight_node = param
-    if weight_or_bias.ndim == 1:
-      bias_node = param
-  assert weight_node is not None, "Expected linear layer to have weight"
-
-  input_use_node = None
-  for node in p.nodes:
-    if node in input_node.users:
-      input_use_node = node
-      break
-  assert input_use_node is not None, "Expect linear layer to use the input"
-
-  return (input_use_node, input_node, weight_node, bias_node, output_node)
-
 """
 The actual magic behind deciding where each qspec goes
 """
@@ -183,6 +161,7 @@ _OPS_IN_OUT_SHARING = [
   torch.nn.ReLU6,
   torch.nn.Hardtanh,
   torch.nn.MaxPool2d,
+  torch.nn.functional.max_pool2d,
   torch.nn.AdaptiveAvgPool2d,
   torch.nn.functional.avg_pool2d,
   torch.ops.shir_intrinsic.flatten,
@@ -324,17 +303,23 @@ class BackendQuantizer(Quantizer):
 
     fused_partitions = find_sequential_partitions(gm, [torch.nn.Linear, torch.nn.ReLU])
     for linear_p, relu_p in fused_partitions:
-      (inp_use, inp, weight, bias, out) = _extract_linear_fields(gm, linear_p)
+      linear_node = linear_p.output_nodes[0]
       relu = relu_p.output_nodes[0]
 
-      # if any of the nodes are annotated, then leave it alone
-      if _is_annotated([relu, inp_use, bias, weight, out]):
+      assert (linear_node.op == "call_function" and
+              linear_node.target == torch.ops.aten.linear.default
+      ), "annotation: unsupported aten linear node"
+
+      if _is_annotated([linear_node, relu]):
         continue
 
-      _annotate_input_qspec_map(inp_use, inp, input_qspec)
-      _annotate_output_qspec(weight, weight_qspec)
+      inp = linear_node.args[0]
+      weight = linear_node.args[1]
+      bias = linear_node.args[2] if 2 < len(linear_node.args) else None
+      _annotate_input_qspec_map(linear_node, inp, input_qspec)
+      _annotate_input_qspec_map(linear_node, weight, weight_qspec)
       if bias:
-        _annotate_output_qspec(bias, bias_qspec)
+        _annotate_input_qspec_map(linear_node, bias, bias_qspec)
 
       _annotate_output_qspec(relu, output_qspec)
       _mark_nodes_as_annotated([*relu_p.nodes, *linear_p.nodes])
@@ -348,17 +333,24 @@ class BackendQuantizer(Quantizer):
     all_partitions = get_source_partitions(gm.graph, [torch.nn.Linear])
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:
-      (inp_use, inp, weight, bias, out) = _extract_linear_fields(gm, p)
+      linear_node = p.output_nodes[0]
 
-      if _is_annotated([inp_use, weight, out]):
+      assert (linear_node.op == "call_function" and
+              linear_node.target == torch.ops.aten.linear.default
+      ), "annotation: unsupported aten linear node"
+
+      if _is_annotated([linear_node]):
         continue
 
-      _annotate_input_qspec_map(inp_use, inp, input_qspec)
-      _annotate_output_qspec(weight, weight_qspec)
+      inp = linear_node.args[0]
+      weight = linear_node.args[1]
+      bias = linear_node.args[2] if 2 < len(linear_node.args) else None
+      _annotate_input_qspec_map(linear_node, inp, input_qspec)
+      _annotate_input_qspec_map(linear_node, weight, weight_qspec)
       if bias:
-        _annotate_output_qspec(bias, bias_qspec)
+        _annotate_input_qspec_map(linear_node, bias, bias_qspec)
 
-      _annotate_output_qspec(out, output_qspec)
+      _annotate_output_qspec(linear_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
 
   def _annotate_conv_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
@@ -372,10 +364,10 @@ class BackendQuantizer(Quantizer):
       conv_node = conv_p.output_nodes[0]
       relu = relu_p.output_nodes[0]
 
-      assert (
-        conv_node.op == "call_function"
-        and conv_node.target == torch.ops.aten.convolution.default
-      ), "Expected conv layer to call aten.convolution"
+      assert (conv_node.op == "call_function" and conv_node.target in [
+        torch.ops.aten.conv1d.default,
+        torch.ops.aten.conv2d.default,
+      ]), "annotation: unsupported aten convolution node"
 
       if _is_annotated([conv_node, relu]):
         continue
@@ -401,10 +393,10 @@ class BackendQuantizer(Quantizer):
     partitions = list(itertools.chain(*all_partitions.values()))
     for p in partitions:
       conv_node = p.output_nodes[0]
-      assert (
-        conv_node.op == "call_function"
-        and conv_node.target == torch.ops.aten.convolution.default
-      ), "Expected conv layer to call aten.convolution"
+      assert (conv_node.op == "call_function" and conv_node.target in [
+        torch.ops.aten.conv1d.default,
+        torch.ops.aten.conv2d.default,
+      ]), "annotation: unsupported aten convolution node"
 
       if _is_annotated([conv_node]):
         continue

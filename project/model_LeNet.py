@@ -16,6 +16,7 @@ from torch import nn
 import torch.nn.functional as F
 
 import torch._dynamo as torchdynamo
+import torch.export
 from torch.ao.quantization.quantize_pt2e import (
   convert_pt2e,
   prepare_pt2e,
@@ -52,11 +53,7 @@ print(model)
 
 example_inputs = (get_example_input(),)
 
-model, guards = torchdynamo.export(
-  model,
-  *copy.deepcopy(example_inputs),
-  aten_graph=True,
-)
+model = torch.export.export(model, example_inputs).module()
 
 quantizer = shir.BackendQuantizer()
 

@@ -201,31 +201,16 @@ class QuantOpRewrite:
     if node_relu.op != "call_function":
       return None
     if node_relu.target in {aten.relu.default, aten.relu_.default}:
-      node_matprod = node_relu.args[0]
+      node_linear = node_relu.args[0]
     else:
-      node_matprod = node_relu
+      node_linear = node_relu
       node_relu = None
 
-    # depending on if there is bias, the linear layer could be addmm(b, x, wt)
-    # or mm(x, wt).
-
-    if node_matprod.op != "call_function":
-      return None
-    if node_matprod.target == aten.mm.default:
-      node_bias = None
-      node_dq_input = node_matprod.args[0]
-      node_dq_wt = node_matprod.args[1]
-    elif node_matprod.target == aten.addmm.default:
-      node_bias = node_matprod.args[0]
-      node_dq_input = node_matprod.args[1]
-      node_dq_wt = node_matprod.args[2]
-    else:
+    if node_linear.op != "call_function" or node_linear.target != aten.linear.default:
       return None
 
-    if node_dq_wt.op != "call_function" or node_dq_wt.target != aten.t.default:
-      return None
-
-    node_dq_weight = node_dq_wt.args[0]
+    node_dq_input = node_linear.args[0]
+    node_dq_weight = node_linear.args[1]
 
     qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
     if not qparam_input:
@@ -235,17 +220,18 @@ class QuantOpRewrite:
       return None
 
     node_q_weight = node_dq_weight.args[0]
-    qparam_weight1 = self.fetch_quant_per_tensor(node_q_weight, -127, 127, torch.int8)
-    if not qparam_weight1:
-      return None
 
-    if qparam_weight != qparam_weight1:
-      return None
+    if len(node_linear.args) == 2:
+      node_bias = None
+    elif len(node_linear.args) == 3:
+      node_bias = node_linear.args[2]
+    else:
+      assert False, "Found aten.linear with different arity"
 
     return (
       node_relu is not None,
       node_dq_input.args[0],
-      node_q_weight.args[0],
+      node_q_weight,
       node_bias,
       qparam_input,
       qparam_weight,
@@ -268,16 +254,12 @@ class QuantOpRewrite:
       return None
 
     k = s_x * s_w
-    weight_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is None:
       bias_q = torch.zeros([], dtype=torch.int32)
     else:
       bias_q = torch.round(b / k).int()
-    bias_q = bias_q - z_x * torch.sum(weight_q, dim=1, dtype=torch.int32)
-
-    weight_attr = w_node.target
-    setattr(self.gm, weight_attr, torch.nn.Parameter(weight_q, False))
+    bias_q = bias_q - z_x * torch.sum(w, dim=1, dtype=torch.int32)
 
     if b is None:
       bias_attr = self.create_new_param()
@@ -287,7 +269,7 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.get_attr(weight_attr)
+      n1 = w_node # already quantized
       n2 = graph.get_attr(bias_attr)
       n3 = graph.call_function(shin.int_addmm, (n2, x_node, n1))
       if needs_relu:
@@ -322,7 +304,7 @@ class QuantOpRewrite:
       node_conv = node_relu
       node_relu = None
 
-    if node_conv.op != "call_function" or node_conv.target != aten.convolution.default:
+    if node_conv.op != "call_function" or node_conv.target != aten.conv2d.default:
       return None
 
     node_dq_input = node_conv.args[0]
@@ -336,28 +318,19 @@ class QuantOpRewrite:
       return None
 
     node_q_weight = node_dq_weight.args[0]
-    qparam_weight1 = self.fetch_quant_per_tensor(node_q_weight, -127, 127, torch.int8)
-    if not qparam_weight1:
-      return None
-
-    if qparam_weight != qparam_weight1:
-      return None
 
     # make sure the convolution uses parameters that we support.
     # that means, transpose is false and output padding is all zeros.
     conv_args = _get_all_arguments(
       node_conv.args, node_conv.kwargs, node_conv.target._schema.arguments
     )
-    if len(conv_args) != 9:
-      return None
-    if conv_args[6] or any(conv_args[7]):
-      return None
+    assert len(conv_args) == 7, "Found aten.conv2d with different arity"
 
     return (
       node_relu is not None,
-      (conv_args[3], conv_args[4], conv_args[5], conv_args[8]),
+      (*conv_args[3:],),
       node_dq_input.args[0],
-      node_q_weight.args[0],
+      node_q_weight,
       node_conv.args[2],
       qparam_input,
       qparam_weight,
@@ -380,13 +353,9 @@ class QuantOpRewrite:
       return False
 
     k = s_x * s_w
-    kernel_q = qd.quantize_per_tensor(w, s_w, z_w, -127, 127, torch.int8)
 
     if b is not None:
       bias_q = torch.round(b / k).int()
-
-    kernel_attr = w_node.target
-    setattr(self.gm, kernel_attr, torch.nn.Parameter(kernel_q, False))
 
     if b is not None:
       bias_attr = b_node.target
@@ -394,7 +363,7 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.get_attr(kernel_attr)
+      n1 = w_node # already quantized
       n3 = None
       if b is not None:
         n3 = graph.get_attr(bias_attr)
@@ -429,7 +398,7 @@ class QuantOpRewrite:
       node_conv = node_relu
       node_relu = None
 
-    if node_conv.op != "call_function" or node_conv.target != aten.convolution.default:
+    if node_conv.op != "call_function" or node_conv.target != aten.conv2d.default:
       return None
 
     node_dq_input = node_conv.args[0]
@@ -443,28 +412,19 @@ class QuantOpRewrite:
       return None
 
     node_q_weight = node_dq_weight.args[0]
-    qparam_weight1 = self.fetch_quant_per_channel(node_q_weight, 0, -127, 127, torch.int8)
-    if not qparam_weight1:
-      return None
-
-    if qparam_weight != qparam_weight1:
-      return None
 
     # make sure the convolution uses parameters use support.
     # that means, transpose is false and output padding is all zeros.
     conv_args = _get_all_arguments(
       node_conv.args, node_conv.kwargs, node_conv.target._schema.arguments
     )
-    if len(conv_args) != 9:
-      return None
-    if conv_args[6] or any(conv_args[7]):
-      return None
+    assert len(conv_args) == 7, "Found aten.conv2d with different arity"
 
     return (
       node_relu is not None,
-      (conv_args[3], conv_args[4], conv_args[5], conv_args[8]),
+      (*conv_args[3:],),
       node_dq_input.args[0],
-      node_q_weight.args[0],
+      node_q_weight,
       node_conv.args[2],
       qparam_input,
       qparam_weight,
@@ -488,13 +448,9 @@ class QuantOpRewrite:
       return False
 
     k = s_x * s_w
-    kernel_q = qd.quantize_per_channel(w, s_w, z_w, 0, -127, 127, torch.int8)
 
     if b is not None:
       bias_q = torch.round(b / k).int()
-
-    kernel_attr = w_node.target
-    setattr(self.gm, kernel_attr, torch.nn.Parameter(kernel_q, False))
 
     if b is not None:
       bias_attr = b_node.target
@@ -509,7 +465,7 @@ class QuantOpRewrite:
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.get_attr(kernel_attr)
+      n1 = w_node # already quantized
       n3 = None
       if b is not None:
         n3 = graph.get_attr(bias_attr)
@@ -530,17 +486,8 @@ class QuantOpRewrite:
     if not qparam_out:
       return None
 
-    node_getitem = node_q_output.args[0]
-    if (
-      node_getitem.op != "call_function" or
-      node_getitem.target != operator.getitem or
-      node_getitem.args[1] != 0
-    ):
-      return None
-
-    node_pool = node_getitem.args[0]
-
-    if node_pool.op != "call_function" or node_pool.target != aten.max_pool2d_with_indices.default:
+    node_pool = node_q_output.args[0]
+    if node_pool.op != "call_function" or node_pool.target != aten.max_pool2d.default:
       return None
 
     node_dq_input = node_pool.args[0]

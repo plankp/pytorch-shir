@@ -20,6 +20,7 @@ from torch.utils.data import (
 )
 
 import torch._dynamo as torchdynamo
+import torch.export
 from torch.ao.quantization.quantize_pt2e import (
   convert_pt2e,
   prepare_pt2e,
@@ -111,9 +112,7 @@ with open("./metrics/simple_slp/fp32_eager_b4096.log", "w") as f:
 
 example_inputs = (get_example_input(),)
 
-model, guards = torchdynamo.export(model, aten_graph=True)(
-  *copy.deepcopy(example_inputs),
-)
+model = torch.export.export(model, example_inputs).module()
 
 print(model)
 
