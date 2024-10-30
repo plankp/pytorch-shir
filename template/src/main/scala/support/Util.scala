@@ -1,3 +1,5 @@
+package support
+
 import scala.io.Source
 import java.io.File
 import core.Expr
@@ -67,10 +69,12 @@ Allowed switches and arguments:
         val projectFolder = s"out/${model.name}"
 
         if (genVHDL) {
+          // XXX: FOR NOW
+          core.rewrite.Rules.disabled = Seq("DecomposeTransposition_transposeND2InputMapNDs")
+
           // also generate the memory layout file so that the Python
           // side can use this information to generate memory images.
-          val project = HDLProject(model.name, model.generateIR(), CompilerPhase.first(), model.extraRewrites() ++ Seq(
-            (ArchCompiler.phaseBefore, RewriteStep(RewriteAll(), Seq(algo.torch.rewrite.Rules.padInputToCacheline(512)))),
+          val project = HDLProject(model.name, model.generateIR(), model.compilerPhase(), model.extraRewrites() ++ Seq(
             (ArchCompiler.phaseAfter, RewriteStep(RewriteAll(), Seq(CleanupRules.removeIdentityResizes))),
 
             (MemFunctionsCompiler.phaseAfter, RewriteStep(RewriteAll(), CleanupRules.get())),

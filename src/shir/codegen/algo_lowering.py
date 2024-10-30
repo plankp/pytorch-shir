@@ -1,16 +1,8 @@
-"""
-Where the lowering of each supported operator actually happens
-"""
-
+from shir import types, layout, config, bit_utils
 import torch
 from typing import Tuple, Optional, Dict
 from functools import reduce
 from itertools import chain
-from . import bit_utils, types, layout
-
-"""
-Registration magic
-"""
 
 _supported_ops = {}
 
@@ -23,27 +15,6 @@ def register_lowering(key):
 
 def fetch_lowering(key):
   return _supported_ops.get(key)
-
-"""
-Registration of the supported operators
-
-Each "operator handler" needs a few methods, some optional:
-
--  supports(args...) -> bool:
-   whether the operator handler supports lowering the set of arguments
-
--  lower(args...) -> str:
-   lowers the operation into SHIR code and returns that.
-   supports(xs...) implies lower(xs...) works
-
--  should_buffer(args...) -> Dict[fx.node, BufferMatrix | BufferRow]:  {optional}
-   returns a mapping of nodes that should be buffered.
-   (absence) indicates no need to buffer
-
--  should_rewrite(args...) -> Optional[str]:  {optional}
-   returns None or a string representing a rewrite pass in SHIR
-   (which means "(SomeCompiler.phaseAfter, RewriteWhatever(...))")
-"""
 
 shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
@@ -564,3 +535,4 @@ class LowerAvgPool2D:
       f" {input.name}, {has_channel}, Seq({kernel_size}),"
       f" Seq({stride}), Seq({padding}), Seq(1, 1))"
     )
+

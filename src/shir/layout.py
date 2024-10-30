@@ -15,30 +15,35 @@ _SUPPORTED_TORCH_TYPES = {
   torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
 }
 
-def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
+def pack_host_shape(t: torch.Size) -> Tuple[List[int], Tuple[int, int]]:
   ndim = len(t)
+  if ndim == 0:
+    return ([], (1, 1))
   if ndim == 1:
-    return (1, t[0])
+    return ([0], (1, t[0]))
+  if ndim == 2:
+    return ([0, 1], (t[0], t[1]))
+
+  transpose = None
+  if config.USE_CHANNEL_LAST:
+    transpose = [0, *range(2, ndim), 1]
+
+  if transpose is None:
+    transpose = range(0, ndim)
+  else:
+    t = tuple((t[i] for i in transpose))
 
   if ndim == 4:
-    if config.USE_CHANNEL_LAST:
-      return (t[0] * t[2], t[3] * t[1])
-    return (t[0] * t[1], t[2] * t[3])
+    return (transpose, (t[0] * t[1], t[2] * t[3]))
 
-  return (t[0], reduce(lambda x, y: x * y, t[1:]))
+  return (transpose, (t[0], reduce(lambda x, y: x * y, t[1:])))
+
+def reshape_size_to_matrix(t: torch.Size) -> Tuple[int, int]:
+  return pack_host_shape(t)[1]
 
 def reshape_to_matrix(t: torch.Tensor) -> torch.Tensor:
-  if t.ndim < 2:
-    return t.reshape((1, -1))
-  if t.ndim == 2:
-    return t
-
-  if config.USE_CHANNEL_LAST:
-    t = t.transpose([0, *range(2, t.ndim), 1])
-
-  if t.ndim == 4:
-    return t.reshape((t.size(0) * t.size(1), -1))
-  return t.reshape((t.size(0), -1))
+  indices, shape = pack_host_shape(t.shape)
+  return t.permute(indices).reshape(shape)
 
 def max_entries_per_line(t):
   return config.CACHELINE_BITS // t.bits

@@ -1,6 +1,6 @@
 # Assume we should not be distributing libraries,
 # the users should be fetching them.
-*.jar
+*
 
 # if the assumption doesn't hold, then use negated .gitignore patterns
 # to have git track them here. (currently none)

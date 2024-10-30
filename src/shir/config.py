@@ -29,6 +29,9 @@ USE_CHANNEL_LAST = True
 # the model cache directory:
 MODEL_CACHE_DIR = "./data/cache"
 
+import shir.codegen.algo
+CODEGEN_MODULE = shir.codegen.algo
+
 """ Settings that you normally wouldn't touch """
 
 # the template directory

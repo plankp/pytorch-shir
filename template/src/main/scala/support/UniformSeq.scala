@@ -1,3 +1,5 @@
+package support
+
 // why create an actual list of 100 0's when you can have this,
 // which describes the same thing, but uses much less memory?
 //

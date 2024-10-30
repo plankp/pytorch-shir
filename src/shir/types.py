@@ -12,7 +12,7 @@ class SI:
   bits: int   # should be at least 2
 
   def name(self) -> str:
-    return f"algo.SignedIntType({self.bits})"
+    return f"SignedIntType({self.bits})"
 
   def minval(self) -> int:
     return -1 << (self.bits - 1)
@@ -34,7 +34,7 @@ class UI:
   bits: int   # must be at least 1
 
   def name(self) -> str:
-    return f"algo.IntType({self.bits})"
+    return f"IntType({self.bits})"
 
   def minval(self) -> int:
     return 0

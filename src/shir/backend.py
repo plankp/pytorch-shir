@@ -15,7 +15,7 @@ from torch._decomp import core_aten_decompositions, get_decompositions
 from itertools import count
 from pathlib import Path
 from typing import List, Callable
-from . import types, lowering, graphs, rewrites, config, bit_utils
+from . import types, graphs, rewrites, config, bit_utils
 import shutil
 
 # some aliases
@@ -53,7 +53,7 @@ class SHIROperatorSupport(OperatorSupport):
       if not types.has_shir_type(n):
         return False
 
-      obj = lowering.fetch_lowering(n.target)
+      obj = config.CODEGEN_MODULE.fetch_lowering(n.target)
       if obj is None:
         return False
 
@@ -91,7 +91,7 @@ def apply_shir_ops(gm: GraphModule):
 
     import tempfile
     tempdir = tempfile.mkdtemp()
-    project = graphs.SHIRProject("Module0", Path(tempdir))
+    project = config.CODEGEN_MODULE.Project("Module0", Path(tempdir))
 
     # a makeshift iterator to yield the next placeholder node
     # so we can map out the inputs of the submodule.
