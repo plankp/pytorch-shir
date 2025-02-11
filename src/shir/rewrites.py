@@ -967,3 +967,21 @@ class QuantOpRewrite:
 def rewrite_quantized_ops(gm: GraphModule):
   obj = QuantOpRewrite(gm)
   obj.rewrite()
+
+def insert_buffer_hints(gm: GraphModule):
+  graph = gm.graph
+  for node in graph.nodes:
+    if node.op == 'call_function' and node.target == shin.qconv:
+      image = node.args[0]
+      if image.op == 'call_function' and image.target not in {qd.quantize_per_tensor.default, shin.host_buffer_hint}:
+        # then instead of qconv(f(...)), we want qconv(buffer(f(...)))
+        with graph.inserting_after(image):
+          # delay swapping out the argument to buffer call.
+          # if not, we would end up with
+          #   n1 = shin.host_buffer_hint(n1)
+          # which is not right
+          n1 = graph.call_function(shin.host_buffer_hint, args=(None,))
+          image.replace_all_uses_with(n1)
+          n1.args = (image,)
+
+  graph.lint()

@@ -269,6 +269,7 @@ def compiler(gm: GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
   mode = FakeTensorMode(allow_non_fake_inputs=True)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
   rewrites.rewrite_quantized_ops(gm)
+  rewrites.insert_buffer_hints(gm)
 
   # then we hand it off to aot-autograd to perform decompositions.
   #

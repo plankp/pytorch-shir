@@ -163,3 +163,11 @@ def int_mean(self, dim, keepDim):
   # we sneak a round it to get an answer that is "closer" to SHIR
   assert self.dtype == torch.int8
   return torch.round(aten.mean.dim(self.float(), dim, keepDim)).to(self.dtype)
+
+shir_intrinsic_lib.define(
+  "host_buffer_hint(Tensor self) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "host_buffer_hint", "CompositeExplicitAutograd")
+def host_buffer_hint(self):
+  return self

@@ -15,6 +15,9 @@ _SUPPORTED_TORCH_TYPES = {
   torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
 }
 
+def inverse_transpose(t: List[int]) -> List[int]:
+  return [x[0] for x in sorted(enumerate(t), key=lambda x: x[1])]
+
 def pack_host_shape(t: torch.Size) -> Tuple[List[int], Tuple[int, int]]:
   ndim = len(t)
   if ndim == 0:

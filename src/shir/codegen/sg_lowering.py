@@ -20,6 +20,30 @@ shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
+@register_lowering(shin.host_buffer_hint.default)
+class LowerShirHostBufferHint:
+  @staticmethod
+  def supports(a) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a) -> str:
+    # we could just wrap it under a SolverGuidedBuffer and be done with it,
+    # but add extra permutes to be consistent with the input/output behaviour.
+    annot_typ = types.get_element_type(a)
+    ndim = a.meta.get("val").ndim
+    shape = a.meta.get("val").shape
+
+    transpose, (h, w) = layout.pack_host_shape(shape)
+    shape = [shape[x] for x in transpose]
+    itr = layout.inverse_transpose(transpose)
+
+    node = f"sg.SolverGuidedPermute({a.name}, Seq({', '.join((str(d) for d in transpose))}))"
+    node = f"sg.SolverGuidedReshape(sg.SolverGuidedRebalance({node}), Seq({h}, {w}))"
+    node = f"sg.SolverGuidedBuffer({node})"
+    node = f"sg.SolverGuidedRebalance(sg.SolverGuidedReshape({node}, Seq({', '.join((str(d) for d in shape))})))"
+    return f"sg.SolverGuidedPermute({node}, Seq({', '.join((str(d) for d in itr))}))"
+
 @register_lowering(shin.requantize_channel.default)
 class LowerShirRequantize:
   @staticmethod
