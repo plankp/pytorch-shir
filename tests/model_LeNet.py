@@ -7,6 +7,7 @@ from routine_mnist_digits import (
   reload_cached,
   test_loop,
   test_dataloader,
+  time_inference,
   loss_fn,
   get_example_input,
 )
@@ -21,8 +22,20 @@ from torch.ao.quantization.quantize_pt2e import (
   convert_pt2e,
   prepare_pt2e,
 )
-
+import torch.ao.quantization.quantizer.x86_inductor_quantizer as xiq
+from torch.utils.data import DataLoader, TensorDataset
 import shir
+
+PROFILE = "shir"
+PROBLEM_SIZE_N = 65536
+PROBLEM_TRIPS  = 1000 #1
+PROBLEM_INSTS  = 1    #1000
+KEEP_DEQUANT = False
+
+dummy_dataloader = DataLoader(TensorDataset(
+  torch.zeros(PROBLEM_SIZE_N * PROBLEM_INSTS, 1, 28, 28),
+  torch.zeros(PROBLEM_SIZE_N * PROBLEM_INSTS, 10),
+), batch_size=PROBLEM_SIZE_N)
 
 class Net(nn.Module):
   def __init__(self):
@@ -47,22 +60,59 @@ SAVED_MODEL_PATH = "./data/model_LeNet.pth"
 # the accuracy is around 98.9%
 
 model = reload_cached(SAVED_MODEL_PATH, Net, learning_rate=0.1)
-test_loop(test_dataloader, model, loss_fn)
+#print("SOFT", test_loop(test_dataloader, model, loss_fn))
 
-print(model)
+#print(model)
 
 example_inputs = (get_example_input(),)
 
-model = torch.export.export(model, example_inputs).module()
-
-quantizer = shir.BackendQuantizer()
-
-model = prepare_pt2e(model, quantizer)
-model(*example_inputs)  # calibration
-model = convert_pt2e(model)
-
 torchdynamo.reset()
-model = torch.compile(backend=shir.compiler)(model)
-model(*example_inputs)
 
-test_loop(test_dataloader, model, loss_fn)
+if PROFILE == "shir":
+  quantizer = shir.BackendQuantizer()
+elif PROFILE == "x86":
+  quantizer = xiq.X86InductorQuantizer()
+  quantizer.set_global(xiq.get_default_x86_inductor_quantization_config())
+
+with torch.no_grad():
+  model = torch.export.export(model, example_inputs).module()
+
+  if PROFILE in ["shir", "x86"]:
+    model = prepare_pt2e(model, quantizer)
+    model(*example_inputs)
+    model = convert_pt2e(model)
+
+  # right now, the model roughly looks like:
+  # input -> quantize -> quantized model -> dequantize -> output
+  #
+  # here we forcefully remove the final dequantize layer.
+  if not KEEP_DEQUANT:
+    maybe_output_node = next(iter(reversed(model.graph.nodes)))
+    assert maybe_output_node.op == "output", "Expected last node to be an output node"
+    assert len(maybe_output_node.args) == 1 and len(maybe_output_node.args[0]) == 1, "Expected single output node"
+
+    maybe_dequant_node = maybe_output_node.args[0][0]
+    assert maybe_dequant_node.op == "call_function" and maybe_dequant_node.target == torch.ops.quantized_decomposed.dequantize_per_tensor.default, "Expected output to be a dequant node"
+
+    maybe_output_node.args = ([maybe_dequant_node.args[0]],)
+    model.graph.erase_node(maybe_dequant_node)
+
+    model.graph.lint()
+    model.recompile()
+
+  # print(model)
+
+  if PROFILE == "shir":
+    model = torch.compile(model, backend=shir.compiler)
+  else:
+    model = torch.compile(model)
+
+
+"""
+for i in range(PROBLEM_TRIPS):
+  time_inference(dummy_dataloader, model)
+"""
+
+print(model(example_inputs[0]))
+
+# print("FINAL", test_loop(test_dataloader, model, loss_fn))
