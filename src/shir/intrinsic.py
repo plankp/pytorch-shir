@@ -110,9 +110,13 @@ shir_intrinsic_lib.define(
 def qconv_meta(self, zp, weights, bias, stride, padding, dilation, groups):
   assert bias.dtype == torch.int32
   assert self.dtype == weights.dtype == torch.int8
+
+  # trick is to pad by the zero point!
+  # we need to turn padding of [A, B, C] into [A, A, B, B, C, C].
+  padded = aten.constant_pad_nd(self.float(), [y for x in padding for y in [x, x]], value=zp)
   return aten.convolution(
-    self.float() - zp, weights.float(), bias.float(),
-    stride, padding, dilation, False, [0], groups
+    padded, weights.float(), bias.float(),
+    stride, [0], dilation, False, [0], groups
   ).int()
 
 shir_intrinsic_lib.define(
