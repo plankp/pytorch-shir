@@ -93,11 +93,6 @@ class LowerQConv:
       sseq = ", ".join((f"({d}, {d})" for d in padding))
       node = f"sg.SolverGuidedPad({rank})({node}, Seq({sseq}), {zp})"
 
-    # XXX: assume it's a 8-bit signed value (9 bit signed value because 128)
-    if zp != 0:
-      zpvf = f"Seq(None, Some(ConstantValue({-zp}, Some(SignedIntType(9)))))"
-      node = f"sg.SolverGuidedMap({rank})(AddInt2.asFunction({zpvf}), {node})"
-
     stride = ", ".join((str(d) for d in stride))
     dilation = ", ".join((str(d) for d in dilation))
     node = f"sg.SolverGuidedConvolution({rank})({node}, {weight.name}, Seq({stride}), Seq({dilation}))"

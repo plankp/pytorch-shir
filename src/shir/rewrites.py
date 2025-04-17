@@ -285,9 +285,9 @@ class QuantOpRewrite:
 
   in our case, zw is 0, so:
     = sx sw (CONV(X - zx, W, [b / (sx sw)]))
+    = sx sw (CONV'(X, W, [b / (sx sw) - sum(flatten(W, 1), axis=1)]))
 
-  Note that when there is padding, we cannot factor out the zx term (like in
-  the qlinear case). here we assume that it's never safe to do this.
+  Note that when we factor out the zx term, the convolution MUST pad the zero point.
   """
 
   def _match_qconv(self, node_q_output: Node):
@@ -354,12 +354,17 @@ class QuantOpRewrite:
 
     k = s_x * s_w
 
-    if b is not None:
+    if b is None:
+      bias_q = torcn.zeros([], dtype=torch.int32)
+    else:
       bias_q = torch.round(b / k).int()
+    bias_q = bias_q - z_x * torch.sum(torch.flatten(w, 1), dim=1, dtype=torch.int32)
 
-    if b is not None:
+    if b is None:
+      bias_attr = self.create_new_param()
+    else:
       bias_attr = b_node.target
-      setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
+    setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
@@ -449,12 +454,17 @@ class QuantOpRewrite:
 
     k = s_x * s_w
 
-    if b is not None:
+    if b is None:
+      bias_q = torch.zeros([], dtype=torch.int32)
+    else:
       bias_q = torch.round(b / k).int()
+    bias_q = bias_q - z_x * torch.sum(torch.flatten(w, 1), dim=1, dtype=torch.int32)
 
-    if b is not None:
+    if b is None:
+      bias_attr = self.create_new_param()
+    else:
       bias_attr = b_node.target
-      setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
+    setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
     # we keep the scales as a Python list and leave the responsibility of
     # quantizing these values to the lowering step.
