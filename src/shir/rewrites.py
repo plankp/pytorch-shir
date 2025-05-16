@@ -11,7 +11,7 @@ from torch._dynamo.source import (
   LocalSource,
   AttrSource,
 )
-from . import functional
+from . import functional, config
 
 # any ops in aten, shin, qd and even external functions are fine to use. some
 # prims ops are actually not safe to call, but we don't make use of them
@@ -267,15 +267,38 @@ class QuantOpRewrite:
       bias_attr = b_node.target
     setattr(self.gm, bias_attr, torch.nn.Parameter(bias_q, False))
 
+    # XXX:
+    # If the input was a 4D tensor, then assume that the previous operation
+    # would have been implicitly in channel-last order.
+    #
+    # we permute the weight and hope it cancels out with the earlier permute.
+    repermute_input = False
+    shape = None
+    if (
+      config.USE_CHANNEL_LAST
+      and x_node.op == 'call_function' and x_node.target == shin.flatten
+      and x_node.args[1] == 1
+      and x_node.args[2] in {-1, 3}
+    ):
+      repermute_input = True
+      shape = x_node.args[0].meta.get("val").shape
+      w = w.reshape([-1, *shape[1:]]).permute([0, 2, 3, 1]).flatten(1, -1)
+      setattr(self.gm, w_node.target, torch.nn.Parameter(w, False))
+
     graph = self.gm.graph
     with graph.inserting_before(anchor):
       n1 = w_node # already quantized
       n2 = graph.get_attr(bias_attr)
+      if repermute_input:
+        q1 = graph.call_function(aten.view, (x_node, [*shape]))
+        q2 = graph.call_function(aten.permute, (q1, [0, 2, 3, 1]))
+        x_node = graph.call_function(shin.flatten, (q2, 1, -1))
       n3 = graph.call_function(shin.int_addmm, (n2, x_node, n1))
       if needs_relu:
         n3 = graph.call_function(aten.relu, (n3,))
       n4 = graph.call_function(shin.requantize, (n3, k / s_out, z_out))
 
+    n4.meta = anchor.meta
     anchor.replace_all_uses_with(n4)
     return True
 
@@ -647,6 +670,7 @@ class QuantOpRewrite:
     with graph.inserting_before(anchor):
       n1 = graph.call_function(shin.int_avg_pool2d, (x, *pool_args))
 
+    n1.meta = anchor.meta
     anchor.replace_all_uses_with(n1)
     return True
 
@@ -981,17 +1005,30 @@ def rewrite_quantized_ops(gm: GraphModule):
 def insert_buffer_hints(gm: GraphModule):
   graph = gm.graph
   for node in graph.nodes:
-    if node.op == 'call_function' and node.target == shin.qconv:
+    if node.op != 'call_function':
+      continue
+
+    image = None
+    if node.target == shin.qconv:
       image = node.args[0]
-      if image.op == 'call_function' and image.target not in {qd.quantize_per_tensor.default, shin.host_buffer_hint}:
-        # then instead of qconv(f(...)), we want qconv(buffer(f(...)))
-        with graph.inserting_after(image):
-          # delay swapping out the argument to buffer call.
-          # if not, we would end up with
-          #   n1 = shin.host_buffer_hint(n1)
-          # which is not right
-          n1 = graph.call_function(shin.host_buffer_hint, args=(None,))
-          image.replace_all_uses_with(n1)
-          n1.args = (image,)
+
+    elif node.target == shin.int_addmm:
+      image = node.args[1]  # 0 is the bias
+
+    if image is None:
+      continue
+
+    # XXX: check against quantize_per_tensor because that means it comes
+    # from an external input, which there is no point buffering it.
+    if image.op == 'call_function' and image.target not in {qd.quantize_per_tensor.default, shin.host_buffer_hint}:
+      # then instead of qconv(f(...)), we want qconv(buffer(f(...)))
+      with graph.inserting_after(image):
+        # delay swapping out the argument to buffer call.
+        # if not, we would end up with
+        #   n1 = shin.host_buffer_hint(n1)
+        # which is not right
+        n1 = graph.call_function(shin.host_buffer_hint, args=(None,))
+        image.replace_all_uses_with(n1)
+        n1.args = (image,)
 
   graph.lint()

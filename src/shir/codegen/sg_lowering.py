@@ -45,7 +45,7 @@ class LowerShirHostBufferHint:
     return f"sg.SolverGuidedPermute({node}, Seq({', '.join((str(d) for d in itr))}))"
 
 @register_lowering(shin.requantize_channel.default)
-class LowerShirRequantize:
+class LowerShirRequantizeChannel:
   @staticmethod
   def supports(a, s, z) -> bool:
     return all((bit_utils.is_valid_qscale(x) for x in s))
@@ -65,6 +65,73 @@ class LowerShirRequantize:
     zps = f"sg.SolverGuidedTensor(Seq.fill({shape[1]})({z}), sg.TensorType(Seq({shape[1]}), SignedIntType(8)))"
     scl = f"sg.SolverGuidedTensor(Seq({', '.join((str(d) for d in q))}), sg.TensorType(Seq({shape[1]}), SignedIntType({w + 1})))"
     return f"sg.SolverGuidedRequantDim({len(shape)})({a.name}, {scl}, {zps}, {shamt}, 1)"
+
+@register_lowering(shin.requantize.default)
+class LowerShirRequantize:
+  @staticmethod
+  def supports(a, s, z) -> bool:
+    return bit_utils.is_valid_qscale(s)
+
+  @staticmethod
+  def lower(a, s, z) -> str:
+    try:
+      q, w, shamt = bit_utils.qscale_to_fixpoint([s])
+      q = q[0]
+      fixpoint_method = w <= 32 and shamt < 32 + w + 1
+    except AssertionError:
+      fixpoint_method = False
+
+    assert fixpoint_method, "DYNAMIC METHOD IS NOT YET SUPPORTED"
+
+    # XXX: assume it's a 8-bit signed value
+    shape = a.meta.get("val").shape
+    zps = f"sg.SolverGuidedTensor(Seq.fill({shape[1]})({z}), sg.TensorType(Seq({shape[1]}), SignedIntType(8)))"
+    scl = f"sg.SolverGuidedTensor(Seq.fill({shape[1]})({q}), sg.TensorType(Seq({shape[1]}), SignedIntType({w + 1})))"
+    return f"sg.SolverGuidedRequantDim({len(shape)})({a.name}, {scl}, {zps}, {shamt}, 1)"
+
+@register_lowering(shin.flatten.default)
+class LowerFlatten:
+  @staticmethod
+  def supports(a, start, end) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a, start, end) -> str:
+    q = shin.flatten(torch.zeros(a.meta.get("val").shape), start, end).shape
+    newshape = ", ".join((str(d) for d in q))
+    return f"sg.SolverGuidedReshape({a.name}, Seq({newshape}))"
+
+@register_lowering(aten.view.default)
+class LowerView:
+  @staticmethod
+  def supports(a, shape) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a, shape) -> str:
+    newshape = ", ".join((str(d) for d in shape))
+    return f"sg.SolverGuidedReshape({a.name}, Seq({newshape}))"
+
+@register_lowering(prims.transpose.default)
+class LowerView:
+  @staticmethod
+  def supports(a, axes) -> bool:
+    return True
+
+  @staticmethod
+  def lower(a, axes) -> str:
+    newaxes = ", ".join((str(d) for d in axes))
+    return f"sg.SolverGuidedPermute({a.name}, Seq({newaxes}))"
+
+@register_lowering(shin.int_addmm.default)
+class LowerIntAddmm:
+  @staticmethod
+  def supports(acc, lhs, rhs) -> bool:
+    return True
+
+  @staticmethod
+  def lower(acc, lhs, rhs) -> str:
+    return f"sg.SolverGuidedMapDim(2)(AddInt.asFunction(), sg.SolverGuidedMatmul({lhs.name}, {rhs.name}), {acc.name}, 1)"
 
 @register_lowering(shin.qconv.default)
 class LowerQConv:
