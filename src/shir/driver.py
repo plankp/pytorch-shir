@@ -5,8 +5,8 @@ which is necessary when running with synthesis mode.
 This module is expected to be loaded only when synthesis mode is enabled.
 """
 
+import os
 from contextlib import contextmanager
-from typing import Optional
 import ctypes as C
 import weakref
 import subprocess
@@ -16,9 +16,9 @@ _impl = C.cdll.LoadLibrary(config.DRIVER_LIB)
 
 # buffer.h
 _impl.alloc_buffer.restype  = C.c_void_p
-_impl.alloc_buffer.argtypes = [C.c_void_p, C.c_size_t]
-_impl.free_buffer.restype   = C.c_int
-_impl.free_buffer.argtypes  = [C.c_void_p, C.c_size_t]
+_impl.alloc_buffer.argtypes = [C.c_size_t]
+_impl.free_buffer.restype   = None
+_impl.free_buffer.argtypes  = [C.c_void_p]
 
 class Fpga:
   def __init__(self, handle):
@@ -49,23 +49,32 @@ class Fpga:
     if r := _impl.fpgaReset(self._hndl):
       raise Exception(f"_impl.fpgaReset failed: {r}")
 
+  def read_mmio64(self, ionum: int, offset: int) -> int:
+    result = C.c_uint64()
+    res = _impl.fpgaReadMMIO64(self._hndl, C.c_uint32(ionum), C.c_uint64(offset), C.byref(result))
+    if res:
+      raise Exception(f"driver: failed to read accelerator register {res}")
+    return result.value
+
+  def write_mmio64(self, ionum: int, offset: int, value: int) -> int:
+    res = _impl.fpgaWriteMMIO64(self._hndl, C.c_uint32(ionum), C.c_uint64(offset), C.c_uint64(value))
+    if res:
+      raise Exception(f"driver: failed to write accelerator register {res}")
+
   def start_computation(self):
-    if r := _impl.start_computation(self._hndl):
-      raise Exception(f"_impl.start_computation failed: {r}")
+    # don't consume the completion flag (otherwise is_complete can't poll it)
+    self.write_mmio64(0, 0x10, 0)
+    # mark the input as valid (which effectively starts the FPGA)
+    self.write_mmio64(0, 0x08, 1)
+
+  def stop_computation(self):
+    # mark input as invalid to stop the FPGA
+    self.write_mmio64(0, 0x08, 0)
+    # consume the completion flag if set
+    self.write_mmio64(0, 0x10, 1)
 
   def is_complete(self) -> bool:
-    done = C.c_uint64(0)
-    if r := _impl.poll_for_completion(self._hndl, C.byref(done)):
-      raise Exception(f"_impl.poll_for_completion failed: {r}")
-    return done.value
-
-  def read_mmio64(self, ionum: int, offset: int) -> Optional[int]:
-    result = C.c_uint64()
-    if _impl.fpgaReadMMIO64(
-      self._hndl, C.c_uint32(ionum), C.c_uint64(offset), C.byref(result)
-    ):
-      return None
-    return result.value
+    return self.read_mmio64(0, 0x80)
 
   def __enter__(self):
     return self
@@ -80,15 +89,14 @@ def find_and_open_fpga(uuid):
   return Fpga(handle)
 
 def alloc_buffer(length: int):
-  addr = _impl.alloc_buffer(None, length)
-  if addr == -1:
-    # because mmap uses -1 for errors
+  addr = _impl.alloc_buffer(length)
+  if addr == 0:
     return None
 
   return (C.c_char * length).from_address(addr)
 
 def free_buffer(buf):
-  _impl.free_buffer(buf, len(buf))
+  _impl.free_buffer(buf)
 
 _last_flashed_gbs = None
 _last_opened_fpga = None
@@ -103,7 +111,7 @@ def release_fpga():
 
 def configure_gbs(gbs_file):
   global _last_opened_fpga, _last_flashed_gbs
-  if _last_opened_fpga is not None and _last_flashed_gbs is not None and _last_flashed_gbs.samefile(gbs_file):
+  if _last_opened_fpga is not None and _last_flashed_gbs is not None and os.path.samefile(_last_flashed_gbs, gbs_file):
     return _last_opened_fpga
 
   # otherwise, since we noly have one FPGA on our server, release the old one

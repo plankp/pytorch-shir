@@ -40,3 +40,5 @@ TEMPLATE_DIR = "./template"
 # the shared library for driver
 # only relevant if PERFORM_SYNTHESIS
 DRIVER_LIB = "./driver/build/libdriver.so"
+
+PRESYNTH_GBS = None
