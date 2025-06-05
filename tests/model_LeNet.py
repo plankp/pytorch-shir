@@ -49,7 +49,7 @@ class Net(nn.Module):
   def forward(self, x):
     x = F.avg_pool2d(F.relu(self.conv1(x)), 2)
     x = F.avg_pool2d(F.relu(self.conv2(x)), 2)
-    x = torch.ops.shir_intrinsic.flatten(x, 1, -1)
+    x = torch.flatten(x, 1, -1)
     x = F.relu(self.fc1(x))
     x = F.relu(self.fc2(x))
     x = self.fc3(x)
@@ -68,7 +68,7 @@ example_inputs = (get_example_input(),)
 
 torchdynamo.reset()
 
-if PROFILE == "shir":
+if PROFILE in {"shir", "shir2"}:
   quantizer = shir.BackendQuantizer()
 elif PROFILE == "x86":
   quantizer = xiq.X86InductorQuantizer()
@@ -77,7 +77,7 @@ elif PROFILE == "x86":
 with torch.no_grad():
   model = torch.export.export(model, example_inputs).module()
 
-  if PROFILE in ["shir", "x86"]:
+  if PROFILE in {"shir", "shir2", "x86"}:
     model = prepare_pt2e(model, quantizer)
     model(*example_inputs)
     model = convert_pt2e(model)
@@ -104,15 +104,27 @@ with torch.no_grad():
 
   if PROFILE == "shir":
     model = torch.compile(model, backend=shir.compiler)
+  elif PROFILE == "shir2":
+    import shir.backend2
+    model = torch.compile(model, backend=shir.backend2.compiler)
   else:
     model = torch.compile(model)
 
-
 """
+shir.config.FPGA_PRINT_RTINFO = False
 for i in range(PROBLEM_TRIPS):
   time_inference(dummy_dataloader, model)
 """
 
-print(model(example_inputs[0]))
+"""
+shir.config.FPGA_PRINT_RTINFO = False
+with open(f"./metrics/LeNet5/{PROFILE}_{PROBLEM_SIZE_N}.log", "w") as f:
+  for i in range(PROBLEM_TRIPS):
+    for w in time_inference(dummy_dataloader, model):
+      print(w, file=f)
+"""
 
-# print("FINAL", test_loop(test_dataloader, model, loss_fn))
+# print(model(example_inputs[0][0, None]))
+# print(model(example_inputs[0][0:16]))
+
+print("FINAL", test_loop(test_dataloader, model, loss_fn))

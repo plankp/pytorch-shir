@@ -3,6 +3,7 @@ from torch.fx.graph_module import GraphModule
 from torch.fx import Node
 import torch
 import operator
+from functools import reduce
 from torch.ao.quantization.pt2e.utils import (
   _get_all_arguments,
 )
@@ -69,7 +70,7 @@ class QuantOpRewrite:
       return True
     if self._rewrite_qmean(n):
       return True
-    if self._rewrite_flatten(n):
+    if self._rewrite_view(n):
       return True
     if self._rewrite_hardtanh(n):
       return True
@@ -276,9 +277,8 @@ class QuantOpRewrite:
     shape = None
     if (
       config.USE_CHANNEL_LAST
-      and x_node.op == 'call_function' and x_node.target == shin.flatten
-      and x_node.args[1] == 1
-      and x_node.args[2] in {-1, 3}
+      and x_node.op == "call_function" and x_node.target == aten.view
+      and x_node.args[1][0] == x_node.args[0].meta.get("val").shape[0]
     ):
       repermute_input = True
       shape = x_node.args[0].meta.get("val").shape
@@ -292,7 +292,7 @@ class QuantOpRewrite:
       if repermute_input:
         q1 = graph.call_function(aten.view, (x_node, [*shape]))
         q2 = graph.call_function(aten.permute, (q1, [0, 2, 3, 1]))
-        x_node = graph.call_function(shin.flatten, (q2, 1, -1))
+        x_node = graph.call_function(aten.reshape, (q2, [shape[0], reduce(lambda x, y: x * y, shape[1:], 1)]))
       n3 = graph.call_function(shin.int_addmm, (n2, x_node, n1))
       if needs_relu:
         n3 = graph.call_function(aten.relu, (n3,))
@@ -675,19 +675,18 @@ class QuantOpRewrite:
     return True
 
   """
-  FLATTEN(sx (X - zx)) = sx FLATTEN(X - zx)
+  VIEW(sx (X - zx)) = sx VIEW(x - zx)
   """
-
-  def _match_flatten(self, node_q_output: Node):
+  def _match_view(self, node_q_output: Node):
     qparam_out = self.fetch_quant_per_tensor(node_q_output, -128, 127, torch.int8)
     if not qparam_out:
       return None
 
-    node_flatten = node_q_output.args[0]
-    if node_flatten.op != "call_function" or node_flatten.target != shin.flatten.default:
+    node_view = node_q_output.args[0]
+    if node_view.op != "call_function" or node_view.target != aten.view.default:
       return None
 
-    node_dq_input = node_flatten.args[0]
+    node_dq_input = node_view.args[0]
     qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
     if not qparam_input:
       return None
@@ -696,22 +695,18 @@ class QuantOpRewrite:
     if qparam_out != qparam_input:
       return None
 
-    return (
-      node_flatten.args[1],
-      node_flatten.args[2],
-      node_dq_input.args[0],
-    )
+    return (node_view.args[1], node_dq_input.args[0])
 
-  def _rewrite_flatten(self, anchor: Node) -> bool:
-    node_map = self._match_flatten(anchor)
+  def _rewrite_view(self, anchor: Node) -> bool:
+    node_map = self._match_view(anchor)
     if node_map is None:
       return False
 
-    [start, end, x] = node_map
+    [shape, x] = node_map
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_function(shin.flatten, (x, start, end))
+      n1 = graph.call_function(aten.view, (x, shape))
 
     anchor.replace_all_uses_with(n1)
     return True

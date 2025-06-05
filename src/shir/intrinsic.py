@@ -14,40 +14,6 @@ qd = torch.ops.quantized_decomposed
 # (and we define the CEA overloads for testing purposes)
 
 shir_intrinsic_lib.define(
-  "flatten(Tensor self, int start, int end) -> Tensor"
-)
-
-@impl(shir_intrinsic_lib, "flatten", "CompositeExplicitAutograd")
-def flatten(self, start, end):
-  # XXX: we DON'T want to use torch.flatten in case someone (we) monkey
-  # patches flatten, which would cause an infinite loop.
-  #
-  # instead, we want to use something that is unlikely patched away,
-  # such as reshape.
-
-  ashape = self.shape
-  if not ashape:
-    # flattening a scalar results in a tensor!
-    ashape = [1]
-
-  # negative start end indexes the axes in reverse
-  if start < 0:
-    start = len(ashape) + start
-  if end < 0:
-    end = len(ashape) + end
-
-  assert 0 <= start <= end < len(ashape), f"Expect 0 <= start <= end < {len(ashape)}"
-
-  # axes [start, end] are squished together
-  new_shape = [
-    *ashape[:start],
-    reduce(lambda x, y: x * y, ashape[start:end + 1]),
-    *ashape[end + 1:]
-  ]
-
-  return torch.reshape(self, new_shape)
-
-shir_intrinsic_lib.define(
   "requantize(Tensor self, float s, int z) -> Tensor"
 )
 

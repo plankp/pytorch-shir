@@ -219,8 +219,9 @@ def isel(gm: fx.GraphModule):
           n1 = graph.get_attr(sclattr)
           u = graph.call_function(torch.ops._shir.lenet5_conv_pool1, (i2, kernel, bias, n1, requant.args[2]))
           r = graph.call_function(torch.ops.aten.view, (u, [batch, 14, 14, 6]))
-        n.target = torch.ops.aten.permute
-        n.args = (r, [0, 3, 1, 2])
+          r = graph.call_function(torch.ops.aten.permute, (r, [0, 3, 1, 2]))
+        n.target = torch.ops.aten.reshape
+        n.args = (r, [batch, 6, 14, 14])
         graph.erase_node(requant)
         if relu is not None: graph.erase_node(relu)
         graph.erase_node(conv)
@@ -241,12 +242,16 @@ def isel(gm: fx.GraphModule):
         batch = images.meta.get("val").shape[0]
         with graph.inserting_before(n):
           i1 = graph.call_function(torch.ops.aten.permute, (images, [0, 2, 3, 1]))
-          i2 = graph.call_function(torch.ops.aten.view, (i1, [batch, 14, 14 * 6]))
+          i2 = graph.call_function(torch.ops.aten.reshape, (i1, [batch, 14, 14 * 6]))
           n1 = graph.get_attr(sclattr)
           u = graph.call_function(torch.ops._shir.lenet5_conv_pool2, (i2, kernel, bias, n1, requant.args[2]))
+          # this nasty sequence avoids the permute from messing up the
+          # "contiguity" of the tensor
           r = graph.call_function(torch.ops.aten.view, (u, [batch, 5, 5, 16]))
-        n.target = torch.ops.aten.permute
-        n.args = (r, [0, 3, 1, 2])
+          r = graph.call_function(torch.ops.aten.permute, (r, [0, 3, 1, 2]))
+          r = graph.call_function(torch.ops.aten.reshape, (r, [batch, 16 * 5 * 5]))
+        n.target = torch.ops.aten.view
+        n.args = (r, [batch, 16, 5, 5])
         graph.erase_node(requant)
         if relu is not None: graph.erase_node(relu)
         graph.erase_node(conv)
@@ -268,16 +273,18 @@ def simpl(gm: fx.GraphModule):
     for n in graph.nodes:
       if n.op != "call_function":
         continue
-      if (n.target == torch.ops.aten.view and
+      if (n.target in {torch.ops.aten.view, torch.ops.aten.reshape} and
           n.args[0].op == "call_function" and
-          n.args[0].target in {torch.ops.aten.view, torch.ops.shir_intrinsic.flatten}):
+          n.args[0].target in {torch.ops.aten.view, torch.ops.aten.reshape}):
         flatten = n.args[0]
+        if flatten.target != torch.ops.aten.view:
+          n.target = torch.ops.aten.reshape
         n.args = (flatten.args[0],) + n.args[1:]
         if not flatten.users:
           graph.erase_node(flatten)
         changed = True
 
-      elif (n.target == torch.ops.aten.view and
+      elif (n.target in {torch.ops.aten.view, torch.ops.aten.reshape} and
           list(n.args[0].meta.get("val").shape) == list(n.meta.get("val").shape)):
         n.replace_all_uses_with(n.args[0])
         graph.erase_node(n)

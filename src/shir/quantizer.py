@@ -164,7 +164,7 @@ _OPS_IN_OUT_SHARING = [
   torch.nn.functional.max_pool2d,
   torch.nn.AdaptiveAvgPool2d,
   torch.nn.functional.avg_pool2d,
-  torch.ops.shir_intrinsic.flatten,
+  torch.flatten,
 ]
 
 class BackendQuantizer(Quantizer):

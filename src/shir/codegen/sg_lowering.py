@@ -89,19 +89,8 @@ class LowerShirRequantize:
     scl = f"sg.SolverGuidedTensor(Seq.fill({shape[1]})({q}), sg.TensorType(Seq({shape[1]}), SignedIntType({w + 1})))"
     return f"sg.SolverGuidedRequantDim({len(shape)})({a.name}, {scl}, {zps}, {shamt}, 1)"
 
-@register_lowering(shin.flatten.default)
-class LowerFlatten:
-  @staticmethod
-  def supports(a, start, end) -> bool:
-    return True
-
-  @staticmethod
-  def lower(a, start, end) -> str:
-    q = shin.flatten(torch.zeros(a.meta.get("val").shape), start, end).shape
-    newshape = ", ".join((str(d) for d in q))
-    return f"sg.SolverGuidedReshape({a.name}, Seq({newshape}))"
-
 @register_lowering(aten.view.default)
+@register_lowering(aten.reshape.default)
 class LowerView:
   @staticmethod
   def supports(a, shape) -> bool:
