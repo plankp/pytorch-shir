@@ -278,10 +278,11 @@ class QuantOpRewrite:
     if (
       config.USE_CHANNEL_LAST
       and x_node.op == "call_function" and x_node.target == aten.view
-      and x_node.args[1][0] == x_node.args[0].meta.get("val").shape[0]
+      and (metaval := x_node.args[0].meta.get("val")) is not None
+      and (shape := metaval.shape) is not None
+      and x_node.args[1][0] == shape[0]
     ):
       repermute_input = True
-      shape = x_node.args[0].meta.get("val").shape
       w = w.reshape([-1, *shape[1:]]).permute([0, 2, 3, 1]).flatten(1, -1)
       setattr(self.gm, w_node.target, torch.nn.Parameter(w, False))
 

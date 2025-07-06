@@ -67,7 +67,7 @@ class Fpga:
     # mark the input as valid (which effectively starts the FPGA)
     self.write_mmio64(0, 0x08, 1)
 
-  def stop_computation(self):
+  def soft_reset(self):
     # mark input as invalid to stop the FPGA
     self.write_mmio64(0, 0x08, 0)
     # consume the completion flag if set

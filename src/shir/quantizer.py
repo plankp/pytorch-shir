@@ -176,6 +176,7 @@ class BackendQuantizer(Quantizer):
   # where the magic happens
   def annotate(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     self._fuse_bn_weights(gm)
+    self._remove_eval_dropout(gm)
 
     # allow per channel for convolution
     qconfig = _qconfig_per_channel if self.allow_per_channel else _qconfig_per_tensor
@@ -294,6 +295,17 @@ class BackendQuantizer(Quantizer):
 
     gm.graph.eliminate_dead_code()
     gm.recompile()
+
+  def _remove_eval_dropout(self, gm: torch.fx.GraphModule):
+    # if we see aten.dropout(X, ratio, False), then get rid of it
+    for n in gm.graph.nodes:
+      if (n.op != "call_function" or
+          n.target != torch.ops.aten.dropout.default or
+          n.args[2] != False):
+        continue
+      value = n.args[0]
+      n.replace_all_uses_with(value)
+      gm.graph.erase_node(n)
 
   def _annotate_linear_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
     input_qspec = get_input_act_qspec(qconfig)
