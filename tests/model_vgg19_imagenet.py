@@ -112,7 +112,7 @@ print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
 """
 
 shir.config.FPGA_PRINT_RTINFO = False
-with open(f"./metrics/vgg19_imagenet/{PROFILE}_{PROBLEM_SIZE_N}.log", "w") as f:
+with open(f"./metrics/vgg19_imagenet/{PROFILE}_shallow2_{PROBLEM_SIZE_N}.log", "w") as f:
   for i in range(PROBLEM_TRIPS):
     for w in time_inference(dummy_data, model):
       print(w, file=f)

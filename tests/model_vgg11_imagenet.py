@@ -63,8 +63,6 @@ PROBLEM_SIZE_N = 128
 PROBLEM_TRIPS  = 1
 PROBLEM_INSTS  = 1000
 
-dummy_data = torch.zeros(PROBLEM_INSTS, PROBLEM_SIZE_N, 3, 224, 224)
-
 # top 1 accuracy is around 69% loss is around 1.26
 #print("Original: ", test_loop(valid_dataloader, model, loss_fn))
 
@@ -111,8 +109,9 @@ shir.config.FPGA_PRINT_RTINFO = False
 print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
 """
 
+dummy_data = torch.zeros(PROBLEM_INSTS, PROBLEM_SIZE_N, 3, 224, 224)
 shir.config.FPGA_PRINT_RTINFO = False
-with open(f"./metrics/vgg11_imagenet/{PROFILE}_{PROBLEM_SIZE_N}.log", "w") as f:
+with open(f"./metrics/vgg11_imagenet/{PROFILE}_shallow2_{PROBLEM_SIZE_N}.log", "w") as f:
   for i in range(PROBLEM_TRIPS):
     for w in time_inference(dummy_data, model):
       print(w, file=f)

@@ -16,7 +16,11 @@ shir_fpga_inst_lib.define("lenet5_linear1(Tensor images, Tensor weights, Tensor 
 shir_fpga_inst_lib.define("lenet5_conv_pool2(Tensor images, Tensor kernel, Tensor bias, Tensor scale, int z) -> Tensor")
 shir_fpga_inst_lib.define("lenet5_conv_pool1(Tensor images, Tensor kernel, Tensor bias, Tensor scale, int z) -> Tensor")
 shir_fpga_inst_lib.define("conv3x3p1b8x64(Tensor images, int padvalue, Tensor kernel, Tensor bias, Tensor scale, int z, bool pool) -> Tensor")
-shir_fpga_inst_lib.define("conv3x3p1b14x64(Tensor images, int? padvalue, Tensor kernel, Tensor bias, Tensor scale, int z, bool pool) -> Tensor")
+shir_fpga_inst_lib.define("""
+conv3x3p1b14x64(Tensor images, int? padvalue, Tensor kernel, Tensor bias,
+                Tensor scale, int z, bool pool,
+                int packfactor) -> Tensor
+""")
 
 @impl(shir_fpga_inst_lib, "lenet5_linear3", "Meta")
 def lenet5_linear3_meta(images, weights, bias, scale, zp):
@@ -44,8 +48,8 @@ def conv3x3p1b8x64(images, padvalue, kernel, bias, scales, zp, pool):
   assert scales.ndim == 1 and bias.ndim == 1, "invalid scale and bias dimension"
   assert scales.shape[0] == bias.shape[0], "invalid per tensor or per channel scale shape"
 
-  n, iw, ih, ich1 = images.shape
-  och, kw, kh, ich2 = kernel.shape
+  n, ih, iw, ich1 = images.shape
+  och, kh, kw, ich2 = kernel.shape
 
   assert kw == 3 and kh == 3, "conv3x3p1b8x64: window must be 3x3"
   assert och % 64 == 0, "conv3x3p1b8x64: output channel must be divisible by 64"
@@ -60,8 +64,8 @@ def conv3x3p1b8x64(images, padvalue, kernel, bias, scales, zp, pool):
   ih = (ih + (8 - 1)) // 8 * 8
 
   x = torch.ops.aten.convolution(
-      torch.empty(images.permute([0, 3, 1, 2]).shape, dtype=torch.float, device='meta'),
-      torch.empty(kernel.permute([0, 3, 1, 2]).shape, dtype=torch.float, device='meta'),
+      torch.empty((n, ich1, ih, iw), dtype=torch.float, device='meta'),
+      torch.empty((och, ich2, kh, kw), dtype=torch.float, device='meta'),
       torch.empty(bias.shape, dtype=torch.float, device='meta'),
       [1, 1], [1, 1], [1, 1], False, [0], 1
   )
@@ -70,12 +74,12 @@ def conv3x3p1b8x64(images, padvalue, kernel, bias, scales, zp, pool):
   return torch.empty(x.permute([0, 2, 3, 1]).shape, dtype=torch.int8, device='meta')
 
 @impl(shir_fpga_inst_lib, "conv3x3p1b14x64", "Meta")
-def conv3x3p1b14x64(images, padvalue, kernel, bias, scales, zp, pool):
+def conv3x3p1b14x64(images, padvalue, kernel, bias, scales, zp, pool, packfactor):
   assert scales.ndim == 1 and bias.ndim == 1, "invalid scale and bias dimension"
   assert scales.shape[0] == 1 or scales.shape[0] == bias.shape[0], "invalid per tensor or per channel scale shape"
 
-  n, iw, ih, ich1 = images.shape
-  och, kw, kh, ich2 = kernel.shape
+  n, ih, iw, ich1 = images.shape
+  och, kh, kw, ich2 = kernel.shape
 
   assert kw == 3 and kh == 3, "conv3x3p1b14x64: window must be 3x3"
   assert och % 64 == 0, "conv3x3p1b14x64: output channel must be divisible by 64"
@@ -84,11 +88,21 @@ def conv3x3p1b14x64(images, padvalue, kernel, bias, scales, zp, pool):
   # there are no guarantees on what the filled values are!
   ich1 = (ich1 + (64 - 1)) // 64 * 64
   ich2 = (ich2 + (64 - 1)) // 64 * 64
+  assert ich1 == ich2, "conv3x3p1b14x64: input channel of input and kernel mismatch"
+
+  if packfactor != 1:
+    assert packfactor in {2, 4, 8}, "conv3x3p1b14x64: invalid packing factor"
+    assert ich1 <= 64, "conv3x3p1b14x64: packed convolution must be shallow"
+
+    # packing affects the width dimension
+    iw *= packfactor
+    ich1 //= packfactor
+    ich2 //= packfactor
 
   # let torch's impl handle the other validations
   x = torch.ops.aten.convolution(
-      torch.empty((n, ich1, iw, ih), dtype=torch.float, device='meta'),
-      torch.empty((och, ich2, kw, kh), dtype=torch.float, device='meta'),
+      torch.empty((n, ich1, ih, iw), dtype=torch.float, device='meta'),
+      torch.empty((och, ich2, kh, kw), dtype=torch.float, device='meta'),
       torch.empty(bias.shape, dtype=torch.float, device='meta'),
       [1, 1], [0, 0] if padvalue is None else [1, 1], [1, 1], False, [0], 1
   )
@@ -345,11 +359,33 @@ def isel(gm: fx.GraphModule):
         setattr(gm, sclattr, torch.nn.Parameter(torch.tensor(adjusted, dtype=torch.int32), False))
 
         rs = n.meta.get("val").shape
+        batch, ich, ih, iw = images.meta.get("val").shape
+        packfactor = 1
         with graph.inserting_before(n):
-          n1 = graph.call_function(torch.ops.aten.permute, (images, [0, 2, 3, 1]))
-          n2 = graph.call_function(torch.ops.aten.permute, (kernel, [0, 2, 3, 1]))
+          if ich <= 32 and iw % (2 * 14) == 0:
+            packfactor = 2
+          if ich <= 16 and iw % (4 * 14) == 0:
+            packfactor = 4
+          if ich <= 8 and iw % (8 * 14) == 0:
+            packfactor = 8
+
+          if packfactor == 1:
+            ni = graph.call_function(torch.ops.aten.permute, (images, [0, 2, 3, 1]))
+            nk = graph.call_function(torch.ops.aten.permute, (kernel, [0, 2, 3, 1]))
+
+          else:
+            dwidth = 64 // packfactor
+            n1 = graph.call_function(torch.ops.aten.pad, (images, [0, 0, 0, 0, 0, dwidth - ich]))
+            n2 = graph.call_function(torch.ops.aten.reshape, (n1, [batch, dwidth, ih, packfactor, iw // packfactor]))
+            n3 = graph.call_function(torch.ops.aten.permute, (n2, [0, 2, 4, 3, 1]))
+            ni = graph.call_function(torch.ops.aten.reshape, (n3, [batch, ih, iw // packfactor, 64]))
+
+            n5 = graph.call_function(torch.ops.aten.pad, (kernel, [0, 0, 0, 0, 0, dwidth - ich]))
+            n6 = graph.call_function(torch.ops.aten.repeat, (n5, [1, packfactor, 1, 1]))
+            nk = graph.call_function(torch.ops.aten.permute, (n6, [0, 2, 3, 1]))
+
           n3 = graph.get_attr(sclattr)
-          n4 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (n1, zp, n2, bias, n3, requant.args[2], True))
+          n4 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (ni, zp, nk, bias, n3, requant.args[2], True, packfactor))
           n5 = graph.call_function(torch.ops.aten.permute, (n4, [0, 3, 1, 2]))
         n.target = torch.ops.aten.contiguous
         n.args = (n5,)
@@ -405,11 +441,33 @@ def isel(gm: fx.GraphModule):
         setattr(gm, sclattr, torch.nn.Parameter(torch.tensor(adjusted, dtype=torch.int32), False))
 
         rs = n.meta.get("val").shape
+        batch, ich, ih, iw = images.meta.get("val").shape
+        packfactor = 1
         with graph.inserting_before(n):
-          n1 = graph.call_function(torch.ops.aten.permute, (images, [0, 2, 3, 1]))
-          n2 = graph.call_function(torch.ops.aten.permute, (kernel, [0, 2, 3, 1]))
+          if ich <= 32 and iw % (2 * 14) == 0:
+            packfactor = 2
+          if ich <= 16 and iw % (4 * 14) == 0:
+            packfactor = 4
+          if ich <= 8 and iw % (8 * 14) == 0:
+            packfactor = 8
+
+          if packfactor == 1:
+            ni = graph.call_function(torch.ops.aten.permute, (images, [0, 2, 3, 1]))
+            nk = graph.call_function(torch.ops.aten.permute, (kernel, [0, 2, 3, 1]))
+
+          else:
+            dwidth = 64 // packfactor
+            n1 = graph.call_function(torch.ops.aten.pad, (images, [0, 0, 0, 0, 0, dwidth - ich]))
+            n2 = graph.call_function(torch.ops.aten.reshape, (n1, [batch, dwidth, ih, packfactor, iw // packfactor]))
+            n3 = graph.call_function(torch.ops.aten.permute, (n2, [0, 2, 4, 3, 1]))
+            ni = graph.call_function(torch.ops.aten.reshape, (n3, [batch, ih, iw // packfactor, 64]))
+
+            n5 = graph.call_function(torch.ops.aten.pad, (kernel, [0, 0, 0, 0, 0, dwidth - ich]))
+            n6 = graph.call_function(torch.ops.aten.repeat, (n5, [1, packfactor, 1, 1]))
+            nk = graph.call_function(torch.ops.aten.permute, (n6, [0, 2, 3, 1]))
+
           n3 = graph.get_attr(sclattr)
-          n4 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (n1, zp, n2, bias, n3, requant.args[2], False))
+          n4 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (ni, zp, nk, bias, n3, requant.args[2], False, packfactor))
           n5 = graph.call_function(torch.ops.aten.permute, (n4, [0, 3, 1, 2]))
         n.target = torch.ops.aten.contiguous
         n.args = (n5,)
@@ -486,7 +544,7 @@ def isel(gm: fx.GraphModule):
           n3 = graph.call_function(torch.ops.aten.pad, (weight, [0, i_pad, 0, o_pad]))
           n4 = graph.call_function(torch.ops.aten.view, (n3, [o_tiles * 64, 3, 3, i_tiles * 64]))
           n5 = graph.get_attr(sclattr)
-          n6 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (n2, None, n4, bias, n5, requant.args[2], False))
+          n6 = graph.call_function(torch.ops._shir.conv3x3p1b14x64, (n2, None, n4, bias, n5, requant.args[2], False, 1))
           n7 = graph.call_function(torch.ops.aten.pad, (n6, [0, -o_pad]))
           slice_h = None
           if extra_h > 1:
@@ -695,9 +753,20 @@ def compute_layout(gm: fx.GraphModule):
       assert batch > 0 and batch % 8 == 0, "backend::isel: batch size must be multiple of 8"
       max_inst += (batch + (8 * 0xF - 1)) // (8 * 0xF)
 
-    elif n.target in {torch.ops._shir.conv3x3p1b8x64,
-                      torch.ops._shir.conv3x3p1b14x64}:
+    elif n.target in {torch.ops._shir.conv3x3p1b8x64}:
       images, padvalue, kernel, bias, scales, zp, pool = n.args
+      if images.op == "get_attr":
+        lookup(images, types.SI(8))
+      lookup(kernel, types.SI(8))
+      lookup(bias, types.SI(24))
+      lookup(scales, types.UI(28))
+
+      # for now, do the simple thing, which is each batch is one instruction
+      batch = n.meta.get("val").shape[0]
+      max_inst += batch
+
+    elif n.target in {torch.ops._shir.conv3x3p1b14x64}:
+      images, padvalue, kernel, bias, scales, zp, pool, packfactor = n.args
       if images.op == "get_attr":
         lookup(images, types.SI(8))
       lookup(kernel, types.SI(8))
@@ -748,9 +817,15 @@ def compute_layout(gm: fx.GraphModule):
         mark(images, types.SI(8))
       live_nodes.remove(n)
 
-    elif n.target in {torch.ops._shir.conv3x3p1b8x64,
-                      torch.ops._shir.conv3x3p1b14x64}:
+    elif n.target in {torch.ops._shir.conv3x3p1b8x64}:
       images, padvalue, kernel, bias, scales, zp, pool = n.args
+      mark(n, types.SI(8))
+      if images.op != "get_attr":
+        mark(images, types.SI(8))
+      live_nodes.remove(n)
+
+    elif n.target in {torch.ops._shir.conv3x3p1b14x64}:
+      images, padvalue, kernel, bias, scales, zp, pool, packfactor = n.args
       mark(n, types.SI(8))
       if images.op != "get_attr":
         mark(images, types.SI(8))
@@ -871,46 +946,52 @@ ENCTBL_conv3x3p1b14x64 = {
   "ImageWUpperBound": (47, 55),
   "ImageHOffset": (55, 69),
   "ImageWOffset": (69, 75),
-  "WeightOCHTileNum": (75, 82),
-  "WeightHTileNum": (82, 87),
-  "WeightWTileNum": (87, 92),
-  "WeightICHTileNum": (92, 98),
-  "WeightOCHOffset": (98, 107),
-  "WeightWinOffset": (107, 113),
-  "ImagePointer": (113, 137),
-  "WeightPointer": (137, 161),
-  "BiasCacheLines": (161, 169),
-  "BiasPointer": (169, 193),
-  "PoolEnabled": (193, 194),
-  "WriteAddrOCHTileNum": (194, 201),
-  "WriteAddrHTileNum": (201, 206),
-  "WriteAddrWTileNum": (206, 211),
-  "WriteAddrHOuterOffset": (211, 225),
-  "WriteAddrWOuterOffset": (225, 233),
-  "WriteAddrHPoolReverse": (233, 235),
-  "WriteAddrWPoolReverse": (235, 237),
-  "WriteAddrHPROffset": (237, 250),
-  "WriteAddrWPROffset": (250, 257),
-  "WriteAddrHRealLimit": (257, 277),
-  "WriteAddrWRealLimit": (277, 290),
-  "ResultImagePointer": (290, 314),
-  "WeightReuseEnabled": (314, 315),
-  "WeightReuseOCHTileNum": (315, 322),
-  "WeightReuseHTileNum": (322, 327),
-  "WeightReuseWTileNum": (327, 332),
-  "ImagePadValue": (332, 340),
-  "RequantZeroPoint": (340, 348),
-  "RequantCacheLines": (348, 356),
-  "RequantPointer": (356, 380),
-  "RequantPerTensor": (380, 381),
+  "ImageWLowerOOBVal": (75, 84),
+  "ImageWUpperOOBVal": (84, 93),
+  "WeightOCHTileNum": (93, 100),
+  "WeightHTileNum": (100, 105),
+  "WeightWTileNum": (105, 110),
+  "WeightICHTileNum": (110, 116),
+  "WeightOCHOffset": (116, 125),
+  "WeightWinOffset": (125, 131),
+  "RealOCHTileSize": (131, 138),
+  "ImagePointer": (138, 162),
+  "WeightPointer": (162, 186),
+  "BiasCacheLines": (186, 194),
+  "BiasPointer": (194, 218),
+  "PoolingInstSlice": (218, 219),
+  "WriteAddrOCHTileNum": (219, 226),
+  "WriteAddrHTileNum": (226, 231),
+  "WriteAddrWTileNum": (231, 236),
+  "WriteAddrHOuterOffset": (236, 250),
+  "WriteAddrWOuterOffset": (250, 258),
+  "WriteAddrHPoolReverse": (258, 260),
+  "WriteAddrWPoolReverse": (260, 262),
+  "WriteAddrHPROffset": (262, 275),
+  "WriteAddrWPROffset": (275, 282),
+  "WriteAddrHRealLimit": (282, 302),
+  "WriteAddrWRealLimit": (302, 315),
+  "WriteAddrWFoldLen": (315, 319),
+  "WriteAddrWFoldOffset": (319, 326),
+  "ResultImagePointer": (326, 350),
+  "WeightReuseEnabled": (350, 351),
+  "ImageWLowerOOBShamt": (351, 355),
+  "ImageWUpperOOBShamt": (355, 359),
+  "PartialSumInstSlice": (359, 361),
+  "ImagePadValue": (361, 369),
+  "RequantZeroPoint": (369, 377),
+  "RequantCacheLines": (377, 385),
+  "RequantPointer": (385, 409),
+  "RequantPerTensor": (409, 410),
 }
 
 def _encode(name, tbl, x):
   i = 0
   for k, v in x.items():
     lo, hi = tbl[k]
-    assert (v & ((1 << (hi - lo)) - 1)) == v, f"backend::emit: field {k} too wide for {name}: {v} as {hi - lo} bits"
-    i |= v << lo
+    w = hi - lo
+    assert (v >> w) == (-1 if v < 0 else 0), f"backend::emit: field {k} too narrow for {name}: {v} as {w} bits"
+    i |= (v & ((1 << w) - 1)) << lo
 
   for u in tbl:
     assert u in x, f"backend::emit: missing field {u}"
@@ -1207,7 +1288,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
             batch -= 1
 
         elif n.op == "call_function" and n.target == torch.ops._shir.conv3x3p1b14x64:
-          images, padvalue, kernel, bias, scales, zp, pool = n.args
+          images, padvalue, kernel, bias, scales, zp, pool, packfactor = n.args
           img_ptr = BASEADDR_DATA + data_layout[images][0]
           krn_ptr = BASEADDR_DATA + data_layout[kernel][0]
           bis_ptr = BASEADDR_DATA + data_layout[bias][0]
@@ -1246,6 +1327,10 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           resHOffset = data_layout[n][1] // batch // rh
           resWOffset = data_layout[n][1] // batch // rh // rw
 
+          oob_shamt = 0 if packfactor == 1 else 8 // packfactor
+          fold_ofs = w // 2 if pool else w
+          psum_bits = oob_shamt.bit_length()
+
           pending_inst = iptr if pending_inst is None else pending_inst
           pending_values.add(n)
 
@@ -1264,7 +1349,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
               "ImageHOffset": imgHOffset,
               "ImageWOffset": imgWOffset,
               "ImagePointer": img_ptr,
-              "ImagePadValue": (padvalue or 0) & 0xFF,
+              "ImagePadValue": padvalue or 0,
               "WeightOCHTileNum": ochTileNum,
               "WeightHTileNum": 1 if weight_reuse else hTileNum,
               "WeightWTileNum": 1 if weight_reuse else wTileNum,
@@ -1274,7 +1359,6 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
               "WeightPointer": krn_ptr,
               "BiasCacheLines": bis_lines,
               "BiasPointer": bis_ptr,
-              "PoolEnabled": (1 if pool else 0),
               "WriteAddrOCHTileNum": ochTileNum,
               "WriteAddrHTileNum": hTileNum,
               "WriteAddrWTileNum": wTileNum,
@@ -1288,13 +1372,20 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
               "WriteAddrWRealLimit": resWOffset * (rw - 1),
               "ResultImagePointer": res_ptr,
               "WeightReuseEnabled": 1 if weight_reuse else 0,
-              "WeightReuseOCHTileNum": ochTileNum if weight_reuse else 1,
-              "WeightReuseHTileNum": hTileNum if weight_reuse else 1,
-              "WeightReuseWTileNum": wTileNum if weight_reuse else 1,
-              "RequantZeroPoint": zp & 0xFF,
+              "RequantZeroPoint": zp,
               "RequantCacheLines": scl_lines,
               "RequantPointer": scl_ptr,
               "RequantPerTensor": 1 if pertensor else 0,
+
+              "ImageWLowerOOBVal": -1 if packfactor == 1 else 0,
+              "ImageWUpperOOBVal": -1 if packfactor == 1 else w - 1,
+              "ImageWLowerOOBShamt": -oob_shamt,
+              "ImageWUpperOOBShamt": oob_shamt,
+              "PoolingInstSlice": 1 if pool else 0,
+              "PartialSumInstSlice": psum_bits,
+              "RealOCHTileSize": 64,
+              "WriteAddrWFoldLen": packfactor,
+              "WriteAddrWFoldOffset": fold_ofs,
             })
 
             pptr[iptr * bytes_per_cl:(iptr + 1) * bytes_per_cl] = inst.to_bytes(bytes_per_cl, byteorder="little")
