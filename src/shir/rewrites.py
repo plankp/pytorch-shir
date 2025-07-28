@@ -199,10 +199,15 @@ class QuantOpRewrite:
       return None
 
     node_relu = node_q_output.args[0]
+    relu_op = None
     if node_relu.op != "call_function":
       return None
     if node_relu.target in {aten.relu.default, aten.relu_.default}:
       node_linear = node_relu.args[0]
+      relu_op = (aten.relu, (), {})
+    elif node_relu.target in {aten.leaky_relu.default} and node_relu.args[1] == 0.1:
+      node_conv = node_relu.args[0]
+      relu_op = (shin.sra_leaky_relu, (3,), {})
     else:
       node_linear = node_relu
       node_relu = None
@@ -230,7 +235,7 @@ class QuantOpRewrite:
       assert False, "Found aten.linear with different arity"
 
     return (
-      node_relu is not None,
+      relu_op,
       node_dq_input.args[0],
       node_q_weight,
       node_bias,
@@ -244,7 +249,7 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [needs_relu, x_node, w_node, b_node,
+    [relu_op, x_node, w_node, b_node,
      (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
     b = self.extract_tensor(b_node)
     w = self.extract_tensor(w_node)
@@ -295,8 +300,8 @@ class QuantOpRewrite:
         q2 = graph.call_function(aten.permute, (q1, [0, 2, 3, 1]))
         x_node = graph.call_function(aten.reshape, (q2, [shape[0], reduce(lambda x, y: x * y, shape[1:], 1)]))
       n3 = graph.call_function(shin.int_addmm, (n2, x_node, n1))
-      if needs_relu:
-        n3 = graph.call_function(aten.relu, (n3,))
+      if relu_op:
+        n3 = graph.call_function(relu_op[0], (n3,) + relu_op[1], relu_op[2])
       n4 = graph.call_function(shin.requantize, (n3, k / s_out, z_out))
 
     n4.meta = anchor.meta
@@ -320,10 +325,15 @@ class QuantOpRewrite:
       return None
 
     node_relu = node_q_output.args[0]
+    relu_op = None
     if node_relu.op != "call_function":
       return None
     if node_relu.target in {aten.relu.default, aten.relu_.default}:
       node_conv = node_relu.args[0]
+      relu_op = (aten.relu, (), {})
+    elif node_relu.target in {aten.leaky_relu.default} and node_relu.args[1] == 0.1:
+      node_conv = node_relu.args[0]
+      relu_op = (shin.sra_leaky_relu, (3,), {})
     else:
       node_conv = node_relu
       node_relu = None
@@ -351,7 +361,7 @@ class QuantOpRewrite:
     assert len(conv_args) == 7, "Found aten.conv2d with different arity"
 
     return (
-      node_relu is not None,
+      relu_op,
       (*conv_args[3:],),
       node_dq_input.args[0],
       node_q_weight,
@@ -366,7 +376,7 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [needs_relu, conv_params, x_node, w_node, b_node,
+    [relu_op, conv_params, x_node, w_node, b_node,
      (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
     b = self.extract_tensor(b_node)
     w = self.extract_tensor(w_node)
@@ -397,8 +407,8 @@ class QuantOpRewrite:
       if b is not None:
         n3 = graph.get_attr(bias_attr)
       n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, n3, *conv_params))
-      if needs_relu:
-        n2 = graph.call_function(aten.relu, (n2,))
+      if relu_op:
+        n2 = graph.call_function(relu_op[0], (n2,) + relu_op[1], relu_op[2])
       n3 = graph.call_function(shin.requantize, (n2, k / s_out, z_out))
 
     anchor.replace_all_uses_with(n3)
@@ -419,10 +429,15 @@ class QuantOpRewrite:
       return None
 
     node_relu = node_q_output.args[0]
+    relu_op = None
     if node_relu.op != "call_function":
       return None
     if node_relu.target in {aten.relu.default, aten.relu_.default}:
       node_conv = node_relu.args[0]
+      relu_op = (aten.relu, (), {})
+    elif node_relu.target in {aten.leaky_relu.default} and node_relu.args[1] == 0.1:
+      node_conv = node_relu.args[0]
+      relu_op = (shin.sra_leaky_relu, (3,), {})
     else:
       node_conv = node_relu
       node_relu = None
@@ -450,7 +465,7 @@ class QuantOpRewrite:
     assert len(conv_args) == 7, "Found aten.conv2d with different arity"
 
     return (
-      node_relu is not None,
+      relu_op,
       (*conv_args[3:],),
       node_dq_input.args[0],
       node_q_weight,
@@ -465,7 +480,7 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [needs_relu, conv_params, x_node, w_node, b_node,
+    [relu_op, conv_params, x_node, w_node, b_node,
      (s_x, z_x), (s_w, z_w), (s_out, z_out)] = node_map
     b = self.extract_tensor(b_node)
     w = self.extract_tensor(w_node)
@@ -504,8 +519,8 @@ class QuantOpRewrite:
       if b is not None:
         n3 = graph.get_attr(bias_attr)
       n2 = graph.call_function(shin.qconv, (x_node, z_x, n1, n3, *conv_params))
-      if needs_relu:
-        n2 = graph.call_function(aten.relu, (n2,))
+      if relu_op:
+        n2 = graph.call_function(relu_op[0], (n2,) + relu_op[1], relu_op[2])
       n3 = graph.call_function(shin.requantize_channel, (n2, scales, z_out))
 
     anchor.replace_all_uses_with(n3)
@@ -524,7 +539,16 @@ class QuantOpRewrite:
     if node_pool.op != "call_function" or node_pool.target != aten.max_pool2d.default:
       return None
 
-    node_dq_input = node_pool.args[0]
+    node_rpad = node_pool.args[0]
+    rpad_op = None
+    if (node_rpad.op == "call_function" and node_rpad.target == aten.pad.default and
+        len(node_rpad.args) >= 3 and node_rpad.args[2] == "replicate"):
+      node_dq_input = node_rpad.args[0]
+      rpad_op = (node_rpad.args[1:], node_rpad.kwargs)
+    else:
+      node_dq_input = node_pool.args[0]
+      node_rpad = None
+
     qparam_input = self.fetch_dequant_per_tensor(node_dq_input, -128, 127, torch.int8)
     if not qparam_input:
       return None
@@ -541,6 +565,7 @@ class QuantOpRewrite:
       return None
 
     return (
+      rpad_op,
       pool_args[1:-1],
       node_dq_input.args[0],
     )
@@ -550,13 +575,16 @@ class QuantOpRewrite:
     if node_map is None:
       return False
 
-    [pool_args, x] = node_map
+    [rpad_op, pool_args, x] = node_map
 
     graph = self.gm.graph
     with graph.inserting_before(anchor):
-      n1 = graph.call_function(shin.int_max_pool2d, (x, *pool_args))
+      n1 = x
+      if rpad_op:
+        n1 = graph.call_function(aten.pad, (n1,) + rpad_op[0], rpad_op[1])
+      n2 = graph.call_function(shin.int_max_pool2d, (n1, *pool_args))
 
-    anchor.replace_all_uses_with(n1)
+    anchor.replace_all_uses_with(n2)
     return True
 
   """

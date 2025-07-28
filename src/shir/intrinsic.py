@@ -50,6 +50,18 @@ def requantize_channel_meta(self, s, z):
   return torch.empty_like(self, dtype=torch.int8)
 
 shir_intrinsic_lib.define(
+  "sra_leaky_relu(Tensor self, int rshamt) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "sra_leaky_relu", "CompositeExplicitAutograd")
+def sra_leaky_relu(self, rshamt):
+  assert self.dtype in {torch.int8, torch.int16, torch.int32}
+  assert isinstance(rshamt, int) and rshamt >= 0
+
+  z = torch.zeros([], dtype=self.dtype)
+  return torch.max(z, self) + (torch.min(z, self) >> rshamt)
+
+shir_intrinsic_lib.define(
   "qadd(Tensor self, float s1, Tensor rhs, float s2, int z) -> Tensor"
 )
 
@@ -72,8 +84,20 @@ shir_intrinsic_lib.define(
   "qconv(Tensor self, int zp, Tensor weights, Tensor bias, int[] stride, int[] padding, int[] dilation, int groups) -> Tensor"
 )
 
-@impl(shir_intrinsic_lib, "qconv", "CompositeExplicitAutograd")
+@impl(shir_intrinsic_lib, "qconv", "Meta")
 def qconv_meta(self, zp, weights, bias, stride, padding, dilation, groups):
+  assert bias.dtype == torch.int32
+  assert self.dtype == weights.dtype == torch.int8
+
+  # reuse aten.convolution to avoid reimplementing the shape calculuations.
+  # the actual values in the tensors don't matter, to just let it zero pad.
+  return aten.convolution(
+      self.float(), weights.float(), bias.float(),
+      stride, padding, dilation, False, [0], groups
+  ).int()
+
+@impl(shir_intrinsic_lib, "qconv", "CompositeExplicitAutograd")
+def qconv_CEA(self, zp, weights, bias, stride, padding, dilation, groups):
   assert bias.dtype == torch.int32
   assert self.dtype == weights.dtype == torch.int8
 

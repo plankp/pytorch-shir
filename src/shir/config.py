@@ -41,4 +41,3 @@ TEMPLATE_DIR = "./template"
 # only relevant if PERFORM_SYNTHESIS
 DRIVER_LIB = "./driver/build/libdriver.so"
 
-PRESYNTH_GBS = None

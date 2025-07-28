@@ -313,7 +313,19 @@ class BackendQuantizer(Quantizer):
     weight_qspec = get_weight_qspec(qconfig)
     bias_qspec = get_bias_qspec(qconfig)
 
-    fused_partitions = find_sequential_partitions(gm, [torch.nn.Linear, torch.nn.ReLU])
+    patterns = [
+      [torch.nn.Linear, torch.nn.ReLU],
+      [torch.nn.Linear, torch.nn.functional.relu],
+      [torch.nn.Linear, torch.nn.LeakyReLU],
+      [torch.nn.Linear, torch.nn.functional.leaky_relu],
+    ]
+
+    fused_partitions = []
+    for pattern in patterns:
+      partitions = find_sequential_partitions(gm, pattern)
+      if partitions:
+        fused_partitions.extend(partitions)
+
     for linear_p, relu_p in fused_partitions:
       linear_node = linear_p.output_nodes[0]
       relu = relu_p.output_nodes[0]
@@ -371,7 +383,19 @@ class BackendQuantizer(Quantizer):
     weight_qspec = get_weight_qspec(qconfig)
     bias_qspec = get_bias_qspec(qconfig)
 
-    fused_partitions = find_sequential_partitions(gm, [torch.nn.Conv2d, torch.nn.ReLU])
+    patterns = [
+      [torch.nn.Conv2d, torch.nn.ReLU],
+      [torch.nn.Conv2d, torch.nn.functional.relu],
+      [torch.nn.Conv2d, torch.nn.LeakyReLU],
+      [torch.nn.Conv2d, torch.nn.functional.leaky_relu],
+    ]
+
+    fused_partitions = []
+    for pattern in patterns:
+      partitions = find_sequential_partitions(gm, pattern)
+      if partitions:
+        fused_partitions.extend(partitions)
+
     for conv_p, relu_p in fused_partitions:
       conv_node = conv_p.output_nodes[0]
       relu = relu_p.output_nodes[0]
@@ -474,6 +498,12 @@ class BackendQuantizer(Quantizer):
       inp = p.input_nodes[0]
       if _is_annotated([out]):
         continue
+
+      # special case Tiny YOLO's single-stride max pool...
+      if (out.op == "call_function" and out.target == torch.ops.aten.max_pool2d.default and
+          inp.op == "call_function" and inp.target == torch.ops.aten.pad.default and
+          len(inp.args) >= 3 and inp.args[2] in {"reflect", "replicate"}):
+        inp = inp.args[0]
 
       # only proceed if the input has an annotation
       if not _is_annotated([inp]):
