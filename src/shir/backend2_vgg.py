@@ -203,7 +203,7 @@ def select(gm: fx.GraphModule):
       else:
         print(f"driver::isel: skipping qconv node {requant}:")
 
-    elif (qrm is not None and
+    elif ((qrm := extract_qaddmm_relu(n)) is not None and
         qrm[2].args[0].op == "get_attr" and
         bit_utils.get_narrow_type(getattr(gm, qrm[2].args[0].target)).to_signed().bits <= 24):
       requant, relu, addmm = qrm
