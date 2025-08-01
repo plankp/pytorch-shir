@@ -5,9 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.fx as fx
-from typing import List, Callable
-from functools import reduce
-from . import config, rewrites, bit_utils, types
+from . import bit_utils
 from .isel_utils import (
     extract_qconv_leaky,
     mk_requant_param
