@@ -143,14 +143,19 @@ def host_buffer_hint(self):
   return self
 
 shir_intrinsic_lib.define(
-  "lstm(Tensor images, Tensor ih, Tensor hh, Tensor b) -> Tensor"
+  "lstm(Tensor images, Tensor[] ih, Tensor[] hh, Tensor[] b) -> Tensor"
 )
 
 @impl(shir_intrinsic_lib, "lstm", "Meta")
-def _lstm(images, ih, hh, b):
+def _lstm(images, ihs, hhs, bs):
+  wii, wif, wig, wio = ihs
+  whi, whf, whg, who = hhs
+  bi, bf, bg, bo = bs
+  batch, seq_length, input_size = images.shape
+
   # TODO: add shape validation
-  # TODO: split ih, hh, b into the respective components
-  batch, length, _ = images.shape
-  _, hidden_units = hh.shape
+  hidden_units, _ = wii.shape
+
+  # XXX: the accelerator only outputs (batches of) the last output
   return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
 

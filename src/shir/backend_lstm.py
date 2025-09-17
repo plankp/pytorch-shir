@@ -95,25 +95,49 @@ def transform(gm: fx.GraphModule):
         bias = fetch_tensor(gm, n_params[2]) + fetch_tensor(gm, n_params[3])
         qbias = torch.round(bias * (2**16)).to(torch.int16)
 
-      a_qb = create_new_param()
-      setattr(gm, a_qb, nn.Parameter(qbias, False))
-
-      a_qih = create_new_param()
       qweight_ih = torch.round(weight_ih * (2**16)).to(torch.int16)
-      setattr(gm, a_qih, nn.Parameter(qweight_ih, False))
-
-      a_qhh = create_new_param()
       qweight_hh = torch.round(weight_hh * (2**16)).to(torch.int16)
-      setattr(gm, a_qhh, nn.Parameter(qweight_hh, False))
+
+      # PyTorch stacks all the biases and weights together, but our template
+      # prefers having the Wii, Wif, ... separate
+      hidden_units = weight_ih.shape[0] // 4
+
+      a_qbs = []
+      for i in range(0, 4):
+        a = create_new_param()
+        setattr(gm, a, nn.Parameter(qbias[i * hidden_units:(i + 1) * hidden_units], False))
+        a_qbs.append(a)
+
+      a_qihs = []
+      for i in range(0, 4):
+        a = create_new_param()
+        setattr(gm, a, nn.Parameter(qweight_ih[i * hidden_units:(i + 1) * hidden_units], False))
+        a_qihs.append(a)
+
+      a_qhhs = []
+      for i in range(0, 4):
+        a = create_new_param()
+        setattr(gm, a, nn.Parameter(qweight_hh[i * hidden_units:(i + 1) * hidden_units], False))
+        a_qhhs.append(a)
 
       with graph.inserting_before(n):
         n1 = graph.call_function(operator.mul, (n_image, 2**16))
         n2 = graph.call_function(torch.round, (n1,))
         n_qimage = graph.call_method("to", (n2, torch.int16))
-        n_qih = graph.get_attr(a_qih)
-        n_qhh = graph.get_attr(a_qhh)
-        n_qb  = graph.get_attr(a_qb)
-        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm, (n_qimage, n_qih, n_qhh, n_qb))
+
+        n_qihs = []
+        for a in a_qihs:
+          n_qihs.append(graph.get_attr(a))
+
+        n_qhhs = []
+        for a in a_qhhs:
+          n_qhhs.append(graph.get_attr(a))
+
+        n_qbs = []
+        for a in a_qbs:
+          n_qbs.append(graph.get_attr(a))
+
+        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm.default, (n_qimage, n_qihs, n_qhhs, n_qbs))
         n_dq = graph.call_method("to", (n_res, torch.float))
       n.target = operator.truediv
       n.args = (n_dq, 2**16)

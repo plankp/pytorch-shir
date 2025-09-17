@@ -20,16 +20,25 @@ shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
-@register_lowering(torch.ops.shir_intrinsic.lstm)
+@register_lowering(shin.lstm.default)
 class OperatorLSTM:
   @staticmethod
-  def supports(x, ih, hh, b) -> bool:
+  def supports(x, ihs, hhs, bs) -> bool:
+    wii, wif, wig, wio = ihs
+    whi, whf, whg, who = hhs
+    bi, bf, bg, bo = bs
+
+    # TODO: if extra validation is necessary...
     return True
 
   @staticmethod
-  def lower(x, ih, hh, b) -> str:
-    x.meta.get("val").shape
+  def lower(x, ihs, hhs, bs) -> str:
+    wii, wif, wig, wio = ihs
+    whi, whf, whg, who = hhs
+    bi, bf, bg, bo = bs
 
+    # this is a 3D tensor: [batch x sequence length x input size]
+    image_shape = x.meta.get("val").shape
     return "⟨TODO⟩"
 
 @register_lowering(shin.host_buffer_hint.default)
