@@ -41,28 +41,27 @@ class OperatorLSTM:
     image_shape = x.meta.get("val").shape
     return "⟨TODO⟩"
 
-@register_lowering(shin.host_buffer_hint.default)
-class LowerShirHostBufferHint:
+@register_lowering(aten.view.default)
+class OperatorView:
   @staticmethod
-  def supports(a) -> bool:
+  def supports(a, shape) -> bool:
     return True
 
   @staticmethod
-  def lower(a) -> str:
-    # we could just wrap it under a SolverGuidedBuffer and be done with it,
-    # but add extra permutes to be consistent with the input/output behaviour.
-    annot_typ = types.get_element_type(a)
-    ndim = a.meta.get("val").ndim
-    shape = a.meta.get("val").shape
+  def lower(a, shape) -> str:
+    # reshape the metatensor to get the resulting shape.
+    #
+    # do this instead of using shape directly because we might have unresolved
+    # (-1) lengths...
+    fk = a.meta.get("val")
+    nd = fk.ndim
+    ys = fk.reshape(shape).shape
 
-    transpose, (h, w) = layout.pack_host_shape(shape)
-    shape = [shape[x] for x in transpose]
-    itr = layout.inverse_transpose(transpose)
-
-    node = f"sg.SolverGuidedPermute({a.name}, Seq({', '.join((str(d) for d in transpose))}))"
-    node = f"sg.SolverGuidedReshape(sg.SolverGuidedRebalance({node}), Seq({h}, {w}))"
-    node = f"sg.SolverGuidedBuffer({node})"
-    node = f"sg.SolverGuidedRebalance(sg.SolverGuidedReshape({node}, Seq({', '.join((str(d) for d in shape))})))"
-    return f"sg.SolverGuidedPermute({node}, Seq({', '.join((str(d) for d in itr))}))"
-
+    # the shir expression is just a simple join-all + split-all
+    se = str(a)
+    for _ in range(1, nd):
+      se = f"JoinOrderedStream({se})"
+    for y in reversed(ys[1:]):
+      se = f"SplitOrderedStream({se}, {y})"
+    return se
 

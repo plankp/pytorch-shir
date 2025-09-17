@@ -63,7 +63,7 @@ def fetch_tensor(gm: fx.GraphModule, n: fx.Node):
     mod = getattr(mod, atom)
   return mod
 
-def transform(gm: fx.GraphModule):
+def isel(gm: fx.GraphModule):
   import operator
 
   counter = 0
@@ -150,15 +150,59 @@ def transform(gm: fx.GraphModule):
       for p in n_params:
         graph.erase_node(p)
 
+  graph.lint()
+  gm.recompile()
+
+def simpl(gm: fx.GraphModule):
+  graph = gm.graph
+  for n in graph.nodes:
+    if n.op != "call_function":
+      # assume not interesting, ignore
+      continue
+
+    if (n.target == torch.ops.shir_intrinsic.lstm.default and
+        fetch_tensor(gm, n.args[1][0]) is not None and
+        fetch_tensor(gm, n.args[1][0]).shape[1] == 1):
+      # if the input size of the LSTM is small, then we want to pack it to
+      # avoid slow reads.
+      #
+      # for example, if the input size is 1, hidden size if 32, then that means
+      # we expect the layout to be [32 x 1], meaning each cacheline only has one
+      # entry. very wasteful indeed!
+      #
+      # a better shape would be [1 x 32], which means a single cacheline contains
+      # more than one entry (of course, it depends on the data type, but that it).
+      #
+      # TODO: use a better heuristic instead of hardcoding the input size to 1
+      # FIXME: need to be careful when updating these tensors in-place...
+      #  -  there might be more than one user
+      #  -  the attribute names might be hierarchial (assume flat)
+      ihs = list(n.args[1])
+      for w in ihs:
+        attr = w.target
+        with graph.inserting_before(w):
+          t = fetch_tensor(gm, w)
+          setattr(gm, attr, nn.Parameter(t.view(1, -1), False))
+          p = graph.get_attr(attr)
+          r = graph.call_function(torch.ops.aten.view.default, (p, t.shape))
+          w.replace_all_uses_with(r, propagate_meta=True)
+          graph.erase_node(w)
+
+  graph.lint()
+  gm.recompile()
+
 def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
   from shir import backend
 
   mode = FakeTensorMode(allow_non_fake_inputs=True)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
 
-  transform(gm)
+  isel(gm)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
   gm.print_readable()
+
+  simpl(gm)
+  FakeTensorProp(gm, mode).propagate(*example_inputs)
 
   supported_ops = backend.SHIROperatorSupport()
   partitioner = CapabilityBasedPartitioner(gm, supported_ops, allows_single_node_partition=True)
