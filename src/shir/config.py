@@ -24,13 +24,13 @@ TRY_NARROW_TYPE = True
 TRY_COPY_AOT = True
 
 # if we should enforce channel last order (only for rank 3 and above)
-USE_CHANNEL_LAST = True
+USE_CHANNEL_LAST = False
 
 # the model cache directory:
 MODEL_CACHE_DIR = "./data/cache"
 
-import shir.codegen.sg
-CODEGEN_MODULE = shir.codegen.sg
+import shir.codegen.arch
+CODEGEN_MODULE = shir.codegen.arch
 
 """ Settings that you normally wouldn't touch """
 
