@@ -41,9 +41,14 @@ with torch.no_grad():
   gfx = torch.export.export(model, (x,)).module()
   # gfx.print_readable()
 
-  # lazy compile
   import shir.backend_lstm
-  model = torch.compile(gfx, backend=shir.backend_lstm.compiler)
-  # force compile to happen
+  if False:
+    # for testing purposes, this one is better since it's (marginally) faster
+    # and the stacktraces are not as nasty (in case something goes wrong)
+    model = shir.backend_lstm.compiler(gfx, (x,))
+  else:
+    # lazy compile: compilation happens on first use
+    model = torch.compile(gfx, backend=shir.backend_lstm.compiler)
+
   print(model(x))
 
