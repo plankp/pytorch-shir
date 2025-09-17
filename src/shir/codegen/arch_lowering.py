@@ -20,8 +20,8 @@ shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
-@register_lowering(torch.ops._shir.lstm)
-class FooBar:
+@register_lowering(torch.ops.shir_intrinsic.lstm)
+class OperatorLSTM:
   @staticmethod
   def supports(x, ih, hh, b) -> bool:
     return True

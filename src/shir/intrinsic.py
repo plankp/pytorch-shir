@@ -141,3 +141,16 @@ shir_intrinsic_lib.define(
 @impl(shir_intrinsic_lib, "host_buffer_hint", "CompositeExplicitAutograd")
 def host_buffer_hint(self):
   return self
+
+shir_intrinsic_lib.define(
+  "lstm(Tensor images, Tensor ih, Tensor hh, Tensor b) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "lstm", "Meta")
+def _lstm(images, ih, hh, b):
+  # TODO: add shape validation
+  # TODO: split ih, hh, b into the respective components
+  batch, length, _ = images.shape
+  _, hidden_units = hh.shape
+  return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
+
