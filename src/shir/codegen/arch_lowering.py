@@ -23,7 +23,7 @@ prims = torch.ops.prims
 @register_lowering(shin.lstm.default)
 class OperatorLSTM:
   @staticmethod
-  def supports(x, ihs, hhs, bs) -> bool:
+  def supports(x, ihs, hhs, bs, proj) -> bool:
     wii, wif, wig, wio = ihs
     whi, whf, whg, who = hhs
     bi, bf, bg, bo = bs
@@ -32,13 +32,18 @@ class OperatorLSTM:
     return True
 
   @staticmethod
-  def lower(x, ihs, hhs, bs) -> str:
+  def lower(x, ihs, hhs, bs, proj) -> str:
     wii, wif, wig, wio = ihs
     whi, whf, whg, who = hhs
     bi, bf, bg, bo = bs
 
     # this is a 3D tensor: [batch x sequence length x input size]
     image_shape = x.meta.get("val").shape
+
+    if proj is not None:
+      # projection is used
+      pass
+
     return "⟨TODO⟩"
 
 @register_lowering(aten.view.default)
