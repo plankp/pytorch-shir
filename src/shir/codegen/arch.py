@@ -113,15 +113,19 @@ object """, self.clname, """ extends support.GeneratedModel {
 
       if n.op == "placeholder":
         host_id, real_typ = host_mapping[n]
-        ndim = n.meta.get("val").ndim
+        dims = n.meta.get("val").ndim
         shape = [*n.meta.get("val").shape]
 
         transpose, (h, w) = layout.pack_host_shape(shape)
         shape = [shape[x] for x in transpose]
 
-        assert list(transpose) == list(range(0, ndim)), "TODO: transpose"
+        assert list(transpose) == list(range(0, dims)), "TODO: transpose"
 
         node = f"arch.mem.Input(\"{host_id}\", {w}, {h}, {real_typ.name()})"
+        if dims < 2:
+          node = f"arch.JoinOrderedStream({node})"
+        for i in reversed(shape[1:-1]):
+          node = f"arch.SplitOrderedStream({node}, {i})"
         print(
           "    val ", n.name, " = core.TypeChecker.check(", node, ")",
           sep="", file=f
@@ -141,8 +145,8 @@ object """, self.clname, """ extends support.GeneratedModel {
           v = f"arch.Repeat({v}, 1)"
         if dims < 2:
           v = f"arch.Repeat({v}, 1)"
-        if dims > 2:
-          assert False, "TODO: flattening logic"
+        for _ in range(2, dims):
+          v = f"arch.JoinOrderedStream({v})"
 
         print(
           "    core.TypeChecker.check(arch.MapOrderedStream(2,",
