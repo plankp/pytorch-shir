@@ -119,13 +119,13 @@ object """, self.clname, """ extends support.GeneratedModel {
         transpose, (h, w) = layout.pack_host_shape(shape)
         shape = [shape[x] for x in transpose]
 
-        assert list(transpose) == list(range(0, dims)), "TODO: transpose"
+        assert list(transpose) == list(range(0, dims)), "TODO: placeholder transpose"
 
         node = f"arch.mem.Input(\"{host_id}\", {w}, {h}, {real_typ.name()})"
-        if dims < 2:
+        if dims != 2:
           node = f"arch.JoinOrderedStream({node})"
-        for i in reversed(shape[1:-1]):
-          node = f"arch.SplitOrderedStream({node}, {i})"
+          for y in reversed(shape[1:]):
+            node = f"arch.SplitOrderedStream({node}, {y})"
         print(
           "    val ", n.name, " = core.TypeChecker.check(", node, ")",
           sep="", file=f
@@ -139,19 +139,25 @@ object """, self.clname, """ extends support.GeneratedModel {
 
         annot_typ = types.get_element_type(retv)
         dims = retv.meta.get("val").ndim
+        shape = retv.meta.get("val").shape
         v = retv.name
+
+        transpose, (h, w) = layout.pack_host_shape(shape)
+        assert list(transpose) == list(range(0, dims)), "TODO: output transpose"
 
         if dims < 1:
           v = f"arch.Repeat({v}, 1)"
         if dims < 2:
           v = f"arch.Repeat({v}, 1)"
-        for _ in range(2, dims):
-          v = f"arch.JoinOrderedStream({v})"
+        if dims > 2:
+          for _ in range(1, dims):
+            v = f"arch.JoinOrderedStream({v})"
+          v = f"arch.SplitOrderedStream({v}, {w})"
 
         print(
-          "    core.TypeChecker.check(arch.MapOrderedStream(2,",
+          "    core.TypeChecker.check(arch.mem.StoreResult(arch.MapOrderedStream(2,",
           " arch.ResizeInteger.asFunction(types = Seq(", annot_typ.bits, ")),",
-          " ", v, "))",
+          " ", v, ")))",
           sep="", file=f
         )
 
