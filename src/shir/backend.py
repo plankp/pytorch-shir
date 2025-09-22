@@ -161,7 +161,7 @@ def apply_shir_ops(gm: GraphModule):
         # use rename, which is atomic (at least on Unix).
         precopy_dir.rename(cache_dir)
 
-    shutil.rmtree(tempdir)
+    #shutil.rmtree(tempdir)
 
     # then construct the graph as necessary
     if config.PERFORM_SYNTHESIS:

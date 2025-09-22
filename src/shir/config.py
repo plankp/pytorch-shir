@@ -5,7 +5,7 @@ All sorts of configuration flags
 """ Settings that you would play with """
 
 # if we should trigger synthesis
-PERFORM_SYNTHESIS = False
+PERFORM_SYNTHESIS = True
 
 # the UUID of the accelerator as a bytestring
 # only relevant if PERFORM_SYNTHESIS
