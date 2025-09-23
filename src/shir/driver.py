@@ -83,6 +83,7 @@ class Fpga:
     self.close()
 
 def find_and_open_fpga(uuid):
+  assert uuid is not None, "uuid must not be None!"
   handle = C.POINTER(C.c_void_p)()
   if r := _impl.find_and_open_fpga(uuid, C.byref(handle)):
     raise Exception(f"_impl.find_and_open_fpga failed: {r}")

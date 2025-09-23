@@ -9,7 +9,7 @@ PERFORM_SYNTHESIS = True
 
 # the UUID of the accelerator as a bytestring
 # only relevant if PERFORM_SYNTHESIS
-ACCEL_UUID = None
+ACCEL_UUID = b"850ADCC2-6CEB-4B22-9722-D43375B61C66"
 
 # the number of bits in each cacheline (of the target / simulated hardware)
 CACHELINE_BITS = 512
