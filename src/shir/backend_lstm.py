@@ -1,4 +1,4 @@
-from typing import List, Callable
+from typing import List, Callable, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.fx as fx
@@ -7,6 +7,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+
+# Configuration values
+mvm_frac: Optional[Tuple[int, int]] = None
+sparsity: Optional[float] = None
 
 def match_rnn(n: fx.Node):
   import operator
@@ -217,7 +221,7 @@ def isel(gm: fx.GraphModule):
         if a_proj is not None:
           n_proj = graph.get_attr(a_proj)
 
-        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm.default, (n_qimage, n_qihs, n_qhhs, n_qbs, n_proj))
+        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm.default, (n_qimage, n_qihs, n_qhhs, n_qbs, n_proj, mvm_frac, sparsity))
         n_dq = graph.call_method("to", (n_res, torch.float))
       n.target = operator.truediv
       n.args = (n_dq, 2**16)

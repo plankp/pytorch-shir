@@ -41,14 +41,20 @@ with torch.no_grad():
   gfx = torch.export.export(model, (x,)).module()
   # gfx.print_readable()
 
-  import shir.backend_lstm
+  import shir.backend_lstm as I
+  if False:
+    # say we want to pick P/Q as 3/1 and 50% sparsity
+    # TODO: sparsity needs the weights to be preprocessed as well...
+    I.mvm_frac = (3, 1)
+    I.sparsity = 0.5
+
   if False:
     # for testing purposes, this one is better since it's (marginally) faster
     # and the stacktraces are not as nasty (in case something goes wrong)
-    model = shir.backend_lstm.compiler(gfx, (x,))
+    model = I.compiler(gfx, (x,))
   else:
     # lazy compile: compilation happens on first use
-    model = torch.compile(gfx, backend=shir.backend_lstm.compiler)
+    model = torch.compile(gfx, backend=I.compiler)
 
   print(model(x))
 
