@@ -163,3 +163,19 @@ def _lstm(images, ihs, hhs, bs, proj):
   # XXX: the accelerator only outputs (batches of) the last output
   return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
 
+
+shir_intrinsic_lib.define(
+  "rnn(Tensor images, Tensor ih, Tensor hh, Tensor b, bool tanh_or_relu) -> Tensor"
+)
+
+@impl(shir_intrinsic_lib, "rnn", "Meta")
+def _rnn(images, ih, hh, b, tanh_or_relu):
+  batch, seq_length, input_size = images.shape
+
+  # TODO: add shape validation
+
+  hidden_units, _ = ih.shape
+
+  # XXX: the accelerator only outputs (batches of) the last output
+  return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
+

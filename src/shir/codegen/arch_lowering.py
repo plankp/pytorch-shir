@@ -20,6 +20,16 @@ shin = torch.ops.shir_intrinsic
 aten = torch.ops.aten
 prims = torch.ops.prims
 
+@register_lowering(shin.rnn.default)
+class OperatorRNN:
+  @staticmethod
+  def supports(x, ih, hh, b, tanh_or_relu) -> bool:
+    return False
+
+  @staticmethod
+  def lower(x, ih, hh, b, tanh_or_relu) -> str:
+    assert False, "TODO"
+
 @register_lowering(shin.lstm.default)
 class OperatorLSTM:
   @staticmethod

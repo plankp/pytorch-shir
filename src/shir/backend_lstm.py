@@ -8,6 +8,54 @@ from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
 from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 
+def match_rnn(n: fx.Node):
+  import operator
+
+  # only allow the last timestep
+  n_get_last_timestep = n
+  if (n.op != "call_function" or n.target != torch.ops.aten.select.int or
+      n.args[1] != 1 or n.args[2] != -1):
+    return None
+
+  # ignore the full batch slicing if it exists
+  n = n.args[0]
+  n_slice_all = None
+  if (n.op == "call_function" and n.target == torch.ops.aten.slice.Tensor and
+      n.args[1] == 0 and n.args[2] == 0 and n.args[3] == 9223372036854775807 and
+      len(n.users) == 1):
+    n_slice_all, n = n, n.args[0]
+
+  # only allow getting the output, not the hidden state
+  n_getitem = n
+  if (n.op != "call_function" or n.target != operator.getitem or
+      n.args[1] != 0 or
+      len(n.users) != 1):
+    return None
+
+  # then we have the rnn node
+  n_rnn = n = n.args[0]
+  if n.op != "call_function" or len(n.users) != 1:
+    return None
+  if n.target not in {torch.ops.aten.rnn_tanh.input,
+                      torch.ops.aten.rnn_relu.input}:
+    return None
+
+  # examine the arguments
+  img, hx, params, has_biases, num_layers, _dropout, train, bidi, batchfirst = n_rnn.args
+
+  if train or bidi or num_layers != 1:
+    return None
+
+  if len(params) != (4 if has_biases else 2):
+    return None
+
+  # initial hx must be all zeros
+  # TODO: could be relaxed in some cases
+  if hx.op != "call_function" or hx.target != torch.ops.aten.zeros.default:
+    return None
+
+  return n_rnn, [n_getitem, n_slice_all]
+
 def match_lstm(n: fx.Node):
   import operator
 
@@ -179,6 +227,59 @@ def isel(gm: fx.GraphModule):
       graph.erase_node(n_lstm)
       for p in n_zeros:
         graph.erase_node(p)
+      for p in n_params:
+        graph.erase_node(p)
+
+    elif p := match_rnn(n):
+      n_rnn, n_rest = p
+      n_image = n_rnn.args[0]
+      n_zeros = n_rnn.args[1]
+      n_params = n_rnn.args[2]
+
+      weight_ih = fetch_tensor(gm, n_params[0])
+      weight_hh = fetch_tensor(gm, n_params[1])
+
+      if n_rnn.target == torch.ops.aten.rnn_tanh.input:
+        nonlinearity = True
+      elif n_rnn.target == torch.ops.aten.rnn_relu.input:
+        nonlinearity = False
+
+      if not n_rnn.args[3]:
+        qbias = torch.zeros(weight_ih.shape[0], dtype=torch.int16)
+      else:
+        bih = fetch_tensor(gm, n_params[2])
+        bhh = fetch_tensor(gm, n_params[3])
+        qbias = torch.round((bih + bhh) * (2**16)).to(torch.int16)
+
+      qweight_ih = torch.round(weight_ih * (2**16)).to(torch.int16)
+      qweight_hh = torch.round(weight_hh * (2**16)).to(torch.int16)
+
+      a_qb = create_new_param()
+      setattr(gm, a_qb, nn.Parameter(qbias, False))
+
+      a_qhh = create_new_param()
+      setattr(gm, a_qhh, nn.Parameter(qweight_hh, False))
+
+      a_qih = create_new_param()
+      setattr(gm, a_qih, nn.Parameter(qweight_ih, False))
+
+      with graph.inserting_before(n):
+        n1 = graph.call_function(operator.mul, (n_image, 2**16))
+        n2 = graph.call_function(torch.round, (n1,))
+        n_qimage = graph.call_method("to", (n2, torch.int16))
+
+        n_qih = graph.get_attr(a_qih)
+        n_qhh = graph.get_attr(a_qhh)
+        n_qb  = graph.get_attr(a_qb)
+        n_res = graph.call_function(torch.ops.shir_intrinsic.rnn.default, (n_qimage, n_qih, n_qhh, n_qb, nonlinearity))
+        n_dq = graph.call_method("to", (n_res, torch.float))
+      n.target = operator.truediv
+      n.args = (n_dq, 2**16)
+
+      for q in reversed(n_rest):
+        graph.erase_node(q)
+      graph.erase_node(n_rnn)
+      graph.erase_node(n_zeros)
       for p in n_params:
         graph.erase_node(p)
 
