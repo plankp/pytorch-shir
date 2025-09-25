@@ -164,7 +164,6 @@ def _lstm(images, ihs, hhs, bs, proj, mvm_frac, sparsity):
   # XXX: the accelerator only outputs (batches of) the last output
   return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
 
-
 shir_intrinsic_lib.define(
   "rnn(Tensor images, Tensor ih, Tensor hh, Tensor b, bool tanh_or_relu) -> Tensor"
 )
@@ -179,4 +178,22 @@ def _rnn(images, ih, hh, b, tanh_or_relu):
 
   # XXX: the accelerator only outputs (batches of) the last output
   return torch.empty((batch, hidden_units), dtype=torch.int16, device='meta')
+
+shir_intrinsic_lib.define("""
+  mm(Tensor ik, Tensor jk, Tensor? bias) -> Tensor
+""")
+
+@impl(shir_intrinsic_lib, "mm", "Meta")
+def _mm(ik, jk, bias):
+  i1, k1 = ik.shape
+  j1, k2 = jk.shape
+  assert ik.dtype == jk.dtype == torch.int16, "shir_intrinsic::mm: unsupported data type"
+  assert k1 == k2, "shir_intrinsic::mm: invalid k length mismatch"
+
+  if bias is not None:
+    j2, = bias.shape
+    assert bias.dtype == torch.int16, "shir_intrinsic::mm: unsupported data type"
+    assert j1 == j2, "shir_intrinsic::mm: invalid j length mismatch"
+
+  return torch.empty((i1, j1), dtype=torch.int16, device='meta')
 

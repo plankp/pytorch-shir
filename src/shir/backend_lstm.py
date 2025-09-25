@@ -2,10 +2,10 @@ from typing import List, Callable, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.fx as fx
+import operator
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.passes.tools_common import CALLABLE_NODE_OPS
-from torch.fx.passes.operator_support import OperatorSupport
 from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 
 # Configuration values
@@ -13,8 +13,6 @@ mvm_frac: Optional[Tuple[int, int]] = None
 sparsity: Optional[float] = None
 
 def match_rnn(n: fx.Node):
-  import operator
-
   # only allow the last timestep
   n_get_last_timestep = n
   if (n.op != "call_function" or n.target != torch.ops.aten.select.int or
@@ -61,8 +59,6 @@ def match_rnn(n: fx.Node):
   return n_rnn, [n_getitem, n_slice_all]
 
 def match_lstm(n: fx.Node):
-  import operator
-
   # only allow the last timestep
   n_get_last_timestep = n
   if (n.op != "call_function" or n.target != torch.ops.aten.select.int or
@@ -134,8 +130,6 @@ def fetch_tensor(gm: fx.GraphModule, n: fx.Node):
   return mod
 
 def isel(gm: fx.GraphModule):
-  import operator
-
   counter = 0
 
   def create_new_param():
@@ -287,17 +281,58 @@ def isel(gm: fx.GraphModule):
       for p in n_params:
         graph.erase_node(p)
 
+    elif n.op == "call_function" and n.target == torch.ops.aten.linear.default:
+      n_img, n_wgt, n_bias = n.args
+
+      qweight = torch.round(fetch_tensor(gm, n_wgt) * (2**16)).to(torch.int16)
+      qbias = None
+      if n_bias is not None:
+        qbias = torch.round(fetch_tensor(gm, n_bias) * (2**16)).to(torch.int16)
+
+      a_qweight = create_new_param()
+      setattr(gm, a_qweight, nn.Parameter(qweight, False))
+
+      a_qbias = None
+      if qbias is not None:
+        a_qbias = create_new_param()
+        setattr(gm, a_qbias, nn.Parameter(qbias, False))
+
+      with graph.inserting_before(n):
+        n1 = graph.call_function(operator.mul, (n_img, 2**16))
+        n2 = graph.call_function(torch.round, (n1,))
+        n_qimage = graph.call_method("to", (n2, torch.int16))
+        n_qweight = graph.get_attr(a_qweight)
+        n_qbias = None
+        if a_qbias is not None:
+          n_qbias = graph.get_attr(a_qbias)
+        n_res = graph.call_function(torch.ops.shir_intrinsic.mm.default, (n_qimage, n_qweight, n_qbias))
+        n_dq = graph.call_method("to", (n_res, torch.float))
+      n.target = operator.truediv
+      n.args = (n_dq, 2**16)
+
   graph.lint()
   gm.recompile()
 
 def simpl(gm: fx.GraphModule):
   graph = gm.graph
   for n in graph.nodes:
-    if n.op != "call_function":
+    if n.op not in CALLABLE_NODE_OPS:
       # assume not interesting, ignore
       continue
 
-    if (n.target == torch.ops.shir_intrinsic.lstm.default and
+    if (n.target == "to" and n.args[1] == torch.int16 and
+        (n_r := n.args[0]).op == "call_function" and n_r.target == torch.round and
+        (n_m := n_r.args[0]).op == "call_function" and n_m.target == operator.mul and n_m.args[1] == 2**16 and
+        (n_d := n_m.args[0]).op == "call_function" and n_d.target == operator.truediv and n_d.args[1] == 2**16 and
+        (n_t := n_d.args[0]).op == "call_method" and n_t.target == "to" and n_t.args[1] == torch.float and
+        n_t.args[0].meta.get("val").dtype == torch.int16):
+      n.replace_all_uses_with(n_t.args[0])
+      for q in [n, n_r, n_m, n_d, n_t]:
+        if q.users:
+          break
+        graph.erase_node(q)
+
+    elif (n.target == torch.ops.shir_intrinsic.lstm.default and
         fetch_tensor(gm, n.args[1][0]) is not None and
         fetch_tensor(gm, n.args[1][0]).shape[1] == 1):
       # if the input size of the LSTM is small, then we want to pack it to
