@@ -47,6 +47,8 @@ with torch.no_grad():
     # TODO: sparsity needs the weights to be preprocessed as well...
     I.mvm_frac = (3, 1)
     I.sparsity = 0.5
+  I._assume_qinput = True
+  I._assume_qoutput = True
 
   if False:
     # for testing purposes, this one is better since it's (marginally) faster

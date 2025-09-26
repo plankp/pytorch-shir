@@ -11,6 +11,8 @@ from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 # Configuration values
 mvm_frac: Optional[Tuple[int, int]] = None
 sparsity: Optional[float] = None
+_assume_qinput: bool = False
+_assume_qoutput: bool = False
 
 def match_rnn(n: fx.Node):
   # only allow the last timestep
@@ -313,8 +315,61 @@ def isel(gm: fx.GraphModule):
   graph.lint()
   gm.recompile()
 
+def _remap_qinput(gm: fx.GraphModule):
+  # to be safe (since we completely change the placeholder information),
+  # construct a brand-new graph
+  env = {}
+  new_graph = fx.Graph()
+
+  def mapper(n):
+    return env[n]
+
+  for n in gm.graph.nodes:
+    if n.op == "placeholder":
+      dt = getattr(n.meta.get("val", {}), "dtype", None)
+      if dt == torch.float:
+        u = new_graph.placeholder(n.target)
+        a = new_graph.call_method("to", (u, torch.float))
+        b = new_graph.call_function(operator.truediv, (a, 2**16))
+        env[n] = b
+        continue
+
+      if dt is None:
+        print("backend_lstm::_remap_qinput: warning: some inputs have no type information")
+
+    u = new_graph.node_copy(n, mapper)
+    env[n] = u
+
+  new_graph.lint()
+  gm.graph = new_graph
+
 def simpl(gm: fx.GraphModule):
   graph = gm.graph
+  if _assume_qoutput:
+    for n in reversed(graph.nodes):
+      if n.op != "output":
+        continue
+      new_outs = []
+      maybe_discard = []
+      outputs = n.args[0]
+      for out in outputs:
+        if (out.op == "call_function" and out.target == operator.truediv and out.args[1] == 2**16 and
+            (n_t := out.args[0]).op == "call_method" and n_t.target == "to" and n_t.args[1] == torch.float and
+            n_t.args[0].meta.get("val").dtype == torch.int16):
+          new_outs.append(n_t.args[0])
+          maybe_discard.append([out, n_t])
+        else:
+          print("backend_lstm::simpl: warning: some outputs are not dequantized")
+          new_outs.append(out)
+
+      n.args = (tuple(new_outs),)
+      for xs in maybe_discard:
+        for x in xs:
+          if x.users:
+            break
+          graph.erase_node(x)
+      break
+
   for n in graph.nodes:
     if n.op not in CALLABLE_NODE_OPS:
       # assume not interesting, ignore
@@ -360,7 +415,7 @@ def simpl(gm: fx.GraphModule):
           w.replace_all_uses_with(r, propagate_meta=True)
           graph.erase_node(w)
 
-  graph.lint()
+  gm.graph.lint()
   gm.recompile()
 
 def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
@@ -371,10 +426,15 @@ def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
 
   isel(gm)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
-  gm.print_readable()
+
+  if _assume_qinput:
+    _remap_qinput(gm)
+    example_inputs = [i.to(torch.int16) if i.dtype == torch.float else i for i in example_inputs]
+    FakeTensorProp(gm, mode).propagate(*example_inputs)
 
   simpl(gm)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
+  gm.print_readable()
 
   supported_ops = backend.SHIROperatorSupport()
   partitioner = CapabilityBasedPartitioner(gm, supported_ops, allows_single_node_partition=True)
