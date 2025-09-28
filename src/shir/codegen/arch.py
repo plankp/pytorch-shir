@@ -51,7 +51,10 @@ object """, self.clname, """ extends support.GeneratedModel {
 
   def main(args: Array[String]): Unit = support.Util.drive(this, args)
 
-  override def extraRewrites(): Seq[(CompilerPhase, RewriteStep)] = Seq()
+  override def extraRewrites(): Seq[(CompilerPhase, RewriteStep)] = {
+    import backend.hdl.arch.rewrite.InputBufferingRules
+    Seq((tiling.PaddingCompiler.phaseBefore, RewriteStep(RewriteAll(), Seq(InputBufferingRules.increaseParallelReadRequests(64)))))
+  }
 """, sep='', file=f)
 
       self._emit_method_load_data(f, gm, host_mapping)
