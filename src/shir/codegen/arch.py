@@ -52,6 +52,7 @@ object """, self.clname, """ extends support.GeneratedModel {
   def main(args: Array[String]): Unit = support.Util.drive(this, args)
 
   override def extraRewrites(): Seq[(CompilerPhase, RewriteStep)] = {
+    import core.rewrite.RewriteAll
     import backend.hdl.arch.rewrite.InputBufferingRules
     Seq((tiling.PaddingCompiler.phaseBefore, RewriteStep(RewriteAll(), Seq(InputBufferingRules.increaseParallelReadRequests(64)))))
   }
