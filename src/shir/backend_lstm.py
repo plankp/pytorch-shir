@@ -343,33 +343,34 @@ def _remap_qinput(gm: fx.GraphModule):
   new_graph.lint()
   gm.graph = new_graph
 
+def _remap_qoutput(gm: fx.GraphModule):
+  graph = gm.graph
+  for n in reversed(graph.nodes):
+    if n.op != "output":
+      continue
+    new_outs = []
+    maybe_discard = []
+    outputs = n.args[0]
+    for out in outputs:
+      if (out.op == "call_function" and out.target == operator.truediv and out.args[1] == 2**16 and
+          (n_t := out.args[0]).op == "call_method" and n_t.target == "to" and n_t.args[1] == torch.float and
+          n_t.args[0].meta.get("val").dtype == torch.int16):
+        new_outs.append(n_t.args[0])
+        maybe_discard.append([out, n_t])
+      else:
+        print("backend_lstm::simpl: warning: some outputs are not dequantized")
+        new_outs.append(out)
+
+    n.args = (tuple(new_outs),)
+    for xs in maybe_discard:
+      for x in xs:
+        if x.users:
+          break
+        graph.erase_node(x)
+    break
+
 def simpl(gm: fx.GraphModule):
   graph = gm.graph
-  if _assume_qoutput:
-    for n in reversed(graph.nodes):
-      if n.op != "output":
-        continue
-      new_outs = []
-      maybe_discard = []
-      outputs = n.args[0]
-      for out in outputs:
-        if (out.op == "call_function" and out.target == operator.truediv and out.args[1] == 2**16 and
-            (n_t := out.args[0]).op == "call_method" and n_t.target == "to" and n_t.args[1] == torch.float and
-            n_t.args[0].meta.get("val").dtype == torch.int16):
-          new_outs.append(n_t.args[0])
-          maybe_discard.append([out, n_t])
-        else:
-          print("backend_lstm::simpl: warning: some outputs are not dequantized")
-          new_outs.append(out)
-
-      n.args = (tuple(new_outs),)
-      for xs in maybe_discard:
-        for x in xs:
-          if x.users:
-            break
-          graph.erase_node(x)
-      break
-
   for n in graph.nodes:
     if n.op not in CALLABLE_NODE_OPS:
       # assume not interesting, ignore
@@ -418,6 +419,18 @@ def simpl(gm: fx.GraphModule):
   gm.graph.lint()
   gm.recompile()
 
+def peephole(gm: fx.GraphModule):
+  graph = gm.graph
+  for n in graph.nodes:
+    if n.op not in CALLABLE_NODE_OPS:
+      # assume not interesting, ignore
+      continue
+
+    if n.target == torch.ops.shir_intrinsic.mm.default:
+      # that means for whatever reason, we did not lower it...
+      # so turn it back to using the torch implementation
+      n.target = torch.ops.aten.linear.default
+
 def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
   from shir import backend
 
@@ -432,6 +445,9 @@ def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
     example_inputs = [i.to(torch.int16) if i.dtype == torch.float else i for i in example_inputs]
     FakeTensorProp(gm, mode).propagate(*example_inputs)
 
+  if _assume_qoutput:
+    _remap_qoutput(gm)
+
   simpl(gm)
   FakeTensorProp(gm, mode).propagate(*example_inputs)
   gm.print_readable()
@@ -441,6 +457,7 @@ def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
   partitions = partitioner.propose_partitions()
   fused_graph = partitioner.fuse_partitions(partitions)
 
+  peephole(fused_graph)
   fused_graph.print_readable()
   backend.apply_shir_ops(fused_graph)
 
