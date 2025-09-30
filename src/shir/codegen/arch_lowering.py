@@ -44,7 +44,7 @@ class OperatorRNN:
 @register_lowering(shin.lstm.default)
 class OperatorLSTM:
   @staticmethod
-  def supports(x, ihs, hhs, bs, proj, mvm_frac, sparsity) -> bool:
+  def supports(x, ihs, hhs, bs, proj, mvm_frac, sparsity, blocks) -> bool:
     wii, wif, wig, wio = ihs
     whi, whf, whg, who = hhs
     bi, bf, bg, bo = bs
@@ -53,14 +53,14 @@ class OperatorLSTM:
     if mvm_frac is not None:
       p, q = mvm_frac
       return False
-    if sparsity is not None:
+    if sparsity is not None or blocks is not None:
       return False
 
     # TODO: if extra validation is necessary...
     return True
 
   @staticmethod
-  def lower(x, ihs, hhs, bs, proj, mvm_frac, sparsity) -> str:
+  def lower(x, ihs, hhs, bs, proj, mvm_frac, sparsity, blocks) -> str:
     wii, wif, wig, wio = ihs
     whi, whf, whg, who = hhs
     bi, bf, bg, bo = bs

@@ -11,6 +11,7 @@ from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
 # Configuration values
 mvm_frac: Optional[Tuple[int, int]] = None
 sparsity: Optional[float] = None
+blocks: Optional[int] = None
 _assume_qinput: bool = False
 _assume_qoutput: bool = False
 
@@ -217,7 +218,7 @@ def isel(gm: fx.GraphModule):
         if a_proj is not None:
           n_proj = graph.get_attr(a_proj)
 
-        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm.default, (n_qimage, n_qihs, n_qhhs, n_qbs, n_proj, mvm_frac, sparsity))
+        n_res = graph.call_function(torch.ops.shir_intrinsic.lstm.default, (n_qimage, n_qihs, n_qhhs, n_qbs, n_proj, mvm_frac, sparsity, blocks))
         n_dq = graph.call_method("to", (n_res, torch.float))
       n.target = operator.truediv
       n.args = (n_dq, 2**16)

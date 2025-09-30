@@ -43,10 +43,11 @@ with torch.no_grad():
 
   import shir.backend_lstm as I
   if False:
-    # say we want to pick P/Q as 3/1 and 50% sparsity
+    # say we want to pick P/Q as 3/1 and 1 block at 50% sparsity
     # TODO: sparsity needs the weights to be preprocessed as well...
     I.mvm_frac = (3, 1)
     I.sparsity = 0.5
+    I.blocks = 1
   I._assume_qinput = True
   I._assume_qoutput = True
 

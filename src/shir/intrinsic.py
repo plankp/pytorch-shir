@@ -144,11 +144,11 @@ def host_buffer_hint(self):
 
 shir_intrinsic_lib.define("""
   lstm(Tensor images, Tensor[] ih, Tensor[] hh, Tensor[] b, Tensor? proj,
-       int[2]? mvm_frac, float? sparsity) -> Tensor
+       int[2]? mvm_frac, float? sparsity, int? blocks) -> Tensor
 """)
 
 @impl(shir_intrinsic_lib, "lstm", "Meta")
-def _lstm(images, ihs, hhs, bs, proj, mvm_frac, sparsity):
+def _lstm(images, ihs, hhs, bs, proj, mvm_frac, sparsity, blocks):
   wii, wif, wig, wio = ihs
   whi, whf, whg, who = hhs
   bi, bf, bg, bo = bs
