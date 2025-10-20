@@ -180,6 +180,7 @@ class BackendQuantizer(Quantizer):
 
     # allow per channel for convolution
     qconfig = _qconfig_per_channel if self.allow_per_channel else _qconfig_per_tensor
+    self._annotate_conv_add_relu(gm, qconfig)
     self._annotate_conv_relu(gm, qconfig)
     self._annotate_conv(gm, qconfig)
 
@@ -376,6 +377,54 @@ class BackendQuantizer(Quantizer):
 
       _annotate_output_qspec(linear_node, output_qspec)
       _mark_nodes_as_annotated([*p.nodes])
+
+  def _annotate_conv_add_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
+    input_qspec = get_input_act_qspec(qconfig)
+    output_qspec = get_output_act_qspec(qconfig)
+    weight_qspec = get_weight_qspec(qconfig)
+    bias_qspec = get_bias_qspec(qconfig)
+
+    patterns = [
+      [torch.nn.Conv2d, operator.add, torch.nn.ReLU],
+    ]
+
+    fused_partitions = []
+    for pattern in patterns:
+      if partitions := find_sequential_partitions(gm, pattern):
+        fused_partitions.extend(partitions)
+
+    for conv_p, add_p, relu_p in fused_partitions:
+      conv_node = conv_p.output_nodes[0]
+      add_node = add_p.output_nodes[0]
+      relu = relu_p.output_nodes[0]
+
+      assert (conv_node.op == "call_function" and conv_node.target in [
+        torch.ops.aten.conv1d.default,
+        torch.ops.aten.conv2d.default,
+      ]), "annotation: unsupported aten convolution node"
+
+      if len(conv_node.users) != 1:
+        continue
+      if _is_annotated([conv_node, add_node, relu]):
+        continue
+
+      conv_idx, residual_idx = 0, 1
+      if conv_node is not add_p.input_nodes[conv_idx]:
+        conv_idx, residual_idx = residual_idx, conv_idx
+      if conv_node is not add_p.input_nodes[conv_idx]:
+        continue
+
+      inp = conv_node.args[0]
+      weight = conv_node.args[1]
+      bias = conv_node.args[2]
+      _annotate_input_qspec_map(conv_node, inp, input_qspec)
+      _annotate_input_qspec_map(conv_node, weight, weight_qspec)
+      if bias:
+        _annotate_input_qspec_map(conv_node, bias, bias_qspec)
+      _annotate_input_qspec_map(add_node, add_p.input_nodes[residual_idx], input_qspec)
+
+      _annotate_output_qspec(relu, output_qspec)
+      _mark_nodes_as_annotated([*conv_p.nodes, *add_p.nodes, *relu_p.nodes])
 
   def _annotate_conv_relu(self, gm: torch.fx.GraphModule, qconfig: QuantizationConfig):
     input_qspec = get_input_act_qspec(qconfig)
