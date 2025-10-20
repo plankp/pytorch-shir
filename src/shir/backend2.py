@@ -223,9 +223,6 @@ def resnet7x7(images, padvalue, kernel, bias, scales, zp, packfactor):
 
   return torch.empty(x.permute([0, 2, 3, 1]).shape, dtype=torch.int8, device='meta')
 
-def isel(gm: fx.GraphModule):
-  from .backend2_resnet import select
-  select(gm)
 
 def permute_has_equiv_view(shape: torch.Size, perm: List[int]):
   filtered = [i for (i, x) in zip(perm, list(shape)) if x != 1]
@@ -1513,12 +1510,14 @@ class _Wrapper:
     return self._gm(self._pptr, *args, **kwargs)
 
 def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_resnet as isel
   mode = FakeTensorMode(allow_non_fake_inputs=True)
-  FakeTensorProp(gm, mode).propagate(*example_inputs)
-  rewrites.rewrite_quantized_ops(gm)
+  if getattr(isel, "REQUIRE_QUANT_REWRITE", True):
+    FakeTensorProp(gm, mode).propagate(*example_inputs)
+    rewrites.rewrite_quantized_ops(gm)
 
   FakeTensorProp(gm, mode).propagate(*example_inputs)
-  isel(gm)
+  isel.select(gm)
 
   FakeTensorProp(gm, mode).propagate(*example_inputs)
   simpl(gm)
