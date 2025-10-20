@@ -31,6 +31,18 @@ resnet7x7(Tensor images, int padvalue, Tensor kernel, Tensor bias,
           Tensor scale, int z,
           int packfactor) -> Tensor
 """)
+shir_fpga_inst_lib.define("""
+resnet_weird(
+  Tensor images, int padvalue, Tensor kernel, Tensor bias,
+  Tensor scale, int z,
+  int[2] stride) -> Tensor
+""")
+shir_fpga_inst_lib.define("""
+resnet_weird_residual(
+  Tensor images, int padvalue, Tensor kernel, Tensor bias,
+  Tensor scale, int z,
+  Tensor y, Tensor scale_y, int z_y) -> Tensor
+""")
 
 GBSTBL = {
     # Replace None with the path to the gbs file
@@ -44,6 +56,8 @@ GBSTBL = {
     torch.ops._shir.conv3x3p1b14x64: None,
     torch.ops._shir.tiny_yolo_v2: None,
     torch.ops._shir.resnet7x7: None,
+    torch.ops._shir.resnet_weird: None,
+    torch.ops._shir.resnet_weird_residual: None,
 }
 
 @impl(shir_fpga_inst_lib, "lenet5_linear3", "Meta")
@@ -223,6 +237,66 @@ def resnet7x7(images, padvalue, kernel, bias, scales, zp, packfactor):
 
   return torch.empty(x.permute([0, 2, 3, 1]).shape, dtype=torch.int8, device='meta')
 
+@impl(shir_fpga_inst_lib, "resnet_weird", "Meta")
+def _resnet_weird(images, padvalue, kernel, bias, scales, z, stride):
+  assert scales.ndim == 1 and bias.ndim == 1, "resnet_weird: invalid scale and bias dimension"
+  assert scales.shape[0] == 1 or scales.shape[0] == bias.shape[0], "resnet_weird: invalid per tensor or per channel scale shapes"
+
+  n, ih, iw, ich1 = images.shape
+  och, kh, kw, ich2 = kernel.shape
+
+  assert kw == kh and kh in {1, 3}, "resnet_weird: window must be 1x1 or 3x3"
+  assert och % 64 == 0, "resnet_weird: output channel must be divisible by 64"
+  assert all((s == 1 or s == 2 for s in stride)), "resnet_weird: stride must be 1 or 2"
+
+  ich1 = (ich1 + (64 - 1)) // 64 * 64
+  ich2 = (ich2 + (64 - 1)) // 64 * 64
+  assert ich1 == ich2, "resnet_weird: input channel of input and kernel mismatch"
+
+  padding = [1, 1]
+  if kw == 1 or padvalue is None:
+    padding = [0, 0]
+
+  x = torch.ops.aten.convolution(
+      torch.empty((n, ich1, ih, iw), dtype=torch.float, device='meta'),
+      torch.empty((och, ich2, kh, kw), dtype=torch.float, device='meta'),
+      torch.empty(bias.shape, dtype=torch.float, device='meta'),
+      stride, padding, [1, 1], False, [0], 1
+  )
+
+  return torch.empty(x.permute([0, 2, 3, 1]).shape, dtype=torch.int8, device='meta')
+
+@impl(shir_fpga_inst_lib, "resnet_weird_residual", "Meta")
+def _resnet_weird_residual(images, padvalue, kernel, bias, scales, z, y, scale_y, z_y):
+  assert scales.ndim == 1 and bias.ndim == 1, "resnet_weird_residual: invalid scale and bias dimension"
+  assert scales.shape[0] == 1 or scales.shape[0] == bias.shape[0], "resnet_weird_residual: invalid per tensor or per channel scale shapes"
+  assert scale_y.ndim == 1 and scale_y.shape[0] == 1, "resnet_weird_residual: invalid residual scale shape"
+
+  n, ih, iw, ich1 = images.shape
+  och, kh, kw, ich2 = kernel.shape
+
+  assert kw == kh and kh in {1, 3}, "resnet_weird_residual: window must be 1x1 or 3x3"
+  assert och % 64 == 0, "resnet_weird_residual: output channel must be divisible by 64"
+
+  ich1 = (ich1 + (64 - 1)) // 64 * 64
+  ich2 = (ich2 + (64 - 1)) // 64 * 64
+  assert ich1 == ich2, "resnet_weird_residual: input channel of input and kernel mismatch"
+
+  padding = [1, 1]
+  if kw == 1 or padvalue is None:
+    padding = [0, 0]
+
+  x = torch.ops.aten.convolution(
+      torch.empty((n, ich1, ih, iw), dtype=torch.float, device='meta'),
+      torch.empty((och, ich2, kh, kw), dtype=torch.float, device='meta'),
+      torch.empty(bias.shape, dtype=torch.float, device='meta'),
+      [1, 1], padding, [1, 1], False, [0], 1
+  )
+
+  n, och, oh, ow = x.shape
+  assert list(y.shape) == [n, oh, ow, och], "resnet_weird_residual: residual shape mismatch"
+
+  return torch.empty([n, oh, ow, och], dtype=torch.int8, device='meta')
 
 def permute_has_equiv_view(shape: torch.Size, perm: List[int]):
   filtered = [i for (i, x) in zip(perm, list(shape)) if x != 1]
@@ -463,6 +537,33 @@ def compute_layout(gm: fx.GraphModule):
       batch = n.meta.get("val").shape[0]
       max_inst += batch
 
+    elif n.target in {torch.ops._shir.resnet_weird}:
+      images, padvalue, kernel, bias, scales, z, stride = n.args
+      if images.op == "get_attr":
+        lookup(images, types.SI(8))
+      lookup(kernel, types.SI(8))
+      lookup(bias, types.SI(24))
+      lookup(scales, types.UI(28))
+
+      # for now, do the simple thing, which is each batch is one instruction
+      batch = n.meta.get("val").shape[0]
+      max_inst += batch
+
+    elif n.target in {torch.ops._shir.resnet_weird_residual}:
+      images, padvalue, kernel, bias, scales, z, y, scale_y, z_y = n.args
+      if images.op == "get_attr":
+        lookup(images, types.SI(8))
+      lookup(kernel, types.SI(8))
+      lookup(bias, types.SI(24))
+      lookup(scales, types.UI(28))
+      if y.op == "get_attr":
+        lookup(y, types.SI(8))
+      lookup(scale_y, types.UI(28))
+
+      # for now, do the simple thing, which is each batch is one instruction
+      batch = n.meta.get("val").shape[0]
+      max_inst += batch
+
   # knowing the optimal case is actually quite tricky, approximate it by
   # looking for the first available space.
   # (is prone to fragmentation, but at least as good as the naive case)
@@ -530,6 +631,26 @@ def compute_layout(gm: fx.GraphModule):
       if images.op != "get_attr":
         mark(images, types.SI(8))
       live_nodes.remove(n)
+
+    elif n.target in {torch.ops._shir.resnet_weird}:
+      images, padvalue, kernel, bias, scales, z, stride = n.args
+      mark(n, types.SI(8))
+      if images.op != "get_attr":
+        mark(images, types.SI(8))
+      live_nodes.remove(n)
+
+    elif n.target in {torch.ops._shir.resnet_weird_residual}:
+      images, padvalue, kernel, bias, scales, z, y, scale_y, z_y = n.args
+      mark(n, types.SI(8))
+      if images.op != "get_attr":
+        mark(images, types.SI(8))
+      if y.op != "get_attr":
+        mark(y, types.SI(8))
+      live_nodes.remove(n)
+
+      # for now, do the simple thing, which is each batch is one instruction
+      batch = n.meta.get("val").shape[0]
+      max_inst += batch
 
   return max_inst, layout
 
@@ -773,6 +894,52 @@ ENCTBL_resnet7x7 = {
   "RequantCacheLines": (302, 307),
   "RequantPointer": (307, 331),
   "RequantPerTensor": (331, 332),
+}
+
+ENCTBL_resnet_weird = {
+  "ImageOCHTileNum": (24, 30),
+  "ImageHTileNum": (30, 35),
+  "ImageWTileNum": (35, 40),
+  "ImageICHTileNum": (40, 47),
+  "ImageHLowerBound": (47, 55),
+  "ImageHUpperBound": (55, 63),
+  "ImageWLowerBound": (63, 71),
+  "ImageWUpperBound": (71, 79),
+  "ImageHOffset": (79, 93),
+  "ImageWOffset": (93, 100),
+  "ImageWLowerOOBVal": (100, 109),
+  "ImageWUpperOOBVal": (109, 118),
+  "ImagePadValue": (118, 126),
+  "WeightPointer": (126, 150),
+  "WeightOCHTileNum": (150, 156),
+  "WeightHTileNum": (156, 161),
+  "WeightWTileNum": (161, 166),
+  "WeightICHTileNum": (166, 173),
+  "WeightOCHOffset": (173, 183),
+  "WeightWinOffset": (183, 190),
+  "WeightReuseEnabled": (190, 191),
+  "ResultImagePointer": (191, 215),
+  "WriteAddrHOuterOffset": (215, 228),
+  "WriteAddrWOuterOffset": (228, 236),
+  "WriteAddrHPoolReverse": (236, 239),
+  "WriteAddrWPoolReverse": (239, 242),
+  "WriteAddrHPROffset": (242, 254),
+  "WriteAddrWPROffset": (254, 260),
+  "WriteAddrHRealLimit": (260, 279),
+  "WriteAddrWRealLimit": (279, 291),
+  "BiasCacheLines": (291, 298),
+  "BiasPointer": (298, 322),
+  "RequantZeroPoint": (322, 330),
+  "RequantCacheLines": (330, 337),
+  "RequantPointer": (337, 361),
+  "RequantPerTensor": (361, 362),
+  "ImageHTileStride": (362, 365),
+  "ImageWTileStride": (365, 368),
+  "ResNetResidualEnabled": (368, 369),
+  "ResNetResidualPointer": (369, 393),
+  "ResNetResidualZeroPoint": (393, 401),
+  "ResNetResidualScalePointer": (401, 425),
+  "ResNet1x1Kernel": (425, 427),
 }
 
 def _encode(name, tbl, x):
@@ -1374,7 +1541,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           psum_bits = oob_shamt.bit_length()
 
           gbs_file = GBSTBL.get(n.target, None)
-          assert gbs_file is not None, "backend::emit: tiny_yolo_v2 design does not exist"
+          assert gbs_file is not None, "backend::emit: resnet7x7 design does not exist"
           if pending_gbs is not None and pending_gbs != gbs_file:
             flush_pending_inst()
 
@@ -1431,6 +1598,265 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
             iptr += 1
 
             img_ptr += imgs_per_batch
+            res_ptr += ress_per_batch
+            batch -= 1
+
+        elif n.op == "call_function" and n.target == torch.ops._shir.resnet_weird:
+          images, padvalue, kernel, bias, scales, zp, stride = n.args
+          img_ptr = BASEADDR_DATA + data_layout[images][0]
+          krn_ptr = BASEADDR_DATA + data_layout[kernel][0]
+          bis_ptr = BASEADDR_DATA + data_layout[bias][0]
+          scl_ptr = BASEADDR_DATA + data_layout[scales][0]
+          res_ptr = BASEADDR_DATA + data_layout[n][0]
+
+          # asserting the img_ptr and res_ptr happens later
+          assert (krn_ptr & 0xFFFFFF) == krn_ptr, "backend::emit: pointer too wide"
+          assert (bis_ptr & 0xFFFFFF) == bis_ptr, "backend::emit: pointer too wide"
+          assert (scl_ptr & 0xFFFFFF) == scl_ptr, "backend::emit: pointer too wide"
+          assert -128 <= (padvalue or 0) < 128, "backend::emit: signed pad value too wide for resnet_weird"
+          assert -128 <= zp < 128, "backend::emit: signed zero point too wide for resnet_weird"
+
+          batch, h, w, ich = images.meta.get("val").shape
+          och, kh, kw, _ = kernel.meta.get("val").shape
+          _, rh, rw, _ = n.meta.get("val").shape
+          pertensor = scales.meta.get("val").shape[0] == 1
+
+          bis_lines = data_layout[bias][1]
+          scl_lines = data_layout[scales][1]
+
+          imgHOffset = data_layout[images][1] // batch // h
+          imgWOffset = data_layout[images][1] // batch // h // w
+
+          krnOchOffset = data_layout[kernel][1] // och
+          krnWinOffset = data_layout[kernel][1] // och // kh // kw
+
+          resHOffset = data_layout[n][1] // batch // rh
+          resWOffset = data_layout[n][1] // batch // rh // rw
+
+          if kw == kh == 1:
+            # prefer implementing stride by interpreting the input image
+            # as a "smaller" image with wider gaps
+            stride = list(stride)
+            imgHOffset *= stride[0]
+            imgWOffset *= stride[1]
+            h = (h + (stride[0] - 1)) // stride[0]
+            w = (w + (stride[1] - 1)) // stride[1]
+            stride = [1, 1]
+
+          ochTileNum = (och + (64 - 1)) // 64
+          ichTileNum = (ich + (64 - 1)) // 64
+
+          hTileNum = (h + (14 - 1)) // 14
+          wTileNum = (w + (14 - 1)) // 14
+
+          padding = [1, 1]
+          if kw == kh == 1 or padvalue is None:
+            padding = [0, 0]
+
+          pool_reverse = [2, 2]
+          if kw == kh == 1:
+            pool_reverse = [7, 7]
+
+          if kw == kh == 1:
+            mode = 1
+          elif kw == kh == 3:
+            mode = 0
+            if stride[0] == stride[1] == 2:
+              mode = 2
+            elif stride[0] == stride[1] == 1 and h < 8 and w < 8 and False: # XXX: broken
+              mode = 3
+
+          weight_reuse = ich <= 64 and h > 14 and w > 14
+
+          gbs_file = GBSTBL.get(n.target, None)
+          assert gbs_file is not None, "backend::emit: resnet_weird design does not exist"
+          if pending_gbs is not None and pending_gbs != gbs_file:
+            flush_pending_inst()
+
+          pending_gbs  = gbs_file
+          pending_inst = iptr if pending_inst is None else pending_inst
+          pending_values.add(n)
+
+          imgs_per_batch = data_layout[images][1] // batch
+          ress_per_batch = data_layout[n][1] // batch
+          while batch > 0:
+            inst = _encode("resnet_weird", ENCTBL_resnet_weird, {
+              "ImagePointer": img_ptr,
+              "ImageOCHTileNum": ochTileNum,
+              "ImageHTileNum": hTileNum,
+              "ImageWTileNum": wTileNum,
+              "ImageICHTileNum": ichTileNum,
+              "ImageHLowerBound": padding[0],
+              "ImageHUpperBound": h + padding[0],
+              "ImageWLowerBound": padding[1],
+              "ImageWUpperBound": w + padding[1],
+              "ImageHOffset": imgHOffset,
+              "ImageWOffset": imgWOffset,
+              "ImageWLowerOOBVal": -1,
+              "ImageWUpperOOBVal": -1,
+              "ImagePadValue": padvalue or 0,
+              "WeightPointer": krn_ptr,
+              "WeightOCHTileNum": ochTileNum,
+              "WeightHTileNum": 1 if weight_reuse else hTileNum,
+              "WeightWTileNum": 1 if weight_reuse else wTileNum,
+              "WeightICHTileNum": ichTileNum,
+              "WeightOCHOffset": krnOchOffset,
+              "WeightWinOffset": krnWinOffset,
+              "WeightReuseEnabled": 1 if weight_reuse else 0,
+              "ResultImagePointer": res_ptr,
+              "WriteAddrHOuterOffset": resHOffset * pool_reverse[0],
+              "WriteAddrWOuterOffset": resWOffset * pool_reverse[1],
+              "WriteAddrHPoolReverse": pool_reverse[0],
+              "WriteAddrWPoolReverse": pool_reverse[1],
+              "WriteAddrHPROffset": resHOffset,
+              "WriteAddrWPROffset": resWOffset,
+              "WriteAddrHRealLimit": resHOffset * (rh - 1),
+              "WriteAddrWRealLimit": resWOffset * (rw - 1),
+              "BiasCacheLines": bis_lines,
+              "BiasPointer": bis_ptr,
+              "RequantZeroPoint": zp,
+              "RequantCacheLines": scl_lines,
+              "RequantPointer": scl_ptr,
+              "RequantPerTensor": 1 if pertensor else 0,
+              "ImageHTileStride": 1,
+              "ImageWTileStride": 1,
+              "ResNetResidualEnabled": 0,
+              "ResNetResidualPointer": 0,
+              "ResNetResidualZeroPoint": 0,
+              "ResNetResidualScalePointer": 0,
+              "ResNet1x1Kernel": mode,
+            })
+
+            pptr[iptr * bytes_per_cl:(iptr + 1) * bytes_per_cl] = inst.to_bytes(bytes_per_cl, byteorder="little")
+            iptr += 1
+
+            img_ptr += imgs_per_batch
+            res_ptr += ress_per_batch
+            batch -= 1
+
+        elif n.op == "call_function" and n.target == torch.ops._shir.resnet_weird_residual:
+          images, padvalue, kernel, bias, scales, zp, scale_y, y, z_y = n.args
+          img_ptr = BASEADDR_DATA + data_layout[images][0]
+          krn_ptr = BASEADDR_DATA + data_layout[kernel][0]
+          bis_ptr = BASEADDR_DATA + data_layout[bias][0]
+          scl_ptr = BASEADDR_DATA + data_layout[scales][0]
+          res_ptr = BASEADDR_DATA + data_layout[n][0]
+          scy_ptr = BASEADDR_DATA + data_layout[scale_y][0]
+          imy_ptr = BASEADDR_DATA + data_layout[y][0]
+
+          # asserting the img_ptr, imy_ptr, and res_ptr happens later
+          assert (krn_ptr & 0xFFFFFF) == krn_ptr, "backend::emit: pointer too wide"
+          assert (bis_ptr & 0xFFFFFF) == bis_ptr, "backend::emit: pointer too wide"
+          assert (scl_ptr & 0xFFFFFF) == scl_ptr, "backend::emit: pointer too wide"
+          assert (scy_ptr & 0xFFFFFF) == scl_ptr, "backend::emit: pointer too wide"
+          assert -128 <= (padvalue or 0) < 128, "backend::emit: signed pad value too wide for resnet_weird_residual"
+          assert -128 <= zp < 128 and -128 <= z_y < 128, "backend::emit: signed zero point too wide for resnet_weird_residual"
+
+          batch, h, w, ich = images.meta.get("val").shape
+          och, kh, kw, _ = kernel.meta.get("val").shape
+          _, rh, rw, _ = n.meta.get("val").shape
+          pertensor = scales.meta.get("val").shape[0] == 1
+
+          bis_lines = data_layout[bias][1]
+          scl_lines = data_layout[scales][1]
+
+          imgHOffset = data_layout[images][1] // batch // h
+          imgWOffset = data_layout[images][1] // batch // h // w
+
+          krnOchOffset = data_layout[kernel][1] // och
+          krnWinOffset = data_layout[kernel][1] // och // kh // kw
+
+          resHOffset = data_layout[n][1] // batch // rh
+          resWOffset = data_layout[n][1] // batch // rh // rw
+
+          ochTileNum = (och + (64 - 1)) // 64
+          ichTileNum = (ich + (64 - 1)) // 64
+
+          hTileNum = (h + (14 - 1)) // 14
+          wTileNum = (w + (14 - 1)) // 14
+
+          padding = [1, 1]
+          if kw == kh == 1 or padvalue is None:
+            padding = [0, 0]
+
+          pool_reverse = [2, 2]
+          if kw == kh == 1:
+            pool_reverse = [7, 7]
+
+          if kw == kh == 1:
+            mode = 1
+          elif kw == kh == 3:
+            mode = 0
+            if h < 8 and w < 8 and False: # XXX: broken
+              mode = 3
+
+          weight_reuse = ich <= 64 and h > 14 and w > 14
+
+          gbs_file = GBSTBL.get(n.target, None)
+          assert gbs_file is not None, "backend::emit: resnet_weird_residual design does not exist"
+          if pending_gbs is not None and pending_gbs != gbs_file:
+            flush_pending_inst()
+
+          pending_gbs  = gbs_file
+          pending_inst = iptr if pending_inst is None else pending_inst
+          pending_values.add(n)
+
+          imgs_per_batch = data_layout[images][1] // batch
+          imys_per_batch = data_layout[y][1] // batch
+          ress_per_batch = data_layout[n][1] // batch
+          while batch > 0:
+            inst = _encode("resnet_weird", ENCTBL_resnet_weird, {
+              "ImagePointer": img_ptr,
+              "ImageOCHTileNum": ochTileNum,
+              "ImageHTileNum": hTileNum,
+              "ImageWTileNum": wTileNum,
+              "ImageICHTileNum": ichTileNum,
+              "ImageHLowerBound": padding[0],
+              "ImageHUpperBound": h + padding[0],
+              "ImageWLowerBound": padding[1],
+              "ImageWUpperBound": w + padding[1],
+              "ImageHOffset": imgHOffset,
+              "ImageWOffset": imgWOffset,
+              "ImageWLowerOOBVal": -1,
+              "ImageWUpperOOBVal": -1,
+              "ImagePadValue": padvalue or 0,
+              "WeightPointer": krn_ptr,
+              "WeightOCHTileNum": ochTileNum,
+              "WeightHTileNum": 1 if weight_reuse else hTileNum,
+              "WeightWTileNum": 1 if weight_reuse else wTileNum,
+              "WeightICHTileNum": ichTileNum,
+              "WeightOCHOffset": krnOchOffset,
+              "WeightWinOffset": krnWinOffset,
+              "WeightReuseEnabled": 1 if weight_reuse else 0,
+              "ResultImagePointer": res_ptr,
+              "WriteAddrHOuterOffset": resHOffset * pool_reverse[0],
+              "WriteAddrWOuterOffset": resWOffset * pool_reverse[1],
+              "WriteAddrHPoolReverse": pool_reverse[0],
+              "WriteAddrWPoolReverse": pool_reverse[1],
+              "WriteAddrHPROffset": resHOffset,
+              "WriteAddrWPROffset": resWOffset,
+              "WriteAddrHRealLimit": resHOffset * (rh - 1),
+              "WriteAddrWRealLimit": resWOffset * (rw - 1),
+              "BiasCacheLines": bis_lines,
+              "BiasPointer": bis_ptr,
+              "RequantZeroPoint": zp,
+              "RequantCacheLines": scl_lines,
+              "RequantPointer": scl_ptr,
+              "RequantPerTensor": 1 if pertensor else 0,
+              "ImageHTileStride": 1,
+              "ImageWTileStride": 1,
+              "ResNetResidualEnabled": 1,
+              "ResNetResidualPointer": imy_ptr,
+              "ResNetResidualZeroPoint": z_y,
+              "ResNetResidualScalePointer": scy_ptr,
+              "ResNet1x1Kernel": mode,
+            })
+
+            pptr[iptr * bytes_per_cl:(iptr + 1) * bytes_per_cl] = inst.to_bytes(bytes_per_cl, byteorder="little")
+            iptr += 1
+
+            img_ptr += imgs_per_batch
+            imy_ptr += imys_per_batch
             res_ptr += ress_per_batch
             batch -= 1
 
@@ -1510,7 +1936,7 @@ class _Wrapper:
     return self._gm(self._pptr, *args, **kwargs)
 
 def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
-  from . import backend2_resnet as isel
+  from . import backend2_resnet3x3 as isel
   mode = FakeTensorMode(allow_non_fake_inputs=True)
   if getattr(isel, "REQUIRE_QUANT_REWRITE", True):
     FakeTensorProp(gm, mode).propagate(*example_inputs)

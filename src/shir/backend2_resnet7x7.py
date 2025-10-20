@@ -1,5 +1,5 @@
 #
-# Currently only contains the instruction selection logic for resnet
+# Currently only contains the instruction selection logic for resnet using 7x7 convolution
 #
 
 import torch
