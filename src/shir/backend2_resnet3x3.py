@@ -216,12 +216,12 @@ def select(gm: fx.GraphModule):
       with graph.inserting_before(n):
         ni = graph.call_function(torch.ops.aten.permute, (n_dq_img.args[0], [0, 2, 3, 1]))
         nk = graph.call_function(torch.ops.aten.permute, (n_dq_wgt.args[0], [0, 2, 3, 1]))
-        n3 = graph.get_attr(sclattr)
-        n4 = graph.get_attr(biasattr)
-        n5 = graph.call_function(torch.ops._shir.resnet_weird, (ni, qx_info[1], nk, n4, n3, qo_info[1], stride))
-        n6 = graph.call_function(torch.ops.aten.permute, (n5, [0, 3, 1, 2]))
+        ns = graph.get_attr(sclattr)
+        nb = graph.get_attr(biasattr)
+        n1 = graph.call_function(torch.ops._shir.resnet_weird, (ni, qx_info[1], nk, nb, ns, qo_info[1], stride))
+        n2 = graph.call_function(torch.ops.aten.permute, (n1, [0, 3, 1, 2]))
       n.target = torch.ops.aten.contiguous
-      n.args = (n6,)
+      n.args = (n2,)
 
       if n_relu: graph.erase_node(n_relu)
       graph.erase_node(n_conv)

@@ -92,7 +92,8 @@ with torch.no_grad():
   else:
     model = torch.compile(model)
 
-print(model(example_inputs[0]))
+with torch.no_grad():
+  print(model(example_inputs[0]))
 
 
 """

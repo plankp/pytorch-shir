@@ -897,6 +897,7 @@ ENCTBL_resnet7x7 = {
 }
 
 ENCTBL_resnet_weird = {
+  "ImagePointer": (0, 24),
   "ImageOCHTileNum": (24, 30),
   "ImageHTileNum": (30, 35),
   "ImageWTileNum": (35, 40),
@@ -1735,7 +1736,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
             batch -= 1
 
         elif n.op == "call_function" and n.target == torch.ops._shir.resnet_weird_residual:
-          images, padvalue, kernel, bias, scales, zp, scale_y, y, z_y = n.args
+          images, padvalue, kernel, bias, scales, zp, y, scale_y, z_y = n.args
           img_ptr = BASEADDR_DATA + data_layout[images][0]
           krn_ptr = BASEADDR_DATA + data_layout[kernel][0]
           bis_ptr = BASEADDR_DATA + data_layout[bias][0]
@@ -1748,7 +1749,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           assert (krn_ptr & 0xFFFFFF) == krn_ptr, "backend::emit: pointer too wide"
           assert (bis_ptr & 0xFFFFFF) == bis_ptr, "backend::emit: pointer too wide"
           assert (scl_ptr & 0xFFFFFF) == scl_ptr, "backend::emit: pointer too wide"
-          assert (scy_ptr & 0xFFFFFF) == scl_ptr, "backend::emit: pointer too wide"
+          assert (scy_ptr & 0xFFFFFF) == scy_ptr, "backend::emit: pointer too wide"
           assert -128 <= (padvalue or 0) < 128, "backend::emit: signed pad value too wide for resnet_weird_residual"
           assert -128 <= zp < 128 and -128 <= z_y < 128, "backend::emit: signed zero point too wide for resnet_weird_residual"
 
@@ -1805,7 +1806,7 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           imys_per_batch = data_layout[y][1] // batch
           ress_per_batch = data_layout[n][1] // batch
           while batch > 0:
-            inst = _encode("resnet_weird", ENCTBL_resnet_weird, {
+            inst = _encode("resnet_weird_residual", ENCTBL_resnet_weird, {
               "ImagePointer": img_ptr,
               "ImageOCHTileNum": ochTileNum,
               "ImageHTileNum": hTileNum,
