@@ -7,7 +7,7 @@ from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
 import torch.ao.quantization.quantizer.x86_inductor_quantizer as xiq
 import shir
 
-transform = torchvision.models.ResNet18_Weights.IMAGENET1K_V1.transforms()
+transform = torchvision.models.ResNet50_Weights.IMAGENET1K_V1.transforms()
 def encode(batch):
   # for whatever reason, some image are grayscale...
   # so convert it into RGB before cropping it to 224.
@@ -58,16 +58,18 @@ def time_inference(data, model):
       times.append(_end - _start)
   return times
 
-model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
 model.eval()
 
 PROFILE = "shir"
-PROBLEM_SIZE_N = 64
+PROBLEM_SIZE_N = 1
 PROBLEM_TRIPS  = 1
 PROBLEM_INSTS  = 1000
 
-# top 1 accuracy is around 69.7% loss is around 1.25
-#print("Original: ", test_loop(valid_dataloader, model, loss_fn))
+"""
+# top 1 accuracy is around 76.1% loss is around 0.96
+print("Original: ", test_loop(valid_dataloader, model, loss_fn))
+"""
 
 _qex = get_example_input()[:PROBLEM_SIZE_N, :, :, :]
 _qex = torch.concat([_qex] * ((PROBLEM_SIZE_N + (batch_size - 1)) // batch_size), axis=0)
@@ -95,14 +97,15 @@ with torch.no_grad():
   else:
     model = torch.compile(model)
 
-"""
 with torch.no_grad():
   print(model(example_inputs[0]))
-"""
 
+
+"""
 # top 1 accuracy is around ??% loss is around ?.??
 shir.config.FPGA_PRINT_RTINFO = False
 print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
+"""
 
 """
 dummy_data = torch.zeros(PROBLEM_INSTS, PROBLEM_SIZE_N, 3, 224, 224)
