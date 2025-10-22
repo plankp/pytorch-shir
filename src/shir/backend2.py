@@ -1622,6 +1622,42 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           _, rh, rw, _ = n.meta.get("val").shape
           pertensor = scales.meta.get("val").shape[0] == 1
 
+          if kw == kh == 1 and batch > 1:
+            if h == w == 1:
+              # bruteforce search the packing factor.
+              # assume the cutoff is the tile size.
+              factor = 14
+              while factor > 1:
+                if batch % factor == 0:
+                  batch //= factor
+                  w *= factor
+                  rw *= factor
+                  # the remaining factor cannot be more than the current factor
+                  # (it could be the same if it was a square)
+                  while factor > 1:
+                    if batch % factor == 0:
+                      batch //= factor
+                      h *= factor
+                      rh *= factor
+                      break
+                    factor -= 1
+                  break
+                factor -= 1
+
+            elif h == w == 7 and batch % 2 == 0 and stride[0] == stride[1] == 1:
+              batch //= 2
+              h *= 2
+              rh *= 2
+              if batch % 2 == 0:
+                batch //= 2
+                w *= 2
+                rw *= 2
+
+            elif batch % 2 == 0:
+              batch //= 2
+              h *= 2
+              rh *= 2
+
           bis_lines = data_layout[bias][1]
           scl_lines = data_layout[scales][1]
 
@@ -1647,9 +1683,6 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           ochTileNum = (och + (64 - 1)) // 64
           ichTileNum = (ich + (64 - 1)) // 64
 
-          hTileNum = (h + (14 - 1)) // 14
-          wTileNum = (w + (14 - 1)) // 14
-
           padding = [1, 1]
           if kw == kh == 1 or padvalue is None:
             padding = [0, 0]
@@ -1658,16 +1691,21 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           if kw == kh == 1:
             pool_reverse = [7, 7]
 
+          tilesz = 14
           if kw == kh == 1:
             mode = 1
           elif kw == kh == 3:
             mode = 0
             if stride[0] == stride[1] == 2:
+              tilesz = 16
               mode = 2
             elif stride[0] == stride[1] == 1 and h < 8 and w < 8 and False: # XXX: broken
               mode = 3
 
-          weight_reuse = ich <= 64 and h > 14 and w > 14
+          hTileNum = (h + (tilesz - 1)) // tilesz
+          wTileNum = (w + (tilesz - 1)) // tilesz
+
+          weight_reuse = ich <= 64 and hTileNum > 1 and wTileNum > 1
 
           gbs_file = GBSTBL.get(n.target, None)
           assert gbs_file is not None, "backend::emit: resnet_weird design does not exist"
@@ -1757,6 +1795,42 @@ def emit(gm: fx.GraphModule, max_inst: int, data_layout):
           och, kh, kw, _ = kernel.meta.get("val").shape
           _, rh, rw, _ = n.meta.get("val").shape
           pertensor = scales.meta.get("val").shape[0] == 1
+
+          if kw == kh == 1 and batch > 1:
+            if h == w == 1:
+              # bruteforce search the packing factor.
+              # assume the cutoff is the tile size.
+              factor = 14
+              while factor > 1:
+                if batch % factor == 0:
+                  batch //= factor
+                  w *= factor
+                  rw *= factor
+                  # the remaining factor cannot be more than the current factor
+                  # (it could be the same if it was a square)
+                  while factor > 1:
+                    if batch % factor == 0:
+                      batch //= factor
+                      h *= factor
+                      rh *= factor
+                      break
+                    factor -= 1
+                  break
+                factor -= 1
+
+            elif h == w == 7 and batch % 2 == 0 and stride[0] == stride[1] == 1:
+              batch //= 2
+              h *= 2
+              rh *= 2
+              if batch % 2 == 0:
+                batch //= 2
+                w *= 2
+                rw *= 2
+
+            elif batch % 2 == 0:
+              batch //= 2
+              h *= 2
+              rh *= 2
 
           bis_lines = data_layout[bias][1]
           scl_lines = data_layout[scales][1]

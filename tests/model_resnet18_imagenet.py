@@ -41,7 +41,8 @@ def test_loop(dataloader, model, loss_fn):
       test_loss += loss_fn(pred, y)
       correct += (pred.argmax(1) == y).type(torch.float).sum().item()
       counter += len(y)
-      print(f"\rBatch {i}/{num_batches}: {correct / counter * 100:3.2f}%", end='')
+      print(f"\rBatch {i+1}/{num_batches}: {correct / counter * 100:3.2f}%", end='')
+  print()
 
   test_loss /= num_batches
   correct /= size
@@ -100,7 +101,7 @@ with torch.no_grad():
   print(model(example_inputs[0]))
 """
 
-# top 1 accuracy is around ??% loss is around ?.??
+# top 1 accuracy is around 66% loss is around 1.41
 shir.config.FPGA_PRINT_RTINFO = False
 print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
 

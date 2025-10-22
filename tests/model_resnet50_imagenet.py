@@ -41,7 +41,8 @@ def test_loop(dataloader, model, loss_fn):
       test_loss += loss_fn(pred, y)
       correct += (pred.argmax(1) == y).type(torch.float).sum().item()
       counter += len(y)
-      print(f"\rBatch {i}/{num_batches}: {correct / counter * 100:3.2f}%", end='')
+      print(f"\rBatch {i+1}/{num_batches}: {correct / counter * 100:3.2f}%", end='')
+  print()
 
   test_loss /= num_batches
   correct /= size
