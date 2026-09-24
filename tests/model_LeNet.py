@@ -106,9 +106,13 @@ with torch.no_grad():
     model = torch.compile(model, backend=shir.compiler)
   elif PROFILE == "shir2":
     import shir.backend2
-    model = torch.compile(model, backend=shir.backend2.compiler)
+    model = torch.compile(model, backend=shir.backend2.lenet_compiler)
   else:
     model = torch.compile(model)
+
+with torch.no_grad():
+  print(model(example_inputs[0]))
+  exit()
 
 """
 shir.config.FPGA_PRINT_RTINFO = False
@@ -127,4 +131,4 @@ with open(f"./metrics/LeNet5/{PROFILE}_{PROBLEM_SIZE_N}.log", "w") as f:
 # print(model(example_inputs[0][0, None]))
 # print(model(example_inputs[0][0:16]))
 
-print("FINAL", test_loop(test_dataloader, model, loss_fn))
+# print("FINAL", test_loop(test_dataloader, model, loss_fn))

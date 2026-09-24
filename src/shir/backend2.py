@@ -2010,8 +2010,7 @@ class _Wrapper:
     assert self._cleanup.alive, "backend::_Wrapper: content already deallocated"
     return self._gm(self._pptr, *args, **kwargs)
 
-def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
-  from . import backend2_resnet3x3 as isel
+def _with_isel(gm: fx.GraphModule, example_inputs: List[torch.Tensor], isel) -> Callable:
   mode = FakeTensorMode(allow_non_fake_inputs=True)
   if getattr(isel, "REQUIRE_QUANT_REWRITE", True):
     FakeTensorProp(gm, mode).propagate(*example_inputs)
@@ -2031,6 +2030,31 @@ def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable
   peephole(graph)
   gm2 = fx.GraphModule(gm, graph)
 
+  # print(gm2)
+  # exit()
+
   from . import driver
   return _Wrapper(gm2, driver, pptr)
+
+def compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_resnet3x3 as isel
+  # from . import backend2_tiny_yolo as isel
+  # from . import backend2_vgg as isel
+  return _with_isel(gm, example_inputs, isel)
+
+def lenet_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_lenet5 as isel
+  return _with_isel(gm, example_inputs, isel)
+
+def vgg_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_vgg as isel
+  return _with_isel(gm, example_inputs, isel)
+
+def yolo_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_tiny_yolo as isel
+  return _with_isel(gm, example_inputs, isel)
+
+def resnet_compiler(gm: fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+  from . import backend2_resnet3x3 as isel
+  return _with_isel(gm, example_inputs, isel)
 

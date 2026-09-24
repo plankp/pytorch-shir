@@ -63,7 +63,9 @@ model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.
 model.eval()
 
 PROFILE = "shir"
-PROBLEM_SIZE_N = 1
+# PROFILE = "x86"
+PROBLEM_SIZE_N = 128
+# PROBLEM_SIZE_N = 64
 PROBLEM_TRIPS  = 1
 PROBLEM_INSTS  = 1000
 
@@ -94,16 +96,16 @@ with torch.no_grad():
 
   if PROFILE == "shir":
     import shir.backend2
-    model = torch.compile(model, backend=shir.backend2.compiler)
+    model = torch.compile(model, backend=shir.backend2.resnet_compiler)
   else:
     model = torch.compile(model)
 
 with torch.no_grad():
   print(model(example_inputs[0]))
-
+  exit()
 
 """
-# top 1 accuracy is around ??% loss is around ?.??
+# top 1 accuracy is around 74.7% loss is around 1.02
 shir.config.FPGA_PRINT_RTINFO = False
 print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
 """

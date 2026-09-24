@@ -114,11 +114,11 @@ def configure_gbs(gbs_file):
   if _last_opened_fpga is not None and _last_flashed_gbs is not None and os.path.samefile(_last_flashed_gbs, gbs_file):
     return _last_opened_fpga
 
-  # otherwise, since we noly have one FPGA on our server, release the old one
+  # otherwise, since we only have one FPGA on our server, release the old one
   release_fpga()
 
   # and then reconfigure it
-  subprocess.run(['fpgaconf', '-v', gbs_file])
+  subprocess.run(['fpgaconf', '-v', gbs_file], check=True)
 
   inst = find_and_open_fpga(config.ACCEL_UUID)
   _last_flashed_gbs = gbs_file

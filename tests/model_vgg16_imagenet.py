@@ -6,6 +6,12 @@ import torch._dynamo as torchdynamo
 from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
 import torch.ao.quantization.quantizer.x86_inductor_quantizer as xiq
 import shir
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-n', '--batch', type=int, default=64)
+parser.add_argument('-a', '--accuracy', action='store_true')
+args = parser.parse_args()
 
 transform = torchvision.models.VGG16_Weights.IMAGENET1K_V1.transforms()
 def encode(batch):
@@ -32,13 +38,17 @@ def test_loop(dataloader, model, loss_fn):
   num_batches = len(dataloader)
   test_loss, correct = 0, 0
 
+  counter = 0
   with torch.no_grad():
-    for T in dataloader:
+    for i, T in enumerate(dataloader):
       X = T["image"]
       y = T["label"]
       pred = model(X)
       test_loss += loss_fn(pred, y)
       correct += (pred.argmax(1) == y).type(torch.float).sum().item()
+      counter += len(y)
+      print(f"\rBatch {i+1}/{num_batches}: {correct / counter * 100:3.2f}%", end='')
+  print()
 
   test_loss /= num_batches
   correct /= size
@@ -59,7 +69,8 @@ model = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGEN
 model.eval()
 
 PROFILE = "shir"
-PROBLEM_SIZE_N = 128
+# PROFILE = "x86"
+PROBLEM_SIZE_N = args.batch
 PROBLEM_TRIPS  = 1
 PROBLEM_INSTS  = 1000
 
@@ -91,28 +102,25 @@ with torch.no_grad():
 
   if PROFILE == "shir":
     import shir.backend2
-    model = torch.compile(model, backend=shir.backend2.compiler)
+    model = torch.compile(model, backend=shir.backend2.vgg_compiler)
   else:
     model = torch.compile(model)
 
-"""
-print(model(example_inputs[0]))
-shir.config.FPGA_PRINT_RTINFO = False
-model(example_inputs[0])
-model(example_inputs[0])
-model(example_inputs[0])
-"""
+print("using batch size:", PROBLEM_SIZE_N)
+if not args.accuracy:
+  with torch.no_grad():
+    print(model(example_inputs[0]))
+else:
+  # top 1 accuracy is around 71% loss is around 1.15
+  shir.config.FPGA_PRINT_RTINFO = False
+  print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
 
 """
-# top 1 accuracy is around 71% loss is around 1.15
-shir.config.FPGA_PRINT_RTINFO = False
-print("FPGA: ", test_loop(valid_dataloader, model, loss_fn))
-"""
-
 shir.config.FPGA_PRINT_RTINFO = False
 dummy_data = torch.zeros(PROBLEM_INSTS, PROBLEM_SIZE_N, 3, 224, 224)
 with open(f"./metrics/vgg16_imagenet/{PROFILE}_shallow2_{PROBLEM_SIZE_N}.log", "w") as f:
   for i in range(PROBLEM_TRIPS):
     for w in time_inference(dummy_data, model):
       print(w, file=f)
+"""
 
